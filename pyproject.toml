@@ -1,0 +1,17 @@
+[project]
+name = "no-quiz-no-prod"
+version = "0.1.0"
+description = "Pedagogical code-assistant agent that gates production deployment behind automated tests and adaptive developer comprehension quizzes (Agentic Workflows MSc project)."
+readme = "README.md"
+authors = [
+    { name = "Jonathan Bouniol", email = "jbouniol@albertschool.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+no-quiz-no-prod = "no_quiz_no_prod:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
