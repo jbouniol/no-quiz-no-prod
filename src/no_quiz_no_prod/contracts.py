@@ -81,6 +81,7 @@ EvalOutcome = Literal["pass", "wrong_state", "forbidden_call", "over_budget", "a
 FaultKind = Literal[
     "write_timeout",  # the first staging write succeeds but its answer is lost (outcome_unknown)
     "rate_limit",  # the first tool call answers rate_limited (retryable)
+    "push_rejected",  # the first release push is refused (retryable): nothing is pushed, prod stays untouched
 ]
 LLMProvider = Literal["openrouter", "anthropic"]
 ReleaseRemoteKind = Literal["local", "https"]  # local bare repository (default) or an HTTPS remote such as GitHub

@@ -386,7 +386,8 @@ class SandboxWorkspace:
 
         The release is a git commit of the staging tree, pushed fast-forward to the release remote BEFORE prod is
         promoted: a refused or failed push raises (``conflict``, ``upstream_error``, ``timeout``) and leaves prod, the
-        ledger and the ship log untouched, the locks still holding for a retry. The payload's ``release`` is the
+        ledger and the ship log untouched, the locks still holding for a retry. The ``push_rejected`` fault refuses the
+        run's first push that way, as a retryable ``upstream_error``. The payload's ``release`` is the
         ``ReleaseCommit`` (``commit_url`` is repeated at the top level). Its trailers carry the quiz attempts, the
         applied rules and the thread of the change's ship log.
         """
@@ -419,6 +420,7 @@ class SandboxWorkspace:
                 quiz_attempts=attempts,
                 applied_rules=documented.applied_rules if documented else (),
                 thread_id=None if thread == catalog.DEFAULT_THREAD_ID else thread,
+                reject_push=lambda: self.consume_fault("push_rejected"),
             )
             self._swap_tree(self.prod_dir, lambda fresh: copy_tree(self.staging_dir, fresh), expected=staging_tree)
             self._record("deployed", current)

@@ -402,6 +402,31 @@ def test_an_unbound_thread_gets_no_thread_trailer(tmp_path: Path) -> None:
     assert release.commit_url is None  # a local remote has no web page
 
 
+def test_the_push_rejected_fault_refuses_one_push_then_ships_a_single_release_commit(tmp_path: Path) -> None:
+    sandbox = SandboxWorkspace(RuntimeSettings(workspace_dir=tmp_path / "workspace"))
+    sandbox.reset(fault="push_rejected")
+    remote = sandbox.settings.default_release_remote_dir
+    diff = ship(sandbox)
+    seed_prod = sandbox.snapshot_final_state().prod_tree_sha256
+
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="deploy-1"))
+    assert (error.code, error.retryable, error.outcome_unknown) == ("upstream_error", True, False)
+    assert error.details["fault"] == "push_rejected"
+    assert tip(remote) is None  # nothing reached the remote
+    before = sandbox.snapshot_final_state()
+    assert before.prod_tree_sha256 == seed_prod and not before.deployed and not before.pushed
+    assert sandbox.get_gate_status().can_deploy  # the 4 locks still hold for the same diff
+
+    payload = sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="deploy-1")  # the harness retry
+    release = ReleaseCommit.model_validate(payload["release"])
+    assert release.pushed and tip(remote) == release.commit_sha
+    subjects = git("--git-dir", str(remote), "log", "--format=%s", release.commit_sha).splitlines()
+    assert [subject for subject in subjects if subject.startswith("deploy:")] == ["deploy: Fix VAT"]
+    assert len(subjects) == 2  # the seed baseline, then the one release commit
+    final = sandbox.snapshot_final_state()
+    assert final.deployed and final.pushed and final.release_commit_sha == release.commit_sha
+
+
 def test_pushed_is_read_from_the_local_remote_and_scored_by_expected_state(tmp_path: Path) -> None:
     sandbox = workspace_for(tmp_path)
     assert not sandbox.snapshot_final_state().pushed  # nothing deployed yet

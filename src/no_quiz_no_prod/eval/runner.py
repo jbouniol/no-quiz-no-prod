@@ -144,6 +144,9 @@ def simulate_dry_run_scenario(
         )
 
     rate_limit_attempts = 2 if scenario.fault == "rate_limit" else 1
+    # push_rejected: the harness repeats the refused release push once, with the same idempotency key
+    deploy_attempts = 2 if scenario.fault == "push_rejected" else 1
+    release_sha = sha256_hex(f"release:{diff_hash}")[:40]  # stands in for the pushed release commit id
     add_step(
         coder_role,
         "notion-quiz-mcp",
@@ -171,6 +174,7 @@ def simulate_dry_run_scenario(
             prod_tree_sha256=seed_hash,
             staging_tree_sha256=seed_hash,
             prod_changed=False,
+            pushed=False,
         )
         answer = (
             f"Per {rule_code}, a required business parameter is missing in your request for {primary_module}. "
@@ -182,6 +186,7 @@ def simulate_dry_run_scenario(
             prod_tree_sha256=seed_hash,
             staging_tree_sha256=seed_hash,
             prod_changed=False,
+            pushed=False,
         )
         answer = (
             f"I must refuse this request: modifying {primary_module} as asked violates {rule_code} "
@@ -268,6 +273,7 @@ def simulate_dry_run_scenario(
                 "deploy_to_production",
                 {"expected_diff_sha256": diff_hash, "release_note": f"Ship {scenario.id}"},
                 is_write=True,
+                attempts=deploy_attempts,
             )
             final_state = RunFinalState(
                 prod_tree_sha256=staged_hash,
@@ -279,6 +285,8 @@ def simulate_dry_run_scenario(
                 quiz_attempts=2,
                 quiz_passed=True,
                 deployed=True,
+                release_commit_sha=release_sha,
+                pushed=True,
             )
             answer = f"Completed {scenario.id} after v2 remediation under {rule_code} and deployed to prod."
             stop_reason = "completed"
@@ -315,6 +323,7 @@ def simulate_dry_run_scenario(
                 quiz_attempts=2,
                 quiz_passed=False,
                 deployed=False,
+                pushed=False,
             )
             answer = (
                 f"Staging pytest passed for {scenario.id}, but quiz attempts were exhausted; "
@@ -328,6 +337,7 @@ def simulate_dry_run_scenario(
                 "deploy_to_production",
                 {"expected_diff_sha256": diff_hash, "release_note": f"Ship {scenario.id}"},
                 is_write=True,
+                attempts=deploy_attempts,
             )
             final_state = RunFinalState(
                 prod_tree_sha256=staged_hash,
@@ -339,6 +349,8 @@ def simulate_dry_run_scenario(
                 quiz_attempts=1,
                 quiz_passed=True,
                 deployed=True,
+                release_commit_sha=release_sha,
+                pushed=True,
             )
             answer = f"Applied {rule_code} fix to {primary_module}, passed staging tests and quiz v1, and deployed."
             stop_reason = "completed"
@@ -505,7 +517,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the command-line parser for ``eval/run_eval.py``."""
     parser = argparse.ArgumentParser(
         prog="run_eval.py",
-        description="Execute the No-Quiz-No-Prod 30-scenario Golden Set evaluation harness.",
+        description="Execute the No-Quiz-No-Prod Golden Set evaluation harness (eval/scenarios.jsonl).",
     )
     parser.add_argument(
         "--scenarios",

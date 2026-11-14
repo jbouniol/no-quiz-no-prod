@@ -356,6 +356,10 @@ class FakeBackend:
         if self.push_failures > 0:  # the git push of the release fails: nothing is promoted or recorded
             self.push_failures -= 1
             raise ToolCallError(ToolErrorPayload(code="upstream_error", message="git push (release remote) failed"))
+        if self.fault == "push_rejected" and not self.fault_fired:  # refused once, retryable, nothing pushed
+            self.fault_fired = True
+            payload = ToolErrorPayload(code="upstream_error", message="push rejected (injected)", retryable=True)
+            raise ToolCallError(payload)
         shutil.copytree(self.root / "staging", self.root / "prod", dirs_exist_ok=True)
         self.ledger = self.ledger.record("deployed", diff.diff_sha256)
         for thread_id, entry in list(self.ship_logs.items()):
@@ -771,6 +775,17 @@ def test_rate_limit_is_retried_transparently(tmp_path: Path, backend: FakeBacken
     result = workflow.run_scenario(scenario(fault="rate_limit", max_steps=14))
     search = next(entry for entry in result.trace if entry.tool == "search_notion_rules")
     assert result.passed and search.ok and search.attempts == 2 and search.idempotency_key is None
+
+
+def test_a_rejected_push_is_retried_by_the_harness_with_the_same_key(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A")))
+    result = workflow.run_scenario(scenario(fault="push_rejected", max_steps=14))
+    assert result.passed and result.stop_reason == "completed" and result.final_state.deployed, result.why
+    (deploy,) = [entry for entry in result.trace if entry.tool == "deploy_to_production"]
+    assert deploy.agent == "system" and deploy.ok and deploy.attempts == 2 and deploy.idempotency_key
+    assert [entry.agent for entry in result.trace].count("human") == 2  # quiz + one approval: no new human action
+    keys = [args["idempotency_key"] for tool, args in backend.calls if tool == "deploy_to_production"]
+    assert keys == [deploy.idempotency_key] * 2 and len(backend.ledger.deployed) == 1  # deployed once
 
 
 def test_hallucinated_deploy_is_refused_by_the_harness(tmp_path: Path, backend: FakeBackend) -> None:

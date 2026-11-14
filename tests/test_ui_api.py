@@ -21,6 +21,7 @@ from no_quiz_no_prod.cli import _cmd_init_notion, _cmd_reset, _cmd_run, build_pa
 from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
     DEFAULT_USER_ID,
+    PROJECT_ROOT,
     DeployDecision,
     DeployGateStatus,
     DiffReport,
@@ -955,6 +956,29 @@ def test_eval_results_empty_and_populated(
     assert len(body["summary"]["cohorts"]) == 2
     assert body["summary"]["showcase_passed_key"] == "n01#0"
     assert body["summary"]["showcase_failed_or_blocked_key"] == "x01#0"
+
+
+def test_eval_mode_renders_legacy_results_without_pushed(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    """eval/results*.jsonl written before ``pushed`` existed still load, and are never flagged as unpushed deploys."""
+    client, _, eval_dir = studio_env
+    rows = [json.loads(line) for line in (PROJECT_ROOT / "eval" / "results.jsonl").read_text().splitlines() if line]
+    for row in rows:  # the shape of a campaign recorded before the deploy became a git push
+        row["final_state"].pop("pushed", None)
+        row["final_state"].pop("release_commit_sha", None)
+    legacy_rows = [json.dumps(row) for row in rows]
+    assert any(row["final_state"]["deployed"] for row in rows)
+    (eval_dir / "results.jsonl").write_text("\n".join(legacy_rows) + "\n", encoding="utf-8")
+    legacy = [EvalRunResult.model_validate_json(line) for line in legacy_rows]
+
+    res = client.get("/api/eval/results")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["available"] is True and body["summary"]["total_runs"] == len(legacy_rows)
+    assert body["summary"]["hidden_failures_count"] == sum(run.hidden_failure for run in legacy)
+    assert [run["hidden_failure"] for run in body["runs"]] == [run.hidden_failure for run in legacy]
+    assert all(run["final_state"]["pushed"] is False for run in body["runs"])
 
 
 # ---- 5. CLI Subcommands & Interactive HITL Loop ---------------------------------------------------------------------

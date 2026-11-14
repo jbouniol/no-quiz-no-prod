@@ -29,7 +29,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -188,6 +188,7 @@ class GitReleasePublisher:
         quiz_attempts: int = 0,
         applied_rules: Sequence[str] = (),
         thread_id: str | None = None,
+        reject_push: Callable[[], bool] | None = None,
     ) -> ReleaseCommit:
         """Commit ``source_dir`` (staging) on top of ``baseline_dir`` (prod) and push it to the release branch.
 
@@ -195,6 +196,9 @@ class GitReleasePublisher:
         ``thread_id`` (when known) become commit trailers next to ``Diff-SHA256``. Raises ``WorkspaceError`` (``conflict``
         when the remote moved during the deploy, ``upstream_error`` for a refused or failed push, ``timeout`` with
         ``outcome_unknown`` when git did not answer in time, ``invalid_argument`` for a bad remote or branch).
+
+        ``reject_push`` is the eval's ``push_rejected`` fault hook: asked once the release commit is built, a True
+        answer refuses that push as a retryable ``upstream_error`` before anything reaches the remote.
         """
         remote = self.resolve_remote()  # pure validation first: a bad URL never reaches git
         branch = self._branch()
@@ -227,6 +231,14 @@ class GitReleasePublisher:
             f"{key}: {_trailer_value(value)}\n" for key, value in trailers.items()
         )
         commit = self._commit_tree(target_tree, parent, message)
+        if reject_push is not None and reject_push():
+            raise WorkspaceError(
+                "upstream_error",
+                f"The release remote rejected the push to {branch!r} (injected push_rejected fault). Nothing was "
+                "pushed and production was not touched: repeating the same deploy is safe.",
+                retryable=True,
+                details={"branch": branch, "remote": remote.display, "fault": "push_rejected"},
+            )
         self._push(remote, commit, branch)
         self._git("update-ref", f"refs/heads/{branch}", commit)  # local record of the last release
         return self._release(commit, parent, branch, remote, diff_sha256, prod_tree_sha256, True)

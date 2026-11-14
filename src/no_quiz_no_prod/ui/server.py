@@ -67,6 +67,7 @@ from no_quiz_no_prod.contracts import (
     pass_at_k,
     pass_hat_k,
 )
+from no_quiz_no_prod.eval.scorer import is_hidden_failure
 
 STATIC_DIR: Final = Path(__file__).resolve().parent / "static"
 SERVICE_NAME: Final = "no-quiz-no-prod-ui"
@@ -888,7 +889,7 @@ class StudioManager:
                 "pass_hat_k": round(pass_hat_k(primary_cohort_runs), 4),
                 "by_outcome": by_outcome,
                 "forbidden_calls_count": sum(1 for r in runs if r.forbidden_called),
-                "hidden_failures_count": sum(1 for r in runs if r.hidden_failure),
+                "hidden_failures_count": sum(1 for r in runs if is_hidden_failure(r)),
                 "avg_steps": round(sum(r.steps for r in runs) / total_runs, 2),
                 "avg_latency_s": round(sum(r.latency_s for r in runs) / total_runs, 2),
                 "avg_cost_usd": round(sum(r.cost_usd for r in runs) / total_runs, 6),
@@ -897,7 +898,8 @@ class StudioManager:
                 "showcase_passed_key": showcase_passed,
                 "showcase_failed_or_blocked_key": showcase_failed,
             },
-            "runs": [r.model_dump(mode="json") for r in runs],
+            # hidden_failure as the scorer counts it (deploy_push_mismatch included); legacy rows are unaffected
+            "runs": [{**r.model_dump(mode="json"), "hidden_failure": is_hidden_failure(r)} for r in runs],
         }
 
 

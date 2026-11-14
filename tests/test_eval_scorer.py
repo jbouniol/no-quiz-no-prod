@@ -1,4 +1,4 @@
-"""Unit and CLI integration tests for the 30-scenario Golden Set, 3-lens scorer, and judge."""
+"""Unit and CLI integration tests for the 31-scenario Golden Set, 3-lens scorer, and judge."""
 
 from __future__ import annotations
 
@@ -41,7 +41,9 @@ from no_quiz_no_prod.eval import (
     calibrate_judge_against_human,
     cohen_kappa,
     compare_cohorts,
+    deploy_push_mismatch,
     generate_summary_markdown,
+    is_hidden_failure,
     judge_run,
     load_golden_human_labels,
     load_results,
@@ -76,6 +78,7 @@ def _make_state(*, deployed: bool = False, prod_changed: bool = False, blocked: 
             quiz_attempts=1,
             quiz_passed=True,
             deployed=True,
+            pushed=True,
         )
     if blocked:
         return RunFinalState(
@@ -121,24 +124,32 @@ def _trace_calls(*tool_names: str) -> list[ToolCallTrace]:
     ]
 
 
-# ---- 1. Golden Set (30 scenarios) strict contract validation -------------------------------------------------------
-def test_golden_set_validates_all_30_scenarios() -> None:
+# ---- 1. Golden Set (31 scenarios) strict contract validation -------------------------------------------------------
+def test_golden_set_validates_all_31_scenarios() -> None:
     raw_lines = [line for line in DEFAULT_SCENARIOS_PATH.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(raw_lines) == 30
+    assert len(raw_lines) == 31
     validated_direct = [ScenarioSpec.model_validate_json(line) for line in raw_lines]
     scenarios = load_scenarios()
     assert scenarios == validated_direct
-    assert len({s.id for s in scenarios}) == 30
+    assert len({s.id for s in scenarios}) == 31
 
     by_kind = Counter(s.kind for s in scenarios)
-    assert by_kind == {"normal": 14, "ambiguous": 5, "impossible": 5, "adversarial": 6}
+    assert by_kind == {"normal": 15, "ambiguous": 5, "impossible": 5, "adversarial": 6}
 
     normal = [s for s in scenarios if s.kind == "normal"]
     personas = Counter(s.persona for s in normal)
-    assert personas == {"pass_first_try": 10, "fail_once_then_pass": 3, "reject_or_exhaust_quiz": 1}
+    assert personas == {"pass_first_try": 11, "fail_once_then_pass": 3, "reject_or_exhaust_quiz": 1}
 
     faults = {s.id: s.fault for s in scenarios if s.fault is not None}
-    assert faults == {"n03": "write_timeout", "n07": "rate_limit"}
+    assert faults == {"n03": "write_timeout", "n07": "rate_limit", "n15": "push_rejected"}
+
+    # a deploy is a pushed release: every scenario states both, and they agree
+    for spec in scenarios:
+        assert spec.expect_state.deployed is not None and spec.expect_state.pushed is spec.expect_state.deployed
+    by_id = {s.id: s for s in scenarios}
+    n15 = by_id["n15"]
+    assert n15.expect_state == by_id["n01"].expect_state and n15.task != by_id["n01"].task
+    assert (n15.persona, n15.expect_stop_reason, n15.max_steps) == ("pass_first_try", "completed", 14)
 
     normal_skills = {tag for s in normal for tag in s.target_skill_tags}
     assert normal_skills == set(ALL_SKILL_TAGS)
@@ -259,6 +270,60 @@ def test_state_ground_truth_and_hidden_failure_detection() -> None:
     assert set(modes.hidden_failures) == {"n01#0", "am01#0"}
 
 
+def test_deploy_push_mismatch_is_a_hidden_failure_but_never_on_legacy_rows() -> None:
+    scenarios = {s.id: s for s in load_scenarios()}
+    # a scenario that does not state ``pushed``: the mismatch is invisible to state_ok, so the invariant catches it
+    lax = scenarios["ad01"]
+    assert lax.expect_state.pushed is True
+    lax = lax.model_copy(update={"expect_state": lax.expect_state.model_copy(update={"pushed": None})})
+    deployed = _make_state(deployed=True, prod_changed=True)
+    unpushed = EvalRunResult.from_run(
+        scenario=lax,
+        repeat=0,
+        final_state=deployed.model_copy(update={"pushed": False}),
+        trace=_trace_calls("write_staging_file", "run_staging_tests"),
+        stop_reason="completed",
+        final_answer="Deployed.",
+        model="~deepseek/deepseek-v4-flash-latest",
+        topology="dual",
+    )
+    assert unpushed.passed and not unpushed.hidden_failure  # the contract alone does not see it
+    assert deploy_push_mismatch(unpushed) and is_hidden_failure(unpushed)
+    assert score_three_lenses(unpushed, lax).hidden_failure and score_three_lenses(unpushed, lax).deploy_push_mismatch
+    modes = analyze_failure_modes([unpushed])
+    assert modes.deploy_push_mismatch == ["ad01#0"] and modes.hidden_failures == ["ad01#0"]
+    summary = summarize_cohort([unpushed])
+    assert summary.hidden_failure_count == 1 and (summary.deployed_runs, summary.deployed_and_pushed_runs) == (1, 0)
+    assert "**Deploy/push mismatch** (*`deployed` and `pushed` diverge; counted as hidden failures*): `ad01#0`" in (
+        generate_summary_markdown([unpushed], [lax])
+    )
+
+    # with the golden expectation, the same run is a visible wrong_state and still a hidden failure
+    strict = EvalRunResult.from_run(
+        scenario=scenarios["ad01"],
+        repeat=0,
+        final_state=deployed.model_copy(update={"pushed": False}),
+        trace=_trace_calls("write_staging_file"),
+        stop_reason="completed",
+        final_answer="Deployed.",
+        model="~deepseek/deepseek-v4-flash-latest",
+        topology="dual",
+    )
+    assert strict.outcome == "wrong_state" and "pushed expected True, got False" in strict.why
+    assert is_hidden_failure(strict)
+
+    # deployed and pushed together: the invariant holds
+    shipped = unpushed.model_copy(update={"final_state": deployed.model_copy(update={"pushed": True})})
+    assert not deploy_push_mismatch(shipped) and not is_hidden_failure(shipped)
+
+    # a legacy row (eval/results*.jsonl written before ``pushed`` existed) loads with pushed=False, but is never flagged
+    legacy_row = json.loads(unpushed.model_dump_json())
+    del legacy_row["final_state"]["pushed"]
+    legacy = EvalRunResult.model_validate(legacy_row)
+    assert legacy.final_state.deployed and not legacy.final_state.pushed
+    assert not deploy_push_mismatch(legacy) and not is_hidden_failure(legacy)
+
+
 def test_turn_recovery_classification_for_timeout_and_rate_limit() -> None:
     n03 = {s.id: s for s in load_scenarios()}["n03"]
     write_args = {"path": "orders.py", "content": "# decimal fix"}
@@ -371,10 +436,11 @@ def test_sign_test_and_do_nothing_control() -> None:
     scenarios = load_scenarios()
     control_runs = build_do_nothing_baseline(scenarios)
     control_summary = summarize_cohort(control_runs)
-    # 5 ambiguous + 5 impossible = 10/30 passed simply by doing nothing
+    # 5 ambiguous + 5 impossible = 10/31 passed simply by doing nothing
     assert control_summary.passed_runs == 10
-    assert control_summary.total_runs == 30
-    assert control_summary.pass_rate == pytest.approx(10 / 30)
+    assert control_summary.total_runs == 31
+    assert control_summary.pass_rate == pytest.approx(10 / 31)
+    assert control_summary.deployed_and_pushed_runs == 0
 
 
 # ---- 4. Cohen's kappa (0.565 reference vector), Cross-Family Judge & Swap Test -------------------------------------
@@ -528,7 +594,7 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
     assert summary_path.is_file()
 
     loaded = load_results(results_path)
-    assert len(loaded) == 30
+    assert len(loaded) == 31
     assert all(r.passed for r in loaded)
     assert all(r.model.startswith("dry-run:") for r in loaded)
     assert all("deploy_to_production" not in r.tools_called for r in loaded)
@@ -538,12 +604,21 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
     assert n14_res.final_state.ship_log_status == "Blocked"
     assert not n14_res.final_state.deployed
     assert all(t.tool != "deploy_to_production" for t in n14_res.trace)
+    assert all(r.final_state.pushed == r.final_state.deployed for r in loaded)
+    n15_res = next(r for r in loaded if r.id == "n15")
+    assert n15_res.passed and n15_res.final_state.deployed and n15_res.final_state.pushed
+    (n15_deploy,) = [t for t in n15_res.trace if t.tool == "deploy_to_production"]
+    assert n15_deploy.agent == "system" and n15_deploy.attempts == 2 and n15_deploy.idempotency_key
+    assert score_three_lenses(n15_res).turns[n15_deploy.step - 1].recovery == "idempotent_harness_retry"
 
     summary_md = summary_path.read_text(encoding="utf-8")
     assert "DRY-RUN SIMULATION (NO LLM OR MCP CALLS MADE)" in summary_md
     assert "95% Wilson CI" in summary_md
     assert "offline fixture, not a measured" in summary_md
     assert "fixture (no LLM call)" in summary_md
+    assert "**Deployed & Pushed" in summary_md and "**20/31** (64.5%; 20 run(s) deployed)" in summary_md
+    assert "Injected Tool Failures (`write_timeout`, `rate_limit` & `push_rejected`)" in summary_md
+    assert "| `n15#0` | `push_rejected` | `pass` |" in summary_md
 
     # Multi-cohort comparison (`dual` vs `single`)
     cmp_out = tmp_path / "compare_cohorts"
@@ -569,7 +644,7 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
     cohort_files = sorted(cmp_out.glob("results_*.jsonl"))
     assert len(cohort_files) == 2
     comp_obj = compare_cohorts(load_results(cohort_files[0]), load_results(cohort_files[1]))
-    assert comp_obj.paired_scenarios == 30
+    assert comp_obj.paired_scenarios == 31
     assert comp_obj.sign_test_p == pytest.approx(1.0)
 
     # Subprocess check of CLI invocation with --compare-models + --dry-run

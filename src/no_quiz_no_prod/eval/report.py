@@ -71,7 +71,7 @@ def _fault_and_adversarial_section(
     if fault_rows:
         lines.extend(
             [
-                "### Injected Tool Failures (`write_timeout` & `rate_limit`)",
+                "### Injected Tool Failures (`write_timeout`, `rate_limit` & `push_rejected`)",
                 "",
                 "| Run | Fault | Outcome | Steps | Safe Recoveries | Unsafe Recoveries | Recovery Actions |",
                 "| :--- | :--- | :---: | :---: | :---: | :---: | :--- |",
@@ -217,7 +217,8 @@ def generate_summary_markdown(
         f"- **Right Final State (`state_ok`)**: **{summary.state_ok_runs}/{summary.total_runs}** ({_fmt_pct(summary.state_ok_rate)})",
         f"- **Strict Pass (`outcome == 'pass'`)**: **{summary.passed_runs}/{summary.total_runs}** (**{_fmt_pct(summary.pass_rate)}**, scenario-level 95% Wilson CI: `{_fmt_pct(summary.wilson_95_low)}` to `{_fmt_pct(summary.wilson_95_high)}`)",
         f"- **Reliability**: `{k_col_at}` = **{_fmt_pct(summary.pass_at_k)}** · `{k_col_hat}` = **{_fmt_pct(summary.pass_hat_k)}**",
-        f"- **Hidden Failures (`state_ok` yet unsafe/over-budget)**: **{summary.hidden_failure_count}**",
+        f"- **Deployed & Pushed (`deployed` and `pushed`: the release commit is on the remote)**: **{summary.deployed_and_pushed_runs}/{summary.total_runs}** ({_fmt_pct(summary.deployed_and_pushed_rate)}; {summary.deployed_runs} run(s) deployed)",
+        f"- **Hidden Failures (`state_ok` yet unsafe/over-budget, or `deploy_push_mismatch`)**: **{summary.hidden_failure_count}**",
         f"- **Efficiency & Cost**: `{summary.total_tokens:,}` tokens · avg latency `{summary.avg_latency_s:.2f}s` · total `{_fmt_usd(summary.total_cost_usd)}` (`{summary.tokens_per_passed_run:,}` tokens / `{_fmt_usd(summary.cost_per_passed_run_usd)}` per passed run)",
     ]
     if control_line:
@@ -255,6 +256,7 @@ def generate_summary_markdown(
             f"- **Unsafe success** (*right state, forbidden tool called*): {_fmt_list_or_none(fm.unsafe)}",
             f"- **Unstable success** (*passes some repeats, fails others*): {_fmt_list_or_none(fm.unstable)}",
             f"- **Expensive success** (*right state, over step budget; tokens vs median passing `{fm.median_passing_tokens:,}`*): {_fmt_list_or_none(fm.expensive)}",
+            f"- **Deploy/push mismatch** (*`deployed` and `pushed` diverge; counted as hidden failures*): {_fmt_list_or_none(fm.deploy_push_mismatch)}",
             f"- **Visible wrong state**: {_fmt_list_or_none(fm.wrong_state)}",
             f"- **Provider API errors**: {_fmt_list_or_none(fm.api_errors)}",
             "",
@@ -320,7 +322,7 @@ def generate_comparison_markdown(
         sig_note = (
             "statistically significant at $\\alpha = 0.05$"
             if comp.sign_test_p < 0.05
-            else "not statistically distinguishable at $\\alpha = 0.05$ on 30 scenarios (effect size / cost-latency trade-off governs selection)"
+            else f"not statistically distinguishable at $\\alpha = 0.05$ on {comp.paired_scenarios} scenarios (effect size / cost-latency trade-off governs selection)"
         )
         cost_str = f"`{comp.cost_ratio_b_over_a:.2f}x`" if comp.cost_ratio_b_over_a is not None else "`n/a`"
         lat_str = f"`{comp.latency_ratio_b_over_a:.2f}x`" if comp.latency_ratio_b_over_a is not None else "`n/a`"
