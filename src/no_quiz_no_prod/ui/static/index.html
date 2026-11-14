@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>No-Quiz-No-Prod</title>
+    <meta name="nq-session-token" content="__NQ_SESSION_TOKEN__" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -550,6 +551,7 @@
           <div class="eval-minimal-header__left">
             <h1 class="eval-minimal-title">Evaluation</h1>
             <span id="explorer-source-label" class="mono-chip mono-chip--compact">eval/results.jsonl</span>
+            <span id="explorer-invalid-rows" class="pill" data-status="Staging" hidden></span>
           </div>
           <div class="eval-minimal-header__actions">
             <button type="button" id="btn-showcase-passed" class="showcase-btn showcase-btn--pass">

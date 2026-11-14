@@ -7,12 +7,14 @@ import json
 import os
 import re
 import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from testkit import FIXED_FINTECH_ORDERS, SCRIPTED_MODEL, ScriptedLLM, call, parse_sse_events, turn
@@ -21,7 +23,6 @@ from no_quiz_no_prod.cli import _cmd_init_notion, _cmd_reset, _cmd_run, build_pa
 from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
     DEFAULT_USER_ID,
-    PROJECT_ROOT,
     DeployDecision,
     DeployGateStatus,
     DiffReport,
@@ -34,6 +35,7 @@ from no_quiz_no_prod.contracts import (
     InjectionSpec,
     NotionRule,
     OptionTexts,
+    PendingRelease,
     PublicQuizView,
     PytestReport,
     QuizAnswer,
@@ -53,7 +55,9 @@ from no_quiz_no_prod.contracts import (
     Topology,
     compute_tree_sha256,
 )
-from no_quiz_no_prod.ui.server import STATIC_DIR, _load_notion_rules, create_app
+from no_quiz_no_prod.graph.workflow import ThreadStateError
+from no_quiz_no_prod.ui.security import SESSION_TOKEN_HEADER, allowed_hosts_from
+from no_quiz_no_prod.ui.server import STATIC_DIR, _load_notion_rules, create_app, same_origin_client_kwargs
 
 
 # ---- deterministic in-memory test doubles implementing #14 §4 & §5 --------------------------------------------------
@@ -66,6 +70,7 @@ class StubWorkflowOutcome:
     trace: list[ToolCallTrace]
     budget: RunBudget
     final_state: RunFinalState
+    pending_release: PendingRelease | None = None
 
 
 class StubSandboxWorkspace:
@@ -81,6 +86,7 @@ class StubSandboxWorkspace:
         self.latest_quiz_by_thread: dict[str, str] = {}
         self.skills: dict[str, dict[str, SkillProfileRecord]] = {}
         self.fault: FaultKind | None = None
+        self.ledger = GateLedger()
         self.reset()
 
     def reset(
@@ -99,8 +105,7 @@ class StubSandboxWorkspace:
                 child.unlink()
             (d / "orders.py").write_text("def calc(x):\n    return round(x * 1.2, 2)\n", encoding="utf-8")
 
-        if self.settings.gate_ledger_path.is_file():
-            self.settings.gate_ledger_path.unlink()
+        self.ledger = GateLedger()
         self.pytest_report = None
         self.ship_logs.clear()
         self.quizzes.clear()
@@ -124,8 +129,7 @@ class StubSandboxWorkspace:
             diff_sha256=diff.diff_sha256,
             duration_s=0.21,
         )
-        ledger = GateLedger.load(self.settings.gate_ledger_path).record("tests_passed", diff.diff_sha256)
-        ledger.save(self.settings.gate_ledger_path)
+        self.ledger = self.ledger.record("tests_passed", diff.diff_sha256)
 
         self.ship_logs[thread_id] = ShipLogEntry(
             title="Fix binary float VAT drift in orders.py",
@@ -262,12 +266,10 @@ class StubSandboxWorkspace:
     ) -> QuizGradeResult:
         question = self.quizzes[question_id]
         grade = question.grade(selected_option)
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
         if grade.passed:
-            ledger = ledger.record("quiz_passed", grade.diff_sha256)
+            self.ledger = self.ledger.record("quiz_passed", grade.diff_sha256)
         elif grade.deployment_blocked:
-            ledger = ledger.record("blocked", grade.diff_sha256)
-        ledger.save(self.settings.gate_ledger_path)
+            self.ledger = self.ledger.record("blocked", grade.diff_sha256)
 
         prev_log = self.ship_logs.get(question.thread_id)
         if prev_log:
@@ -299,25 +301,22 @@ class StubSandboxWorkspace:
 
     def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus:
         diff = self.get_diff_report()
-        target_sha = decision.expected_diff_sha256 or diff.diff_sha256
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
+        target_sha = decision.expected_diff_sha256
         if decision.approved:
-            ledger = ledger.record("human_approved", target_sha)
+            self.ledger = self.ledger.record("human_approved", target_sha)
         else:
-            ledger = ledger.record("blocked", target_sha)
+            self.ledger = self.ledger.record("blocked", target_sha)
             if thread_id and thread_id in self.ship_logs:
                 prev = self.ship_logs[thread_id]
                 self.ship_logs[thread_id] = ShipLogEntry(**{**prev.model_dump(), "status": "Blocked"})
-        ledger.save(self.settings.gate_ledger_path)
-        return ledger.status(diff.diff_sha256, decision.expected_diff_sha256)
+        return self.ledger.status(diff.diff_sha256, decision.expected_diff_sha256)
 
     def promote_to_prod(self, thread_id: str, expected_diff_sha256: str) -> None:
         (self.prod_dir / "orders.py").write_text(
             (self.staging_dir / "orders.py").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        ledger = GateLedger.load(self.settings.gate_ledger_path).record("deployed", expected_diff_sha256)
-        ledger.save(self.settings.gate_ledger_path)
+        self.ledger = self.ledger.record("deployed", expected_diff_sha256)
         prev = self.ship_logs[thread_id]
         self.ship_logs[thread_id] = ShipLogEntry(
             **{
@@ -327,10 +326,11 @@ class StubSandboxWorkspace:
             }
         )
 
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus:
-        diff = self.get_diff_report()
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
-        return ledger.status(diff.diff_sha256, expected_diff_sha256)
+    def get_gate_status(self, expected_diff_sha256: str) -> DeployGateStatus:
+        return self.ledger.status(self.get_diff_report().diff_sha256, expected_diff_sha256)
+
+    def gate_status_of(self, diff_sha256: str) -> DeployGateStatus:
+        return self.ledger.status(diff_sha256, diff_sha256)
 
     def get_skill_profile(self, user_id: str = DEFAULT_USER_ID) -> list[SkillProfileRecord]:
         bucket = self.skills.get(user_id, {})
@@ -354,9 +354,8 @@ class StubSandboxWorkspace:
     def snapshot_final_state(self, thread_id: str | None = None) -> RunFinalState:
         diff = self.get_diff_report()
         log = self.get_latest_ship_log(thread_id)
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
-        deployed = bool(log and log.diff_sha256 and log.diff_sha256 in ledger.deployed)
-        quiz_passed = bool(log and log.diff_sha256 and log.diff_sha256 in ledger.quiz_passed)
+        deployed = bool(log and log.diff_sha256 and log.diff_sha256 in self.ledger.deployed)
+        quiz_passed = bool(log and log.diff_sha256 and log.diff_sha256 in self.ledger.quiz_passed)
         return RunFinalState(
             prod_tree_sha256=diff.prod_tree_sha256,
             staging_tree_sha256=diff.staging_tree_sha256,
@@ -453,6 +452,8 @@ class StubWorkflow:
         user_id: str = DEFAULT_USER_ID,
         on_event: Callable[[RunEvent], None] | None = None,
     ) -> tuple[QuizGradeResult, StubWorkflowOutcome]:
+        if thread_id not in self.workspace.latest_quiz_by_thread:
+            raise ThreadStateError(f"thread {thread_id!r} is not waiting for a quiz answer")
         qid = self.workspace.latest_quiz_by_thread[thread_id]
         grade = self.workspace.grade_quiz_answer(qid, answer.selected_option, user_id=user_id)
         trace: list[ToolCallTrace] = []
@@ -481,7 +482,7 @@ class StubWorkflow:
                 quiz=next_pub,
             )
         elif grade.passed:
-            locks = self.workspace.get_gate_status(expected_diff_sha256=grade.diff_sha256)
+            locks = self.workspace.get_gate_status(grade.diff_sha256)
             interrupt = HumanInterrupt(
                 kind="deploy_approval",
                 thread_id=thread_id,
@@ -516,7 +517,7 @@ class StubWorkflow:
     ) -> StubWorkflowOutcome:
         _ = (user_id, on_event)
         if thread_id not in self.workspace.ship_logs:
-            raise KeyError(f"Unknown thread '{thread_id}' in workflow checkpoint store")
+            raise ThreadStateError(f"thread {thread_id!r} is not waiting for a deploy decision")
         locks = self.workspace.apply_deploy_decision(decision, thread_id=thread_id)
         if decision.approved and locks.can_deploy and decision.expected_diff_sha256:
             self.workspace.promote_to_prod(thread_id, decision.expected_diff_sha256)
@@ -537,8 +538,17 @@ class StubWorkflow:
         )
 
 
-@pytest.fixture
-def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
+WorkflowBuilder = Callable[[StubSandboxWorkspace, Topology, str], StubWorkflow]
+
+
+def page_client(app: FastAPI, **kwargs: object) -> TestClient:
+    """An in-process client that sends what the Studio page sends: allowed Host, same Origin, session token."""
+    return TestClient(app, **same_origin_client_kwargs(app), **kwargs)  # type: ignore[arg-type]
+
+
+def build_studio(
+    tmp_path: Path, workflow_builder: WorkflowBuilder | None = None
+) -> tuple[FastAPI, StubSandboxWorkspace, Path]:
     ws_dir = tmp_path / "runtime_ws"
     eval_dir = tmp_path / "eval"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -567,6 +577,8 @@ def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
     stub_ws = StubSandboxWorkspace(settings)
 
     def wf_factory(_cfg: RuntimeSettings, topology: Topology, model: str) -> StubWorkflow:
+        if workflow_builder is not None:
+            return workflow_builder(stub_ws, topology, model)
         return StubWorkflow(stub_ws, topology=topology, model=model)
 
     app = create_app(
@@ -577,7 +589,13 @@ def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
         notion_ids_file=notion_ids_path,
         env_file=tmp_path / ".env",
     )
-    return TestClient(app), stub_ws, eval_dir
+    return app, stub_ws, eval_dir
+
+
+@pytest.fixture
+def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
+    app, stub_ws, eval_dir = build_studio(tmp_path)
+    return page_client(app), stub_ws, eval_dir
 
 
 # ---- 1. Static Assets, Token Purity & XSS Safety Invariants ---------------------------------------------------------
@@ -958,27 +976,79 @@ def test_eval_results_empty_and_populated(
     assert body["summary"]["showcase_failed_or_blocked_key"] == "x01#0"
 
 
+def _eval_run(run_id: str, *, deployed: bool, passed_quiz: bool = True, kind: str = "normal") -> EvalRunResult:
+    """A small EvalRunResult fixture (no dependency on the committed eval campaigns)."""
+    sha = "c" * 64
+    return EvalRunResult.from_run(
+        scenario=ScenarioSpec(
+            id=run_id,
+            kind=kind,  # type: ignore[arg-type]
+            task=f"task {run_id}",
+            expect_state=ExpectedState(deployed=deployed),
+        ),
+        repeat=0,
+        final_state=RunFinalState(
+            prod_tree_sha256=sha,
+            staging_tree_sha256=sha,
+            prod_changed=deployed,
+            tests_passed=True,
+            ship_log_status="Deployed to Prod" if deployed else "Blocked",
+            doc_version="v1",
+            quiz_attempts=1,
+            quiz_passed=passed_quiz,
+            deployed=deployed,
+            pushed=deployed,
+        ),
+        trace=[],
+        stop_reason="completed" if deployed else "quiz_failed",
+        final_answer="ok",
+        model="fixture-model",
+        topology="dual",
+    )
+
+
 def test_eval_mode_renders_legacy_results_without_pushed(
     studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
 ) -> None:
-    """eval/results*.jsonl written before ``pushed`` existed still load, and are never flagged as unpushed deploys."""
+    """Result rows written before ``pushed`` existed still load, and are never flagged as unpushed deploys."""
     client, _, eval_dir = studio_env
-    rows = [json.loads(line) for line in (PROJECT_ROOT / "eval" / "results.jsonl").read_text().splitlines() if line]
+    rows = [
+        json.loads(run.model_dump_json()) for run in (_eval_run("n01", deployed=True), _eval_run("n02", deployed=False))
+    ]
     for row in rows:  # the shape of a campaign recorded before the deploy became a git push
-        row["final_state"].pop("pushed", None)
+        del row["final_state"]["pushed"]
         row["final_state"].pop("release_commit_sha", None)
     legacy_rows = [json.dumps(row) for row in rows]
-    assert any(row["final_state"]["deployed"] for row in rows)
     (eval_dir / "results.jsonl").write_text("\n".join(legacy_rows) + "\n", encoding="utf-8")
     legacy = [EvalRunResult.model_validate_json(line) for line in legacy_rows]
 
     res = client.get("/api/eval/results")
     assert res.status_code == 200
     body = res.json()
-    assert body["available"] is True and body["summary"]["total_runs"] == len(legacy_rows)
-    assert body["summary"]["hidden_failures_count"] == sum(run.hidden_failure for run in legacy)
-    assert [run["hidden_failure"] for run in body["runs"]] == [run.hidden_failure for run in legacy]
+    assert body["available"] is True and body["summary"]["total_runs"] == 2 and body["invalid_rows"] == 0
+    assert body["summary"]["hidden_failures_count"] == sum(run.hidden_failure for run in legacy) == 0
+    assert [run["hidden_failure"] for run in body["runs"]] == [False, False]
     assert all(run["final_state"]["pushed"] is False for run in body["runs"])
+
+
+def test_eval_results_skip_and_count_malformed_rows(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    """UI-06: one bad line in a results file is skipped and reported; it never turns the Eval view into a 500."""
+    client, _, eval_dir = studio_env
+    good = _eval_run("n01", deployed=True).model_dump_json()
+    (eval_dir / "results.jsonl").write_text(f'{{not json}}\n{good}\n{{"id": "half a row"}}\n', encoding="utf-8")
+
+    res = client.get("/api/eval/results")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["available"] is True and body["invalid_rows"] == 2
+    assert [run["key"] for run in body["runs"]] == ["n01#0"]
+
+    (eval_dir / "results.jsonl").write_text("{not json}\n", encoding="utf-8")
+    only_bad = client.get("/api/eval/results")
+    assert only_bad.status_code == 200
+    assert only_bad.json()["available"] is False and only_bad.json()["invalid_rows"] == 1
 
 
 # ---- 5. CLI Subcommands & Interactive HITL Loop ---------------------------------------------------------------------
@@ -1041,7 +1111,7 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
     # 3. Unknown thread MUST return 409 gate_locked on both quiz and deploy — NEVER fake deployed: True!
     bad_quiz = client.post("/api/runs/unknown_thr_999/quiz", json={"selected_option": "A"})
     assert bad_quiz.status_code == 409
-    assert bad_quiz.json()["code"] == "gate_locked"
+    assert bad_quiz.json()["code"] == "conflict"  # no quiz to answer on that thread: not a locked gate
 
     # Even after passing quiz on 'thr_persist' (so workspace Locks 1-3 hold), 'unknown_thr_999' MUST NOT fake deploy!
     resumed_quiz = client.post("/api/runs/thr_persist/quiz", json={"selected_option": "A"})
@@ -1056,7 +1126,7 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
     )
     assert fake_deploy.status_code == 409
     assert fake_deploy.json()["deployed"] is False
-    assert fake_deploy.json()["code"] == "gate_locked"
+    assert fake_deploy.json()["code"] == "conflict"  # no deploy decision to take on that thread
     assert not stub_ws.get_diff_report().trees_identical  # prod/ remained untouched!
 
     # 4. Resuming the real persisted thread after restart routes through workflow_factory and genuinely deploys
@@ -1203,7 +1273,7 @@ def test_post_apikey_updates_temp_env_0600_without_leaking_secrets(
         json={"provider": "openrouter", "api_key": secret_or},
         headers={"Origin": "https://evil.example.com", "Host": "127.0.0.1:8000"},
     )
-    assert cross_origin.status_code == 403
+    assert cross_origin.status_code == 403 and cross_origin.json()["code"] == "forbidden_origin"
     assert secret_or not in cross_origin.text
 
     # 2. Save OpenRouter, Anthropic, and Notion keys sequentially
@@ -1263,10 +1333,17 @@ def test_git_remote_status_and_write_only_github_settings(
 
     # 1. A URL with embedded credentials or a non-https scheme is refused before anything is written, never echoed
     leaky = f"https://x-access-token:{token}@github.com/acme/fintech-release.git"
-    refused = client.post("/api/apikey", json={"provider": "git_remote", "api_key": leaky})
+    confirmed = {"provider": "git_remote", "confirm_remote_change": True}
+    refused = client.post("/api/apikey", json={**confirmed, "api_key": leaky})
     assert refused.status_code == 422 and token not in refused.text and "NO_QUIZ_GITHUB_TOKEN" in refused.text
-    ssh = client.post("/api/apikey", json={"provider": "git_remote", "api_key": "ssh://git@github.com/acme/r.git"})
+    ssh = client.post("/api/apikey", json={**confirmed, "api_key": "ssh://git@github.com/acme/r.git"})
     assert ssh.status_code == 422
+    # An https host outside the allow-list (github.com by default) is refused even when confirmed (UI-36D):
+    # the token is never bound to a remote that is not an allowed host.
+    foreign = client.post("/api/apikey", json={**confirmed, "api_key": "https://git.attacker.example/steal.git"})
+    assert foreign.status_code == 422 and foreign.json()["code"] == "invalid_argument"
+    assert "attacker.example" not in foreign.text
+    assert client.get("/api/health").json()["git"] == local_view
     assert not env_file.exists() or "NO_QUIZ_GIT_REMOTE_URL" not in env_file.read_text(encoding="utf-8")
 
     # 2. Token and URL are accepted under their provider names or their env var names, and never returned
@@ -1274,7 +1351,13 @@ def test_git_remote_status_and_write_only_github_settings(
     assert saved_token.status_code == 200 and token not in saved_token.text
     assert saved_token.json()["provider"] == "github" and saved_token.json()["git"]["token_set"] is True
     assert saved_token.json()["providers"] == {"openrouter": True, "anthropic": False, "notion": False}
-    saved_url = client.post("/api/apikey", json={"provider": "git_remote", "api_key": url})
+    unconfirmed = client.post("/api/apikey", json={"provider": "git_remote", "api_key": url})
+    assert unconfirmed.status_code == 422 and unconfirmed.json()["confirmation_required"] is True
+    assert url not in unconfirmed.text and "NO_QUIZ_GIT_REMOTE_URL" not in env_file.read_text(encoding="utf-8")
+    assert studio.settings.git_remote_url is None  # nothing changed in memory either
+    saved_url = client.post(
+        "/api/apikey", json={"provider": "git_remote", "api_key": url, "confirm_remote_change": True}
+    )
     assert saved_url.status_code == 200 and url not in saved_url.text
     github_view = {"remote_kind": "https", "repo": "acme/fintech-release", "branch": "main", "token_set": True}
     assert saved_url.json()["git"] == github_view
@@ -1372,7 +1455,7 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
     )
     responses: list[str] = []
     try:
-        with TestClient(app) as client:
+        with page_client(app) as client:
             client.post("/api/reset", json={"user_id": DEFAULT_USER_ID, "reset_skill_memory": True})
             run = {
                 "prompt": "Fix VAT rounding in orders.py per RULE-001.",
@@ -1432,3 +1515,236 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
         for workflow in workflows:
             workflow.close()
     assert all(RELEASE_TOKEN not in text for text in responses)  # never in a stream, a result or an error
+
+
+# ---- 12. Request guard (C11): Host allow-list, same Origin and session token on every state-changing route --------------
+STATE_CHANGING_ROUTES = [
+    ("POST", "/api/apikey", {"provider": "openrouter", "api_key": "sk-or-guard-probe"}),
+    ("POST", "/api/reset", {"seed": "fintech"}),
+    ("POST", "/api/runs/stream", {"prompt": "Stage fix", "thread_id": "thr_guard"}),
+    ("POST", "/api/runs/thr_guard/quiz", {"selected_option": "A"}),
+    ("POST", "/api/runs/thr_guard/deploy", {"action": "approve", "expected_diff_sha256": "0" * 64}),
+    ("DELETE", "/api/memory/dev_default", None),
+]
+PAGE_ORIGIN = "http://127.0.0.1:8000"
+
+
+@pytest.mark.parametrize(("method", "path", "body"), STATE_CHANGING_ROUTES)
+def test_guard_refuses_state_changes_without_host_origin_and_token(
+    tmp_path: Path, method: str, path: str, body: dict[str, object] | None
+) -> None:
+    app, stub_ws, _ = build_studio(tmp_path)
+    token = app.state.session_token
+    studio = app.state.studio
+    stub_ws.skills["dev_default"] = {"decimal_rounding": SkillProfileRecord(skill_tag="decimal_rounding")}
+    resets: list[str] = []
+    real_reset = stub_ws.reset
+
+    def counted_reset(*args: object, **kwargs: object) -> RunFinalState:
+        resets.append("reset")
+        return real_reset(*args, **kwargs)  # type: ignore[arg-type]
+
+    stub_ws.reset = counted_reset  # type: ignore[method-assign]
+    client = TestClient(app, base_url=PAGE_ORIGIN)  # a bare client: nothing is sent unless the case sends it
+    good = {"Origin": PAGE_ORIGIN, SESSION_TOKEN_HEADER: token}
+
+    cases: dict[str, tuple[dict[str, str], int, str]] = {
+        "no Origin header": ({SESSION_TOKEN_HEADER: token}, 403, "forbidden_origin"),
+        "another site's Origin": ({**good, "Origin": "https://evil.example.com"}, 403, "forbidden_origin"),
+        "opaque Origin": ({**good, "Origin": "null"}, 403, "forbidden_origin"),
+        "same host, other port": ({**good, "Origin": "http://127.0.0.1:9999"}, 403, "forbidden_origin"),
+        "no session token": ({"Origin": PAGE_ORIGIN}, 403, "invalid_session"),
+        "wrong session token": ({**good, SESSION_TOKEN_HEADER: "x" * len(token)}, 403, "invalid_session"),
+        "empty session token": ({**good, SESSION_TOKEN_HEADER: ""}, 403, "invalid_session"),
+        # DNS rebinding: the page and the request agree on a name that is not an allowed host
+        "foreign Host": (
+            {"Host": "evil.example.com:8000", "Origin": "http://evil.example.com:8000", SESSION_TOKEN_HEADER: token},
+            400,
+            "invalid_host",
+        ),
+    }
+    for name, (headers, status, code) in cases.items():
+        response = client.request(method, path, json=body, headers=headers)
+        assert (response.status_code, response.json()["code"]) == (status, code), name
+
+    # None of the refused requests reached a route: nothing written, started, reset or forgotten.
+    assert not studio.env_file.exists()
+    assert studio.sessions == {} and studio.busy is None and resets == []
+    assert "dev_default" in stub_ws.skills
+    assert stub_ws.get_diff_report().trees_identical
+
+    # The same request with the three proofs passes the guard (whatever the route then answers).
+    accepted = client.request(method, path, json=body, headers=good)
+    assert accepted.status_code not in (400, 403), accepted.text
+
+
+def test_guard_host_allow_list_covers_reads_and_the_page_carries_the_token(tmp_path: Path) -> None:
+    app, _, _ = build_studio(tmp_path)
+    client = TestClient(app, base_url=PAGE_ORIGIN)
+
+    for path in ("/", "/api/state", "/api/health", "/api/eval/results", "/static/app.js"):
+        assert client.get(path).status_code == 200, path
+        rebound = client.get(path, headers={"Host": "evil.example.com:8000"})
+        assert rebound.status_code == 400 and rebound.json()["code"] == "invalid_host", path
+        assert client.get(path, headers={"Host": "localhost:8000"}).status_code == 200, path
+        assert client.get(path, headers={"Host": "[::1]:8000"}).status_code == 200, path
+
+    # The token is delivered inside the page only (never by an API route), and the page is not cacheable.
+    page = client.get("/")
+    assert f'<meta name="nq-session-token" content="{app.state.session_token}" />' in page.text
+    assert "__NQ_SESSION_TOKEN__" not in page.text and page.headers["cache-control"] == "no-store"
+    assert "__NQ_SESSION_TOKEN__" in (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    for path in ("/api/state", "/api/health", "/static/index.html"):
+        assert app.state.session_token not in client.get(path).text, path
+
+    # Two server instances never share a token; an explicit allow-list replaces the default one.
+    other, _, _ = build_studio(tmp_path / "other")
+    assert other.state.session_token != app.state.session_token and len(app.state.session_token) >= 32
+    assert allowed_hosts_from("0.0.0.0", ["Studio.Example:8443"]) == ("127.0.0.1", "localhost", "::1", "studio.example")
+    assert allowed_hosts_from("192.168.1.20") == ("127.0.0.1", "localhost", "::1", "192.168.1.20")
+
+
+# ---- 13. One active run per workspace (C10): 409 run_active for a second run, a Reset or a settings change --------------
+class BlockingWorkflow(StubWorkflow):
+    """A workflow whose run stays in flight until the test releases it."""
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def start_run(self, task: str, **kwargs: object) -> StubWorkflowOutcome:  # type: ignore[override]
+        self.started.set()
+        assert self.release.wait(timeout=30), "the test never released the run"
+        return super().start_run(task, **kwargs)  # type: ignore[arg-type]
+
+
+def test_second_run_reset_and_settings_change_are_refused_while_a_run_is_active(tmp_path: Path) -> None:
+    BlockingWorkflow.started.clear()
+    BlockingWorkflow.release.clear()
+    app, stub_ws, _ = build_studio(tmp_path, lambda ws, topology, model: BlockingWorkflow(ws, topology, model))
+    studio = app.state.studio
+    first_response: list[str] = []
+
+    def first_run() -> None:
+        response = page_client(app).post("/api/runs/stream", json={"prompt": "Stage fix", "thread_id": "thr_one"})
+        first_response.append(response.text)
+
+    runner = threading.Thread(target=first_run)
+    runner.start()
+    try:
+        assert BlockingWorkflow.started.wait(timeout=30)
+        client = page_client(app)
+        assert client.get("/api/state").json()["active_run"]["busy"] == "run"
+
+        refused = {
+            "second run": client.post("/api/runs/stream", json={"prompt": "Another", "thread_id": "thr_two"}),
+            "reset": client.post("/api/reset", json={"seed": "fintech"}),
+            "quiz answer": client.post("/api/runs/thr_one/quiz", json={"selected_option": "A"}),
+            "deploy": client.post(
+                "/api/runs/thr_one/deploy", json={"action": "approve", "expected_diff_sha256": "0" * 64}
+            ),
+            "api key": client.post("/api/apikey", json={"provider": "openrouter", "api_key": "sk-or-new"}),
+            "release remote": client.post(
+                "/api/apikey",
+                json={
+                    "provider": "git_remote",
+                    "api_key": "https://github.com/acme/other.git",
+                    "confirm_remote_change": True,
+                },
+            ),
+            "forget": client.delete("/api/memory/dev_default"),
+        }
+        for name, response in refused.items():
+            assert response.status_code == 409, name
+            assert response.json()["code"] == "run_active" and response.json()["busy"] == "run", name
+        # Nothing of the refused requests happened: no second session, settings and env file untouched.
+        assert list(studio.sessions) == ["thr_one"] and not studio.env_file.exists()
+        assert studio.settings.git_remote_url is None
+    finally:
+        BlockingWorkflow.release.set()
+        runner.join(timeout=30)
+
+    assert not runner.is_alive()
+    assert parse_sse_events(first_response[0])[-1][0] == "run_completed"
+    assert not stub_ws.get_diff_report().trees_identical  # the first run did its work undisturbed
+    # The slot is free again: the same Reset now goes through.
+    after = page_client(app)
+    assert after.get("/api/state").json()["active_run"]["busy"] is None
+    assert after.post("/api/reset", json={"seed": "fintech"}).status_code == 200
+
+
+def test_run_slot_is_released_when_the_run_fails_or_never_starts(tmp_path: Path) -> None:
+    app, _, _ = build_studio(tmp_path)
+    client = page_client(app)
+    failed = client.post("/api/runs/stream", json={"prompt": "RAISE_ERROR now", "thread_id": "thr_err"})
+    assert parse_sse_events(failed.text)[-1][0] == "run_error"
+    assert app.state.studio.busy is None
+    assert client.post("/api/runs/stream", json={"prompt": "", "thread_id": "thr_bad"}).status_code == 422
+    assert app.state.studio.busy is None
+    ok = client.post("/api/runs/stream", json={"prompt": "Stage fix", "thread_id": "thr_ok"})
+    assert parse_sse_events(ok.text)[-1][0] == "run_completed"
+    # What the thread waits for is recorded by the run itself, so a reload sees it without the stream.
+    assert client.get("/api/state?thread_id=thr_ok").json()["active_run"]["interrupt"]["kind"] == "quiz"
+
+
+# ---- 14. The deploy decision must name its diff; errors keep their type (UI-24, UI-07) ----------------------------------
+def test_deploy_decision_without_expected_diff_is_refused_and_reaches_no_workflow(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    client, stub_ws, _ = studio_env
+    client.post("/api/runs/stream", json={"prompt": "Stage fix", "thread_id": "thr_sha"})
+    client.post("/api/runs/thr_sha/quiz", json={"selected_option": "A"})
+    diff_sha = stub_ws.get_diff_report().diff_sha256
+    assert stub_ws.get_gate_status(diff_sha).ready_for_approval  # only the human decision is missing
+
+    for action in ("approve", "reject"):
+        for body in ({"action": action}, {"action": action, "expected_diff_sha256": None}):
+            missing = client.post("/api/runs/thr_sha/deploy", json=body)
+            assert missing.status_code == 422, missing.text
+        malformed = client.post("/api/runs/thr_sha/deploy", json={"action": action, "expected_diff_sha256": "zz"})
+        assert malformed.status_code == 422
+    # No decision was recorded and nothing shipped: the current diff was not assumed on the caller's behalf.
+    assert stub_ws.ledger.human_approved == [] and stub_ws.ledger.blocked == []
+    assert not stub_ws.get_diff_report().trees_identical
+
+    shipped = client.post("/api/runs/thr_sha/deploy", json={"action": "approve", "expected_diff_sha256": diff_sha})
+    assert shipped.status_code == 200 and shipped.json()["deployed"] is True
+    # The receipt shows the locks recorded for that diff, and the time recorded by the deploy: nothing made up.
+    assert shipped.json()["locks"] == stub_ws.gate_status_of(diff_sha).model_dump(mode="json")
+    assert shipped.json()["deployed_at"] == "2026-11-14T01:00:00+00:00"
+
+
+class BrokenWorkflow(StubWorkflow):
+    """Infrastructure failures of the harness (not gate refusals)."""
+
+    def submit_quiz(self, thread_id: str, answer: QuizAnswer, **kwargs: object):  # type: ignore[override,no-untyped-def]
+        raise RuntimeError("checkpoint store unreachable")
+
+    def submit_deploy_decision(self, thread_id: str, decision: DeployDecision, **kwargs: object):  # type: ignore[override,no-untyped-def]
+        raise RuntimeError("checkpoint store unreachable")
+
+
+def test_infrastructure_errors_are_not_reported_as_a_locked_gate(tmp_path: Path) -> None:
+    """UI-07: only "this thread is not waiting" is a 409; a broken dependency or a bad seed keeps its own status."""
+    app, stub_ws, _ = build_studio(tmp_path, lambda ws, topology, model: BrokenWorkflow(ws, topology, model))
+    client = page_client(app, raise_server_exceptions=False)
+    stub_ws.stage_fix("thr_infra")
+    diff_sha = stub_ws.get_diff_report().diff_sha256
+    stub_ws.ledger = stub_ws.ledger.record("quiz_passed", diff_sha)
+
+    quiz = client.post("/api/runs/thr_infra/quiz", json={"selected_option": "A"})
+    deploy = client.post("/api/runs/thr_infra/deploy", json={"action": "approve", "expected_diff_sha256": diff_sha})
+    for response in (quiz, deploy):
+        assert response.status_code == 500, response.text
+        assert "gate_locked" not in response.text and "checkpoint store" not in response.text
+    assert app.state.studio.busy is None  # a crashed request still frees the workspace
+
+    # A typed backend error keeps its code and status (here: the real workspace refusing an unknown seed).
+    from no_quiz_no_prod.backend import SandboxWorkspace
+
+    settings = RuntimeSettings(workspace_dir=tmp_path / "real_ws")
+    real = create_app(settings=settings, workspace=SandboxWorkspace(settings), env_file=tmp_path / ".env2")
+    unknown_seed = page_client(real).post("/api/reset", json={"seed": "does-not-exist"})
+    assert unknown_seed.status_code == 422, unknown_seed.text
+    assert unknown_seed.json()["code"] == "invalid_argument" and "does-not-exist" in unknown_seed.json()["message"]
+    traversal = page_client(real).post("/api/reset", json={"seed": "../../etc"})
+    assert traversal.status_code == 422 and traversal.json()["code"] == "invalid_argument"

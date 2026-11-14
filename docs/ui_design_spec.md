@@ -104,6 +104,7 @@ src/no_quiz_no_prod/ui/
      - Optional secondary OpenRouter model (e.g., `openai/gpt-4o-mini`) when OpenRouter is active, enabling live model switching.
 3. **Seed Reset Button** (`#btn-reset-seed`):
    - Label: `↺ Reset Seed` (`height: 30px`, neutral outline button, hover `var(--bg-hover)`).
+   - Disabled while a run streams or the server reports the workspace busy (`active_run.busy`); the server refuses it too (`409 run_active`).
    - Clicking triggers `POST /api/reset` (`{"reset_skill_memory": false}` by default; holding `Shift` or choosing from split dropdown allows `"Full Reset (incl. Skill Memory)"`).
    - Shows non-blocking toast (`top-right` or header status flash): *"Sandbox reset to clean Fintech seed (`prod == staging`, SHA `…`)"*.
 4. **Direct Notion Hub Link Pill** (`#link-notion-hub`):
@@ -112,7 +113,7 @@ src/no_quiz_no_prod/ui/
    - Displays subtle live green dot when Notion workspace IDs/sync are active, or warm stone dot (`Local Seed Mirror`) with click modal/link if offline.
 5. **GitHub Release Remote Section** (inside `#api-popover`, modeled exactly on the Notion section, no new component):
    - A 4th `.api-tab` **`GitHub`** (`data-key-provider="github"`) beside `OpenRouter` / `Anthropic` / `Notion`.
-   - Two write-only `.api-key-form` rows: `NO_QUIZ_GIT_REMOTE_URL` (`#git-remote-form`, `POST /api/apikey` with `provider: "git_remote"`, placeholder = `https://github.com/<git.repo>.git` when known) above `NO_QUIZ_GITHUB_TOKEN` (the shared `#api-key-form`, `provider: "github"`). Inputs are cleared after save and never prefilled.
+   - Two write-only `.api-key-form` rows: `NO_QUIZ_GIT_REMOTE_URL` (`#git-remote-form`, `POST /api/apikey` with `provider: "git_remote"`, placeholder = `https://github.com/<git.repo>.git` when known) above `NO_QUIZ_GITHUB_TOKEN` (the shared `#api-key-form`, `provider: "github"`). Inputs are cleared after save and never prefilled. Saving the remote URL takes two clicks (`Save` then `Confirm new remote` within 4 s, the same pattern as the skill reset): only the second click sends the request, with `confirm_remote_change: true`.
    - A second `.notion-hub-pill` (`#link-github-repo`) under the Notion one: live dot + **`GitHub`** (links `https://github.com/<git.repo>`) when `git.remote_kind === "https"` and `git.token_set`, otherwise stone dot + **`Local remote`** (click shows a toast instead of navigating).
 
 ---
@@ -329,11 +330,12 @@ This panel makes the **irreversible backend promotion** (`staging/ → prod/`) c
   - **When `!locks.ready_for_approval` (Locks 1–3 are NOT all satisfied or `locks.blocked === true`)**:
     - Primary button `<button disabled class="btn-deploy btn-deploy--locked">🔒 Approve & Deploy to Production</button>` (`background: var(--action-locked-bg); color: var(--action-locked-fg); border: 1px solid var(--action-locked-border); cursor: not-allowed`).
     - Helper caption dynamically inspects `locks.missing_locks[0]` (or `locks.blocked`) to name the exact next required step (e.g., `"tests_passed"` → *"Run green staging pytest first"*; `"quiz_passed"` → *"Complete Quiz Gate above to unlock production promotion."*).
-  - **When `locks.ready_for_approval === true` (Locks 1–3 hold, `missing_locks == ["human_approved"]`) — or `locks.can_deploy === true` after a failed push (all 4 locks still hold)**:
+  - **When `locks.ready_for_approval === true` (Locks 1–3 hold, `missing_locks == ["human_approved"]`)**:
     - Primary button `<button class="btn-deploy btn-deploy--ready">✓ Approve & Deploy to Production</button>` (`background: var(--action-deploy-bg); color: var(--ink-on-accent); box-shadow: var(--shadow-deploy-ready); transition: all var(--transition-base)`). Sends `DeployDecision` (`{"action": "approve", "expected_diff_sha256": locks.diff_sha256, "reason": "..."}`).
     - Secondary outline button `<button class="btn-reject">Reject</button>` (sends `{"action": "reject", "expected_diff_sha256": locks.diff_sha256, "reason": "Rejected by reviewer"}` to `POST /api/runs/{thread_id}/deploy`, setting `StopReason = "human_rejected"`, `locks.blocked = true`, and leaving `prod/` untouched!).
     - Secondary caption under the buttons (`.kpi-card__sub`): `commit + push to <git.branch>` (from `/api/state -> git.branch`). The button label is unchanged.
-  - **When the push fails** (`409` with `code` in `conflict` / `upstream_error` / `timeout` and `retryable: true`): nothing was deployed (`prod/`, ledger and Ship Log untouched) and all 4 locks still hold, so `locks.can_deploy === true` keeps **`Approve & Deploy`** enabled. The response's `trace` (human sign-off + failed `deploy_to_production` row with its error badge) is appended to the step feed and a toast names the error code. Clicking the same button again sends the same request (same endpoint, same `expected_diff_sha256`): the workflow re-runs that very deploy (same arguments, same idempotency key). No new button.
+  - **When the push fails** (`409` carrying `pending_release`): nothing was deployed and the server revoked the sign-off, so the gate is back to `ready_for_approval` for the same diff. A persistent notice in the gate card (`.release-notice`, the `.quiz-feedback` component) names the error code and message, says whether `prod/` is untouched or the outcome is unknown, and shows the attempt number. Two actions: **`Approve & Retry Push`** (same endpoint, same `expected_diff_sha256`: a real new Lock 4 for the same diff, same idempotency key) and **`Reject`** (accepted, blocks the task, ends `human_rejected`). When the harness offers no further retry (`stop_reason: "release_failed"`, no interrupt) the notice stays and both buttons are gone. The header status pill reads `push_failed · awaiting_decision`. The response's `trace` is appended to the step feed. The state survives a reload (`/api/state -> active_run.pending_release`).
+  - **The decision always names its diff**: the page sends `locks.diff_sha256` and only when it equals the hash of the diff on screen; otherwise nothing is sent and the gate state is reloaded. The server never fills in a missing hash.
   - **When Deployed (`ship_log.status === "Deployed to Prod"`)**:
     - Emerald receipt banner (`.deploy-receipt`): `Deployed to prod/`, then the release commit (`<sha7>` in a click-to-copy `.mono-chip`) followed by **`View on GitHub ↗`** (`target="_blank" rel="noopener noreferrer"`, from `ship_log.release_commit_url`) or the text `local remote`, then the verified `prod_tree_sha256` digest.
 
@@ -424,6 +426,22 @@ Compact editorial card comparing `(model, topology)` cohorts aggregated across `
 
 `ui-docs` MUST implement `src/no_quiz_no_prod/ui/server.py` serializing canonical Pydantic models directly from `no_quiz_no_prod.contracts` (`model_dump(mode="json")`, zero duplicate schema classes). Serve `index.html` at `GET /` and mount `src/no_quiz_no_prod/ui/static` at `/static`.
 
+### 5.0 Rules common to every route
+
+**Request guard** (`ui/security.py`, a pure ASGI middleware in front of every route). A missing header is a refusal, never a pass.
+
+| Check | Applies to | Refusal |
+| :--- | :--- | :--- |
+| `Host` names an allowed host: `127.0.0.1`, `localhost`, `::1`, the `--host` address, each `--allowed-host` | every request, static files included | `400 invalid_host` |
+| `Origin` is present and equals the scheme and host the request was sent to | every `POST` and `DELETE` | `403 forbidden_origin` |
+| `X-NQ-Session-Token` equals the token generated when the server started | every `POST` and `DELETE` | `403 invalid_session` |
+
+The token is random per server start, lives only in memory, and reaches the browser in one place: `GET /` replaces the `__NQ_SESSION_TOKEN__` placeholder of `index.html` (`<meta name="nq-session-token">`) and answers with `Cache-Control: no-store`. No API route returns it. `app.js` reads the meta tag and sends the header through its single `apiSend` helper. There are no CORS headers, so another origin cannot read any answer.
+
+**One error body**: `{"ok": false, "code": "<ToolErrorCode>", "message": "..."}` plus route-specific fields. A typed backend error (`WorkspaceError`) keeps its own code and status: `invalid_argument` 422, `not_found` 404, `forbidden` 403, `gate_locked` / `quiz_exhausted` / `conflict` / `remote_diverged` / `run_active` 409, `rate_limited` 429, `upstream_error` 502, `sandbox_unavailable` 503, `timeout` 504, `internal_error` 500. `gate_locked` is used only when a deploy lock is missing. A request the route cannot parse answers FastAPI's `422` (`detail` list). An unexpected failure answers a plain `500` and is logged server-side.
+
+**One active operation per workspace**: a run, a quiz answer, a deploy, a reset, a settings change and a memory erase exclude each other. While one is in progress every other one answers `409` `{"code": "run_active", "busy": "run" | "quiz" | "deploy" | "reset" | "settings" | "memory"}` and changes nothing. A run holds the workspace until the workflow pauses or ends, even when the browser disconnects; the outcome is recorded by the run, not by the stream. `GET /api/state -> active_run.busy` exposes it: the page disables Run and Reset and polls the state every 2 s while another tab's operation runs.
+
 ### 5.1 `GET /api/health`
 Lightweight readiness probe for CLI, browser tests, and smoke verification (`RuntimeSettings.from_env().providers`).
 
@@ -513,6 +531,8 @@ Hydrates the entire Studio on initial page load and after any reset/deploy/quiz 
   "git": { "remote_kind": "local", "repo": null, "branch": "main", "token_set": false }
 }
 ```
+*(`active_run` also carries `pending_release` (`PendingRelease | null`: a deploy whose push failed, see §5.6) and `busy` (§5.0). With no decision pending, `locks` describes what is staged now; after a deploy of this thread it is the status recorded for the deployed diff.)*
+
 *(Note: `diff.js` renders **both** `Unified` and `Split` views directly from `FileDiff.unified_diff` per `contracts.py` line 646! `notion.rules` serializes `list[NotionRule]`; `active_run.ship_log` serializes `ShipLogEntry | None`; `active_run.quiz` serializes `PublicQuizView | None` **strictly omitting `correct_option` and `explanation_by_option`**; `skill_profile` serializes all 6 `SkillProfileRecord` items.)*
 
 ### 5.3 `POST /api/reset`
@@ -541,6 +561,7 @@ Resets `.runtime_workspace/` (`prod/`, `staging/`, `gate_ledger.json`, active Sh
 ### 5.4 `POST /api/runs/stream` (Server-Sent Events — `text/event-stream` of `RunEvent`)
 Starts or continues a conversational LangGraph execution for `thread_id`. Every SSE frame sets `event: {run_event.type}` and `data: {run_event.model_dump_json()}` using `contracts.RunEvent` directly!
 
+- **Refused before any stream or model call** (JSON, §5.0 body): `409 run_active` when the workspace is busy; the typed error of `backend.release.validate_release_config` when the release remote cannot work (bad URL, host outside the allow-list, https remote with no token, git missing or too old). The page shows the message in the step feed.
 - **Client Implementation Note**: Consume via `fetch('/api/runs/stream', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(...) })` + `response.body.getReader()` chunk parser split on `\n\n`. Set response headers `Cache-Control: no-cache`, `X-Accel-Buffering: no`.
 - **Request Body**:
 ```json
@@ -692,6 +713,8 @@ Resumes the `quiz` `HumanInterrupt` with `QuizAnswer` (`selected_option`), grade
 ```
 *(Note: Per `QuizGradeResult._answer_key_stays_secret`, `correct_option` stays `null` while `attempts_remaining > 0`, and is revealed ONLY when `passed === true` or `deployment_blocked === true`! When `deployment_blocked === true`, `locks.blocked === true`, `ship_log.status === "Blocked"`, and `stop_reason === "quiz_failed"`.)*
 
+*(A thread that is not waiting for a quiz answer answers `409` `{"code": "conflict"}`. Any other failure keeps its own status, see §5.0.)*
+
 ### 5.6 `POST /api/runs/{thread_id}/deploy`
 Resumes the `deploy_approval` `HumanInterrupt` with `DeployDecision` (`action`, `expected_diff_sha256`, `reason`) + request-level `user_id`, enforcing all **4 `DeployLock`s** via `code-mcp` (`deploy_to_production`).
 
@@ -704,6 +727,8 @@ Resumes the `deploy_approval` `HumanInterrupt` with `DeployDecision` (`action`, 
   "user_id": "dev_default"
 }
 ```
+*(`expected_diff_sha256` is **required** for approve and reject: a missing or malformed value answers `422` and no decision is recorded. The server never substitutes the current diff.)*
+
 *(Also accepts `"action": "reject"` which records `stop_reason = "human_rejected"`, marks the diff `blocked` in `GateLedger`, sets `ship_log.status = "Blocked"`, and leaves `prod/` untouched.)*
 - **Response `200 OK` (on `approve` with all 4 locks valid)**:
 ```json
@@ -728,28 +753,37 @@ Resumes the `deploy_approval` `HumanInterrupt` with `DeployDecision` (`action`, 
 }
 ```
 *(`ship_log.release_commit_sha` / `ship_log.release_commit_url` name the pushed release commit; `release_commit_url` is `null` for a local remote.)*
-- **Response `409 Conflict` after a failed push** (the git push was refused or did not answer; nothing deployed, the 4 locks still hold):
+- **Response `409 Conflict` after a failed push** (the gate let the deploy through, the release was not published; nothing deployed):
 ```json
 {
+  "ok": false,
   "deployed": false,
   "code": "upstream_error",
   "retryable": true,
-  "missing_locks": [],
-  "locks": { "...DeployGateStatus with can_deploy: true..." },
+  "stop_reason": null,
+  "interrupt": { "kind": "release_retry", "release": { "...PendingRelease..." }, "gate": { "...human_approved: false..." } },
+  "pending_release": { "expected_diff_sha256": "5748...", "attempts": 1, "error": { "code": "upstream_error", "...": "..." } },
+  "missing_locks": ["human_approved"],
+  "locks": { "...DeployGateStatus with ready_for_approval: true..." },
   "trace": [ "...human sign-off + the failed deploy_to_production step (error.code)..." ],
-  "message": "The server-side gate refused the deployment: git ls-remote (...) failed with exit code 128."
+  "message": "..."
 }
 ```
-*(`code` is `conflict`, `upstream_error` or `timeout`. Posting the same approval again retries that deploy; a thread with no failed push to retry answers `409 gate_locked`.)*
-- **Response `409 Conflict` / `403 Forbidden` (if any server-side lock fails — e.g. drifted diff hash, unpassed quiz, or failed tests; mirrors `ToolErrorPayload` with `code="gate_locked"`)**:
+*(`code` is the release error: `conflict`, `remote_diverged`, `upstream_error` or `timeout` (`contracts.RELEASE_RETRY_CODES`). The failed push revoked the sign-off. Posting an approval for the same diff is a new Lock 4 and retries that deploy; posting a rejection is accepted, blocks the task and answers `200` with `stop_reason: "human_rejected"`. When the harness offers no further retry the body has `retryable: false`, `interrupt: null` and `stop_reason: "release_failed"`.)*
+- **Response `409 Conflict` when a server-side lock is missing** (drifted diff hash, unpassed quiz, failed tests, blocked task):
 ```json
 {
+  "ok": false,
   "deployed": false,
   "code": "gate_locked",
   "missing_locks": ["quiz_passed"],
+  "locks": { "...DeployGateStatus..." },
   "message": "Server-side production gate rejected deployment: missing_locks=['quiz_passed'] for diff 57482422."
 }
 ```
+- **Response `409 Conflict`** `{"code": "conflict"}` when the thread has no deploy decision to take (unknown thread, already deployed, nothing left to retry). This is not a locked gate.
+
+*(On success `locks` is the status recorded for the deployed diff and `deployed_at` is the time recorded in the Ship Log, `null` when none was recorded: neither is ever synthesised.)*
 
 ### 5.7 `GET /api/memory/{user_id}` & `DELETE /api/memory/{user_id}`
 Reads or GDPR-erases (`/forget`) Layer 4 Developer Skill Memory (`list[SkillProfileRecord]`).
@@ -838,10 +872,12 @@ Loads `eval/results.jsonl` (plus any companion comparison `.jsonl` files in `eva
   ]
 }
 ```
+*(Every answer also carries `invalid_rows`: the number of lines that are not a valid `EvalRunResult`. They are skipped, never fatal; the page shows `N invalid rows skipped` next to the source chip.)*
+
 *(Graceful Empty State: If `eval/results.jsonl` has not been generated yet, return `"available": false, "runs": []` with HTTP `200 OK` — never `500` — and Mode 2 renders a clean command card showing `uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/` with a click-to-copy button.)*
 
 ### 5.9 `POST /api/apikey` (Write-Only `.env` Provider & Notion Key Configuration)
-Persists a runtime API key (`openrouter`, `anthropic`, `notion`, `github` = `NO_QUIZ_GITHUB_TOKEN`) or the release remote URL (`git_remote` = `NO_QUIZ_GIT_REMOTE_URL`, refused with `422` when it embeds credentials or is not `https://` / an absolute local path) atomically into `.env` with strict `0o600` permissions (preserving all comments and unrelated `.env` entries), refreshes `StudioManager.settings` in memory, and returns updated boolean availability flags. **Secrets are write-only and NEVER returned, logged, or echoed in error payloads.**
+Persists a runtime API key (`openrouter`, `anthropic`, `notion`, `github` = `NO_QUIZ_GITHUB_TOKEN`) or the release remote URL (`git_remote` = `NO_QUIZ_GIT_REMOTE_URL`, refused with `422` when it embeds credentials or is not `https://` / an absolute local path) atomically into `.env` with strict `0o600` permissions (preserving all comments and unrelated `.env` entries), refreshes `StudioManager.settings` in memory, and returns updated boolean availability flags. **Secrets are write-only and NEVER returned, logged, or echoed in error payloads.** The GitHub token is never written to the server's process environment. Saving the release remote also needs `"confirm_remote_change": true` in the body (`422` with `confirmation_required: true` otherwise), and any settings change answers `409 run_active` while a run or a deploy is in progress. Errors use the §5.0 body.
 
 - **Request Body**:
 ```json
