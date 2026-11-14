@@ -1120,13 +1120,19 @@ function handleRunEvent(ev) {
     if (ev.ship_log !== undefined) {
       store.shipLog = ev.ship_log;
     }
-    if (ev.quiz !== undefined && ev.quiz !== null) {
-      if (!store.quiz || store.quiz.question_id !== ev.quiz.question_id) {
+    if (ev.quiz !== undefined) {
+      if (ev.quiz !== null) {
+        if (!store.quiz || store.quiz.question_id !== ev.quiz.question_id) {
+          store.selectedQuizOption = null;
+          store.lastQuizGrade = null;
+          store.pendingNextQuiz = null;
+        }
+        store.quiz = ev.quiz;
+      } else if (!store.pendingNextQuiz) {
+        store.quiz = null;
         store.selectedQuizOption = null;
         store.lastQuizGrade = null;
-        store.pendingNextQuiz = null;
       }
-      store.quiz = ev.quiz;
     }
     if (ev.locks) {
       store.locks = ev.locks;
@@ -2133,7 +2139,12 @@ function bindEvents() {
     store.threadId = null;
     store.interrupt = null;
     store.stopReason = null;
-    renderTelemetryBar();
+    store.quiz = null;
+    store.selectedQuizOption = null;
+    store.lastQuizGrade = null;
+    store.pendingNextQuiz = null;
+    store.lastDeployReceipt = null;
+    renderAllStudio();
     showToast("Started fresh conversation thread (workspace files preserved).");
   });
 
@@ -2401,6 +2412,13 @@ function bindEvents() {
       return;
     }
     if (ev.key === "Enter" && store.selectedQuizOption) {
+      if (
+        document.activeElement?.closest(
+          "a[href], button:not(.quiz-option):not(#btn-submit-quiz)"
+        )
+      ) {
+        return;
+      }
       ev.preventDefault();
       submitQuizAnswer();
     }
