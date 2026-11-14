@@ -72,6 +72,7 @@ from no_quiz_no_prod.contracts import (
     ToolErrorPayload,
     compute_tree_sha256,
 )
+from no_quiz_no_prod.graph import workflow as workflow_module
 from no_quiz_no_prod.graph.mcp_bridge import (
     DispatcherBridge,
     StdioMCPBridge,
@@ -81,7 +82,6 @@ from no_quiz_no_prod.graph.mcp_bridge import (
     create_bridge,
     decode_call_result,
 )
-from no_quiz_no_prod.graph import workflow as workflow_module
 from no_quiz_no_prod.graph.workflow import (
     MAX_RELEASE_REAPPROVALS,
     NoQuizWorkflow,
