@@ -19,6 +19,7 @@ from typing import Literal
 
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
+    LLM_AGENT_ROLES,
     PROJECT_ROOT,
     AgentRole,
     EvalRunResult,
@@ -262,7 +263,7 @@ def simulate_dry_run_scenario(
                 is_write=True,
             )
             add_step(
-                examiner_role,
+                "system",
                 "code-mcp",
                 "deploy_to_production",
                 {"expected_diff_sha256": diff_hash, "release_note": f"Ship {scenario.id}"},
@@ -322,7 +323,7 @@ def simulate_dry_run_scenario(
             stop_reason = "quiz_failed"
         else:
             add_step(
-                examiner_role,
+                "system",
                 "code-mcp",
                 "deploy_to_production",
                 {"expected_diff_sha256": diff_hash, "release_note": f"Ship {scenario.id}"},
@@ -342,7 +343,8 @@ def simulate_dry_run_scenario(
             answer = f"Applied {rule_code} fix to {primary_module}, passed staging tests and quiz v1, and deployed."
             stop_reason = "completed"
 
-    steps_count = len(trace)
+    effective_model = model if model.startswith("dry-run:") else f"dry-run:{model}"
+    steps_count = sum(t.agent in LLM_AGENT_ROLES for t in trace)
     tokens_in = 650 * steps_count
     tokens_out = 180 * steps_count
     cost_usd = estimate_cost_usd(model, tokens_in, tokens_out)
@@ -355,7 +357,7 @@ def simulate_dry_run_scenario(
         trace=trace,
         stop_reason=stop_reason,  # type: ignore[arg-type]
         final_answer=answer,
-        model=model,
+        model=effective_model,
         topology=topology,
         tokens_in=tokens_in,
         tokens_out=tokens_out,

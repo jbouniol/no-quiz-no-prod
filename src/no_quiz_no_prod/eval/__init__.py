@@ -3,6 +3,8 @@
 from no_quiz_no_prod.eval.judge import (
     DEFAULT_GOLDEN_LABELS_PATH,
     DEFAULT_JUDGE_RUBRIC,
+    DEFAULT_OPENROUTER_ANTHROPIC_MODEL,
+    FIXTURE_JUDGE_MODEL_LABEL,
     Criterion,
     GoldenHumanLabelRecord,
     JudgeCalibrationReport,
@@ -66,7 +68,9 @@ from no_quiz_no_prod.eval.scorer import (
 __all__ = [
     "DEFAULT_GOLDEN_LABELS_PATH",
     "DEFAULT_JUDGE_RUBRIC",
+    "DEFAULT_OPENROUTER_ANTHROPIC_MODEL",
     "DEFAULT_SCENARIOS_PATH",
+    "FIXTURE_JUDGE_MODEL_LABEL",
     "READ_MCP_TOOLS",
     "WILSON_Z_95",
     "WRITE_MCP_TOOLS",

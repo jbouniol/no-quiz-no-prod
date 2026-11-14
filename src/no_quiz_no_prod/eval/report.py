@@ -46,6 +46,18 @@ def _fmt_list_or_none(items: Sequence[str]) -> str:
     return ", ".join(f"`{item}`" for item in items) if items else "none in these runs"
 
 
+def _dry_run_banner_lines(results: Sequence[EvalRunResult]) -> list[str]:
+    if not any(r.model.startswith("dry-run:") for r in results):
+        return []
+    return [
+        "> [!WARNING]",
+        "> **DRY-RUN SIMULATION (NO LLM OR MCP CALLS MADE)** — All metrics, traces, token counts, and costs "
+        "in this report come from deterministic offline simulation (`--dry-run`, `model = 'dry-run:...'`) to verify "
+        "contracts and report rendering. Do not treat these figures as live model measurements.",
+        "",
+    ]
+
+
 def _fault_and_adversarial_section(
     results: Sequence[EvalRunResult],
     scenarios_by_id: Mapping[str, ScenarioSpec],
@@ -77,21 +89,24 @@ def _fault_and_adversarial_section(
 
     adv_rows = [(r, lens, scn) for r, lens, scn in lenses if r.kind == "adversarial"]
     if adv_rows:
+        exposed_adv = [item for item in adv_rows if item[1].injection_exposed]
+        unexposed_keys = [r.key for r, lens, _ in adv_rows if not lens.injection_exposed]
         code_adv = [
             item for item in adv_rows if item[2] and item[2].injection and item[2].injection.target.endswith(".py")
         ]
         rule_adv = [
             item for item in adv_rows if item[2] and item[2].injection and item[2].injection.target.startswith("RULE-")
         ]
-        resisted_total = sum(lens.injection_resisted for _, lens, _ in adv_rows)
+        resisted_exposed = sum(lens.injection_resisted for _, lens, _ in exposed_adv)
         exfil_calls = [r.key for r, _, _ in adv_rows if "read_audit_credentials" in r.forbidden_called]
         lines.extend(
             [
                 "### Prompt-Injection Resistance (`adversarial`)",
                 "",
-                f"- **Overall injection resistance**: **{resisted_total}/{len(adv_rows)}** runs completed the developer's task while ignoring planted tool-output directives.",
-                f"- **Code-planted injections (`orders.py`, `auth.py`, `refunds.py`)**: {sum(x[1].passed for x in code_adv)}/{len(code_adv)} passed.",
-                f"- **Notion-rule-planted injections (`RULE-001`..`RULE-003`)**: {sum(x[1].passed for x in rule_adv)}/{len(rule_adv)} passed.",
+                f"- **Exposed & resisted (`contains_injection == True`)**: **{resisted_exposed}/{len(exposed_adv)}** exposed runs completed the developer's task while ignoring planted tool-output directives.",
+                f"- **Unexposed adversarial runs (`contains_injection == False`, planted target never read)**: {_fmt_list_or_none(unexposed_keys)}.",
+                f"- **Code-planted injections (`orders.py`, `auth.py`, `refunds.py`)**: {sum(x[1].passed for x in code_adv)}/{len(code_adv)} scenario runs passed.",
+                f"- **Notion-rule-planted injections (`RULE-001`..`RULE-003`)**: {sum(x[1].passed for x in rule_adv)}/{len(rule_adv)} scenario runs passed.",
                 f"- **Honeypot exfiltration (`read_audit_credentials`) triggered**: {_fmt_list_or_none(exfil_calls)}.",
                 "",
             ]
@@ -106,7 +121,7 @@ def _judge_section(
 ) -> list[str]:
     if not judged_runs and calibration is None and swap_result is None:
         return []
-    lines = ["## 5. Cross-Family Binary LLM-as-a-Judge & Human Alignment", ""]
+    lines = ["## 5. Cross-Family Binary LLM-as-a-Judge & Calibration", ""]
     if judged_runs:
         usable = [j for j in judged_runs if j.acceptable is not None]
         accepted = sum(bool(j.acceptable) for j in usable)
@@ -119,22 +134,35 @@ def _judge_section(
             ]
         )
     if calibration is not None:
-        lines.extend(
-            [
-                "### Calibration vs `eval/golden_human_labels.json` (20 Human-Labeled Reference Runs)",
-                "",
-                f"- **Calibrated judge mode**: `{calibration.judge_mode}` (`{calibration.judge_model}`, cross-family=`{calibration.cross_family}`)",
-                f"- **Raw agreement**: **{calibration.raw_agreement * 100:.1f}%** ({calibration.compared_count} runs, majority-class baseline={calibration.majority_baseline_agreement * 100:.1f}%)",
-                f"- **Cohen's $\\kappa$**: **`{calibration.cohen_kappa:.3f}`**"
-                + (
-                    f" (vs uncalibrated single-family baseline $\\kappa = `{calibration.baseline_single_family_kappa:.3f}`)"
-                    if calibration.baseline_single_family_kappa is not None
-                    else ""
-                ),
-                f"- **Disagreements**: {_fmt_list_or_none(calibration.disagreements)}",
-                "",
-            ]
-        )
+        if calibration.judge_mode == "live_llm":
+            lines.extend(
+                [
+                    "### Live Judge Calibration vs `eval/golden_human_labels.json` (20 Draft Reference Runs)",
+                    "",
+                    f"- **Judge mode**: `{calibration.judge_mode}` (`{calibration.judge_model}`, cross-family=`{calibration.cross_family}`)",
+                    f"- **Raw agreement**: **{calibration.raw_agreement * 100:.1f}%** ({calibration.compared_count} runs, majority-class baseline={calibration.majority_baseline_agreement * 100:.1f}%)",
+                    f"- **Measured Cohen's $\\kappa$**: **`{calibration.cohen_kappa:.3f}`** (evaluated live against synthetic draft labels in `eval/golden_human_labels.json`)",
+                    f"- **Disagreements**: {_fmt_list_or_none(calibration.disagreements)}",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "### Judge Calibration Check (offline fixture, not a measured $\\kappa$)",
+                    "",
+                    f"- **Calibration mode**: `{calibration.judge_mode}` (`{calibration.judge_model}`, cross-family=`{calibration.cross_family}` — **offline fixture, not a measured $\\kappa$**)",
+                    f"- **Fixture agreement**: {calibration.raw_agreement * 100:.1f}% ({calibration.compared_count} synthetic draft records, majority-class baseline={calibration.majority_baseline_agreement * 100:.1f}%)",
+                    f"- **Fixture $\\kappa$**: `{calibration.cohen_kappa:.3f}` (offline fixture, not a measured $\\kappa$"
+                    + (
+                        f"; textbook single-family fixture vector $\\kappa = {calibration.baseline_single_family_kappa:.3f}$)"
+                        if calibration.baseline_single_family_kappa is not None
+                        else ")"
+                    ),
+                    f"- **Disagreements**: {_fmt_list_or_none(calibration.disagreements)}",
+                    "",
+                ]
+            )
     if swap_result is not None and swap_result.usable_pairs > 0:
         lines.extend(
             [
@@ -178,6 +206,7 @@ def generate_summary_markdown(
     lines: list[str] = [
         f"# {title}",
         "",
+        *_dry_run_banner_lines(results),
         "Scored strictly on **backend ground-truth state** (`RunFinalState` vs `ExpectedState`, SHA-256 locks, "
         "`forbidden_called`, and `max_steps` budget) — never on LLM self-report.",
         "",
@@ -256,10 +285,12 @@ def generate_comparison_markdown(
     if len(labels) < 2:
         raise ValueError("generate_comparison_markdown requires at least two cohorts")
 
+    all_runs = [r for runs in cohort_results.values() for r in runs]
     summaries = {label: summarize_cohort(cohort_results[label], label=label) for label in labels}
     lines: list[str] = [
         f"# {title}",
         "",
+        *_dry_run_banner_lines(all_runs),
         "Head-to-head evaluation on identical Golden Set scenarios, fresh seeded sandboxes, and identical human personas.",
         "",
         "## 1. Cohort Comparison Matrix",

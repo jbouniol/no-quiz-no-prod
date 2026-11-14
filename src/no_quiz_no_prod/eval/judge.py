@@ -25,6 +25,7 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_ANTHROPIC_MODEL,
     DEFAULT_OPENROUTER_MODEL,
     PROJECT_ROOT,
+    AgentRole,
     ContractModel,
     EvalRunResult,
     LLMProvider,
@@ -34,11 +35,13 @@ from no_quiz_no_prod.contracts import (
 from no_quiz_no_prod.llm import LLMClient, LLMError, LLMUsage, resolve_provider
 
 DEFAULT_GOLDEN_LABELS_PATH: Final = PROJECT_ROOT / "eval" / "golden_human_labels.json"
+DEFAULT_OPENROUTER_ANTHROPIC_MODEL: Final = "anthropic/claude-sonnet-4.5"
+FIXTURE_JUDGE_MODEL_LABEL: Final = "fixture (no LLM call)"
 JUDGE_MAX_TOKENS: Final = 2500
 MAX_RESULT_CHARS_IN_RECORD: Final = 420
 MAX_ANSWER_CHARS_IN_RECORD: Final = 1600
 
-ModelFamily = Literal["anthropic", "deepseek", "other"]
+ModelFamily = Literal["anthropic", "deepseek", "openai", "google", "other"]
 
 DEFAULT_JUDGE_RUBRIC: Final[Mapping[str, str]] = {
     "faithful": (
@@ -158,6 +161,7 @@ class SwapTestResult(ContractModel):
 class ReferenceTraceStep(ContractModel):
     """Compact tool-call step stored in ``eval/golden_human_labels.json``."""
 
+    agent: AgentRole = "coder"
     tool: str
     args_summary: str = ""
     result_summary: str = ""
@@ -200,12 +204,21 @@ class JudgeCalibrationReport(ContractModel):
 # ---- pure helpers: family detection, cross-family selection & Cohen's kappa ----------------------------------------
 def detect_model_family(model: str) -> ModelFamily:
     """Classify a model identifier into its underlying family to prevent self-preference bias."""
-    lowered = model.strip().lower()
+    lowered = model.strip().lower().removeprefix("dry-run:")
     if "claude" in lowered or "anthropic" in lowered:
         return "anthropic"
     if "deepseek" in lowered:
         return "deepseek"
+    if "gpt-" in lowered or "openai/" in lowered or lowered.startswith(("o1", "o3", "o4")):
+        return "openai"
+    if "gemini" in lowered or "google/" in lowered:
+        return "google"
     return "other"
+
+
+def _is_cross_family(agent_family: ModelFamily, judge_family: ModelFamily) -> bool:
+    """True only when both families are known and belong to distinct model providers."""
+    return agent_family != "other" and judge_family != "other" and agent_family != judge_family
 
 
 def select_judge_model(
@@ -227,7 +240,7 @@ def select_judge_model(
             judge_model=explicit_judge_model,
             judge_provider=judge_provider,
             judge_family=judge_family,
-            cross_family=judge_family != agent_family or judge_family == "other",
+            cross_family=_is_cross_family(agent_family, judge_family),
             reason="explicit judge_model override",
         )
 
@@ -244,7 +257,7 @@ def select_judge_model(
                 judge_model=judge_model,
                 judge_provider="openrouter",
                 judge_family=judge_family,
-                cross_family=judge_family != agent_family,
+                cross_family=_is_cross_family(agent_family, judge_family),
                 reason="both API keys available -> selected OpenRouter/DeepSeek to judge Anthropic agent",
             )
         judge_model = cfg.anthropic_model or DEFAULT_ANTHROPIC_MODEL
@@ -255,7 +268,7 @@ def select_judge_model(
             judge_model=judge_model,
             judge_provider="anthropic",
             judge_family=judge_family,
-            cross_family=judge_family != agent_family,
+            cross_family=_is_cross_family(agent_family, judge_family),
             reason="both API keys available -> selected native Anthropic Claude to judge OpenRouter agent",
         )
 
@@ -268,17 +281,28 @@ def select_judge_model(
             judge_model=judge_model,
             judge_provider="anthropic",
             judge_family=judge_family,
-            cross_family=judge_family != agent_family,
+            cross_family=_is_cross_family(agent_family, judge_family),
             reason="only ANTHROPIC_API_KEY configured",
         )
 
-    # Default / OpenRouter-only fallback (can still pick cross-family via OpenRouter if agent was Anthropic)
-    if has_or and agent_family == "anthropic":
-        judge_model = (
-            cfg.openrouter_model
-            if detect_model_family(cfg.openrouter_model) != "anthropic"
-            else DEFAULT_OPENROUTER_MODEL
-        )
+    if has_or:
+        if agent_family == "anthropic":
+            judge_model = (
+                cfg.openrouter_model
+                if detect_model_family(cfg.openrouter_model) != "anthropic"
+                else DEFAULT_OPENROUTER_MODEL
+            )
+            judge_family = detect_model_family(judge_model)
+            return JudgeSelection(
+                agent_model=agent_model,
+                agent_family=agent_family,
+                judge_model=judge_model,
+                judge_provider="openrouter",
+                judge_family=judge_family,
+                cross_family=_is_cross_family(agent_family, judge_family),
+                reason="OpenRouter key available -> selected DeepSeek family to judge Anthropic model",
+            )
+        judge_model = DEFAULT_OPENROUTER_ANTHROPIC_MODEL
         judge_family = detect_model_family(judge_model)
         return JudgeSelection(
             agent_model=agent_model,
@@ -286,8 +310,8 @@ def select_judge_model(
             judge_model=judge_model,
             judge_provider="openrouter",
             judge_family=judge_family,
-            cross_family=judge_family != agent_family,
-            reason="OpenRouter key available -> selected DeepSeek family to judge Anthropic model",
+            cross_family=_is_cross_family(agent_family, judge_family),
+            reason="OpenRouter key available -> selected OpenRouter Claude route for cross-family judging",
         )
 
     judge_model = cfg.openrouter_model or DEFAULT_OPENROUTER_MODEL
@@ -298,8 +322,8 @@ def select_judge_model(
         judge_model=judge_model,
         judge_provider="openrouter",
         judge_family=judge_family,
-        cross_family=judge_family != agent_family,
-        reason="fallback to configured OpenRouter model (ANTHROPIC_API_KEY not set)",
+        cross_family=False,
+        reason="no LLM API keys configured",
     )
 
 
@@ -364,7 +388,7 @@ def format_reference_record(record: GoldenHumanLabelRecord) -> str:
     lines = [f"Developer Task ({record.kind}): {record.task}"]
     for index, step in enumerate(record.trace_summary, start=1):
         outcome = f"ERROR: {step.error}" if step.error else f"returned {step.result_summary}"
-        lines.append(f"{index}. {step.tool}({step.args_summary}) -> {outcome}")
+        lines.append(f"{index}. [{step.agent}] {step.tool}({step.args_summary}) -> {outcome}")
     lines.append(f"Final Message: {record.final_answer[:MAX_ANSWER_CHARS_IN_RECORD] or '(empty)'}")
     return "\n".join(lines)
 
@@ -647,12 +671,12 @@ def calibrate_judge_against_human(
 
     if mode == "recorded_single_family":
         verdicts: list[Verdict | None] = [rec.recorded_single_family_verdict for rec in records]
-        effective_model = agent_model
+        effective_model = FIXTURE_JUDGE_MODEL_LABEL
         effective_cross = False
     elif mode == "recorded_cross_family":
         verdicts = [rec.recorded_cross_family_verdict for rec in records]
-        effective_model = selection.judge_model if selection.cross_family else DEFAULT_ANTHROPIC_MODEL
-        effective_cross = True
+        effective_model = FIXTURE_JUDGE_MODEL_LABEL
+        effective_cross = False
     else:
         llm = client or LLMClient(model=selection.judge_model, provider=selection.judge_provider, settings=cfg)
         max_workers = max(1, min(workers, len(records)))
@@ -733,6 +757,8 @@ def calibrate_judge_against_human(
 __all__ = [
     "DEFAULT_GOLDEN_LABELS_PATH",
     "DEFAULT_JUDGE_RUBRIC",
+    "DEFAULT_OPENROUTER_ANTHROPIC_MODEL",
+    "FIXTURE_JUDGE_MODEL_LABEL",
     "JUDGE_MAX_TOKENS",
     "Criterion",
     "GoldenHumanLabelRecord",
