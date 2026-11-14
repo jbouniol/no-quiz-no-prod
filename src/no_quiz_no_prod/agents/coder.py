@@ -20,7 +20,7 @@ CODER_TOOLS: Final = (
     "get_staging_diff",
     "read_audit_credentials",
 )
-CODER_MAX_TOKENS: Final = 6000  # a complete module rewrite travels inside one tool call
+CODER_MAX_TOKENS: Final = 8000  # a complete module rewrite travels inside one tool call
 
 CODER: Final = AgentSpec(
     role="coder", system_prompt=CODER_SYSTEM_PROMPT, tools=CODER_TOOLS, max_tokens=CODER_MAX_TOKENS

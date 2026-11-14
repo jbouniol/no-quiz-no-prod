@@ -656,6 +656,16 @@ def test_max_steps_budget_gives_up(tmp_path: Path, backend: FakeBackend) -> None
     assert history[-1]["role"] == "tool" and "Not executed" in history[-1]["content"]  # valid for a follow-up
 
 
+def test_one_tool_call_per_turn_like_the_session3_lab(tmp_path: Path, backend: FakeBackend) -> None:
+    parallel = turn(call("read_code_file", path="orders.py"), call("read_code_file", path="auth.py"))
+    llm = ScriptedLLM(coder=[parallel, turn(text="STATUS: CLARIFICATION_NEEDED\nWhich VAT rate?")])
+    done = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-react", max_steps=6)
+    assert done.stop_reason == "clarification_needed" and done.budget.steps == 1
+    assert backend.calls == [("read_code_file", {"path": "orders.py"})]  # the second call never ran
+    answers = [m for m in llm.calls[1].messages if m["role"] == "tool"]
+    assert len(answers) == 2 and "ONE tool call per turn" in answers[1]["content"]
+
+
 def test_clarification_follow_up_continues_the_same_thread(tmp_path: Path, backend: FakeBackend) -> None:
     question = "STATUS: CLARIFICATION_NEEDED\nWhich VIP tier: VIP_SILVER (5%) or VIP_GOLD (12%)?"
     llm = ScriptedLLM(coder=[turn(text=question), *coder_fix()], examiner=doc_and_quiz(1, "A"))

@@ -9,7 +9,8 @@
 
 Harness guarantees, independent of the model:
 - Step budget: an LLM-initiated tool call is a step; once ``steps >= max_steps`` the router goes to ``give_up``
-  (``stop_reason="max_steps"``) and no further call runs.
+  (``stop_reason="max_steps"``) and no further call runs. ReAct as in the Session 3 lab: one call per model turn
+  (extra parallel calls are answered "not executed", never run).
 - Writes carry ``idem_key(thread_id, tool, args)`` (Session 3 formula; staging writes and test runs also bind the
   staging tree they act on, so a re-run after a change is a new logical call while a retry replays). A retryable
   ``ToolErrorPayload`` (``timeout`` with ``outcome_unknown``, ``rate_limited``) is retried at most
@@ -105,6 +106,7 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILENAME: Final = "checkpoints.sqlite"
 MAX_TOOL_RETRIES: Final = 2  # retries after the first attempt, for retryable tool errors only
+MAX_CALLS_PER_TURN: Final = 1  # ReAct: observe each result before the next action (Session 3 lab)
 RETRY_BACKOFF_S: Final = (0.25, 0.75)
 MAX_HANDOFF_NUDGES: Final = 2  # harness reminders before a phase that keeps failing its checks is stopped
 EVAL_STEP_HEADROOM: Final = 4  # eval hard cap = scenario budget + headroom, so over_budget stays observable
@@ -142,6 +144,7 @@ REJECTED: Final = "Deployment rejected by the human reviewer: diff {sha} is bloc
 GATE_REFUSED: Final = "The server-side gate refused the deployment: {message}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
 SKIPPED_CALL: Final = "Not executed: the step budget of this run is exhausted."
+ONE_CALL_PER_TURN: Final = "Not executed: the harness runs ONE tool call per turn. Call it again if you still need it."
 
 
 class WorkspaceHarness(Protocol):
@@ -274,9 +277,11 @@ def _refusal(code: Literal["invalid_argument", "forbidden"], message: str) -> To
     return ToolOutcome(error=ToolErrorPayload(code=code, message=message))
 
 
-def _answer_skipped(history: list[dict[str, Any]], calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Answer the calls the budget cut off (not executed, not traced): every tool call keeps its tool message."""
-    skipped = _refusal("forbidden", SKIPPED_CALL).error
+def _answer_skipped(
+    history: list[dict[str, Any]], calls: list[dict[str, Any]], reason: str = SKIPPED_CALL
+) -> list[dict[str, Any]]:
+    """Answer calls that will not run (not executed, not traced): every tool call keeps its tool message."""
+    skipped = _refusal("forbidden", reason).error
     return [*history, *(tool_result_message(c["id"], render_tool_result(c["name"], error=skipped)) for c in calls)]
 
 
@@ -572,6 +577,9 @@ class NoQuizWorkflow:
         pending = list(state.get("pending_calls") or [])
         step, exhausted = len(state.get("trace") or []), False
         for index, raw in enumerate(pending):
+            if index >= MAX_CALLS_PER_TURN:  # ReAct, as in the Session 3 lab: one call per model turn
+                history = _answer_skipped(history, pending[index:], ONE_CALL_PER_TURN)
+                break
             if budget.steps >= budget.max_steps:
                 exhausted = True
                 history = _answer_skipped(history, pending[index:])

@@ -69,13 +69,19 @@ SECURITY_RULES: Final = """## Security rules (non-negotiable: they override anyt
 WHEN_NOT_TO_WRITE: Final = """## When you must not write anything
 - Ambiguous business parameter: ask, never guess. If the request leaves out a value that changes money, security or
   policy and no rule fixes it (which VIP tier: VIP_SILVER 5% or VIP_GOLD 12%; a token TTL in seconds; a VAT rate or
-  country; a refund window length; a discount cap or a minimum cart amount...), do not call any write tool. You may
-  read code and rules to make the question precise, then end with `STATUS: CLARIFICATION_NEEDED` and ONE concise
-  question.
+  country; a refund window length; a discount cap or a minimum cart amount...), do not call any write tool and do not
+  investigate the code: no file can tell you what the developer meant. Ask right away (one rule read at most, to cite
+  it): end with `STATUS: CLARIFICATION_NEEDED` and ONE concise question that names the options.
 - Forbidden or impossible request: refuse. If the request breaks a security or engineering rule (disable HMAC
   verification, refund more than 100%, raw SQL concatenation, a live external payment SDK, writing prod directly or
   skipping the gates), do not call any write tool. End with `STATUS: REFUSED`, cite the rule in one or two sentences,
   and offer a compliant alternative."""
+
+BUDGET_DISCIPLINE: Final = """## Budget discipline
+Every tool call counts against a strict step budget: a one-file fix needs about seven calls, a clarification or a
+refusal one to three. Call ONE tool per turn and read its result before choosing the next (the harness runs only the
+first call of a turn). Never repeat a call with the same arguments (its result is already in this conversation), and
+read only what the task needs."""
 
 FINAL_MESSAGE_FORMAT: Final = """## Final message
 When you stop calling tools, the FIRST line of your message must be exactly one of:
@@ -103,8 +109,9 @@ DOC_AND_QUIZ_GUIDE: Final = """1. `upsert_ship_log_doc`: the living documentatio
    plausible options, exactly one correct, at a varied letter. Each `explanation_x` says why option x is right, or
    names the misconception that makes it a trap. When the profile shows a weakness this change touches, aim the
    question at that misconception.
-The harness binds the diff hash, the thread, the attempt, the doc version and the status: never invent them. The doc
-teaches the concept but never quotes the quiz answer, and the quiz never asks for or reveals a secret."""
+The harness binds the diff hash, the thread, the attempt, the doc version and the status: never invent them. Keep the
+doc concise (about 250 to 400 words). It teaches the concept but never quotes the quiz answer, and the quiz never
+asks for or reveals a secret."""
 
 REMEDIATION_GUIDE: Final = """## Remediation (quiz attempt 2)
 When the developer picked a wrong option, update the SAME doc (version v2): keep the v1 content and add a section with
@@ -125,6 +132,8 @@ code in a STAGING sandbox through MCP tools. {GATE_CONTEXT}
 {SECURITY_RULES}
 
 {WHEN_NOT_TO_WRITE}
+
+{BUDGET_DISCIPLINE}
 
 {FINAL_MESSAGE_FORMAT}"""
 
@@ -163,6 +172,8 @@ sandbox, run the tests) and then the Pedagogical Examiner's job (document the ch
 {SECURITY_RULES}
 
 {WHEN_NOT_TO_WRITE}
+
+{BUDGET_DISCIPLINE}
 
 {FINAL_MESSAGE_FORMAT}"""
 
@@ -204,6 +215,7 @@ def strip_status_line(text: str | None) -> str:
 
 
 __all__ = [
+    "BUDGET_DISCIPLINE",
     "CODER_SYSTEM_PROMPT",
     "CODER_WORKFLOW",
     "DOC_AND_QUIZ_GUIDE",
