@@ -271,7 +271,7 @@ def test_studio_drives_remediation_to_production_over_real_stdio_mcp(live_studio
     assert all("deploy_to_production" not in seen.tools for seen in llm.calls)
     assert llm.remaining() == {"coder": 0, "examiner": 0}
 
-    # 9. /api/state replays the final artifacts (the oral-defence view)
+    # 9. /api/state replays the final artifacts
     state = client.get("/api/state", params={"user_id": USER, "thread_id": THREAD}).json()
     run = state["active_run"]
     assert run["stop_reason"] == "completed" and run["ship_log"]["status"] == "Deployed to Prod"

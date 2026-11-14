@@ -312,7 +312,7 @@ def test_turn_recovery_classification_for_timeout_and_rate_limit() -> None:
 
 # ---- 3. Statistical Rigor: Wilson CI (scenario-counted), pass@k / pass^k, Sign Test & Control ----------------------
 def test_wilson_ci_pass_rates_and_scenario_level_interval() -> None:
-    # Exact Session 6 check_rates test vector
+    # Reference pass_at_k / pass_hat_k test vector
     matrix = [[True, True, True], [True, True, False], [False, False, False], [True, True, True]]
     assert pass_hat_k(matrix) == 0.5
     assert pass_at_k(matrix) == 0.75
@@ -375,9 +375,9 @@ def test_sign_test_and_do_nothing_control() -> None:
     assert control_summary.pass_rate == pytest.approx(10 / 30)
 
 
-# ---- 4. Cohen's kappa (0.565 Session 6 benchmark), Cross-Family Judge & Swap Test ----------------------------------
-def test_cohen_kappa_session6_benchmark_and_golden_labels() -> None:
-    # Exact Session 6 lab check_kappa benchmark vector: 20 labels, 16 agreements -> 0.565
+# ---- 4. Cohen's kappa (0.565 reference vector), Cross-Family Judge & Swap Test -------------------------------------
+def test_cohen_kappa_benchmark_and_golden_labels() -> None:
+    # Reference 20-label agreement vector: 16 agreements -> 0.565
     human = [True] * 14 + [False] * 6
     says = [True] * 11 + [False] * 3 + [True] + [False] * 5
     kappa_val = cohen_kappa(human, says)
@@ -569,7 +569,7 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
     assert comp_obj.paired_scenarios == 30
     assert comp_obj.sign_test_p == pytest.approx(1.0)
 
-    # Subprocess check of the exact PDF command shape with --compare-models + --dry-run
+    # Subprocess check of CLI invocation with --compare-models + --dry-run
     sub_out = tmp_path / "subprocess_models"
     subprocess.run(
         [

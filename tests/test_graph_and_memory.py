@@ -613,7 +613,7 @@ def test_max_steps_budget_gives_up(tmp_path: Path, backend: FakeBackend) -> None
     assert history[-1]["role"] == "tool" and "Not executed" in history[-1]["content"]  # valid for a follow-up
 
 
-def test_one_tool_call_per_turn_like_the_session3_lab(tmp_path: Path, backend: FakeBackend) -> None:
+def test_one_tool_call_per_turn_sequential_execution(tmp_path: Path, backend: FakeBackend) -> None:
     parallel = turn(call("read_code_file", path="orders.py"), call("read_code_file", path="auth.py"))
     llm = ScriptedLLM(coder=[parallel, turn(text="STATUS: CLARIFICATION_NEEDED\nWhich VAT rate?")])
     done = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-react", max_steps=6)
@@ -796,7 +796,7 @@ def test_a_rebuilt_workflow_resumes_a_thread_with_its_own_topology(tmp_path: Pat
     assert again.interrupt.quiz.attempt == 2 and {c.role for c in llm.calls} == {"single"}
 
 
-def test_session4_memory_proof_weakness_reaches_the_next_thread_examiner(tmp_path: Path, backend: FakeBackend) -> None:
+def test_cross_thread_memory_weakness_reaches_the_next_thread_examiner(tmp_path: Path, backend: FakeBackend) -> None:
     """Run 1 fails the decimal_rounding quiz twice; run 2 (new workflow, new thread, same user) is tailored to it."""
     user = "alice.dev"
     first = make_workflow(

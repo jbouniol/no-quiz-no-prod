@@ -9,12 +9,12 @@
 
 Harness guarantees, independent of the model:
 - Step budget: an LLM-initiated tool call is a step; once ``steps >= max_steps`` the router goes to ``give_up``
-  (``stop_reason="max_steps"``) and no further call runs. ReAct as in the Session 3 lab: one call per model turn
+  (``stop_reason="max_steps"``) and no further call runs. Strict ReAct execution: one call per model turn
   (extra parallel calls are answered "not executed", never run).
 - Unusable turns: a model turn with no tool call and no text (a thinking model that spent its whole output budget on
   hidden reasoning, ``finish_reason="length"``) is asked again with a harness note, at most
   ``MAX_UNUSABLE_TURN_RETRIES`` times, then stops as ``api_error``. It is never read as a final "done" message.
-- Writes carry ``idem_key(thread_id, tool, args)`` (Session 3 formula; staging writes and test runs also bind the
+- Writes carry ``idem_key(thread_id, tool, args)`` (staging writes and test runs also bind the
   staging tree they act on, so a re-run after a change is a new logical call while a retry replays). A retryable
   ``ToolErrorPayload`` (``timeout`` with ``outcome_unknown``, ``rate_limited``) is retried at most
   ``MAX_TOOL_RETRIES`` times with backoff and the SAME key; ``attempts`` and ``replayed`` land in the trace.
@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILENAME: Final = "checkpoints.sqlite"
 MAX_TOOL_RETRIES: Final = 2  # retries after the first attempt, for retryable tool errors only
-MAX_CALLS_PER_TURN: Final = 1  # ReAct: observe each result before the next action (Session 3 lab)
+MAX_CALLS_PER_TURN: Final = 1  # ReAct: observe each result before the next action
 RETRY_BACKOFF_S: Final = (0.25, 0.75)
 MAX_HANDOFF_NUDGES: Final = 2  # harness reminders before a phase that keeps failing its checks is stopped
 MAX_UNUSABLE_TURN_RETRIES: Final = 2  # re-asks after a model turn with no tool call and no text (truncated or empty)
@@ -613,7 +613,7 @@ class NoQuizWorkflow:
         pending = list(state.get("pending_calls") or [])
         step, exhausted = len(state.get("trace") or []), False
         for index, raw in enumerate(pending):
-            if index >= MAX_CALLS_PER_TURN:  # ReAct, as in the Session 3 lab: one call per model turn
+            if index >= MAX_CALLS_PER_TURN:  # ReAct: one call per model turn
                 history = _answer_skipped(history, pending[index:], ONE_CALL_PER_TURN)
                 break
             if budget.steps >= budget.max_steps:

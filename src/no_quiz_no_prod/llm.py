@@ -30,14 +30,14 @@ from no_quiz_no_prod.contracts import ENV_FILE, ContractModel, EnvVar, LLMProvid
 
 DEFAULT_TEMPERATURE: Final = 0.0
 DEFAULT_MAX_TOKENS: Final = 2000
-REQUEST_TIMEOUT_S: Final = 90.0  # per HTTP request, as in the course labs
+REQUEST_TIMEOUT_S: Final = 90.0  # per HTTP request timeout
 MAX_SDK_RETRIES: Final = 3  # transport-level retries done by the SDKs themselves
 STRUCTURED_MAX_ATTEMPTS: Final = 2  # extra chance for a reply that does not validate against the schema
 STRUCTURED_TOOL_NAME: Final = "emit_structured_output"  # forced tool used for structured output on Anthropic
 
 # USD per million tokens (input, output). Only a fallback: OpenRouter's own `usage.cost` always wins.
 PRICE_PER_MTOK: Final[Mapping[str, tuple[float, float]]] = {
-    "~deepseek/deepseek-v4-flash-latest": (0.05, 0.16),  # reference price of the course labs (Session 5)
+    "~deepseek/deepseek-v4-flash-latest": (0.05, 0.16),
     "deepseek/deepseek-v4-flash": (0.05, 0.16),
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-sonnet-4-6": (3.0, 15.0),

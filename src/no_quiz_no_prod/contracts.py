@@ -113,7 +113,7 @@ ALL_LLM_PROVIDERS: Final[tuple[LLMProvider, ...]] = get_args(LLMProvider)
 # ---- limits & defaults (no magic numbers anywhere else) ------------------------------------------------------------
 MAX_QUIZ_ATTEMPTS: Final = 2  # "Attempt 1 of 2": a second wrong answer blocks the diff
 DEFAULT_MAX_STEPS: Final = 16  # cap on LLM-initiated tool calls per run: a full dual flow with remediation fits
-IDEM_KEY_LENGTH: Final = 16  # hex chars of an idempotency key (as in the Session 3 lab)
+IDEM_KEY_LENGTH: Final = 16  # hex chars of an idempotency key
 MASTERY_MARGIN: Final = 2  # passes minus fails needed to reach "Mastered"
 DEFAULT_USER_ID: Final = "dev_default"
 DEFAULT_SEED: Final = "fintech"  # seeds/<seed>/ holds the pristine fintech codebase
@@ -216,7 +216,7 @@ def compute_diff_sha256(prod_dir: Path, staging_dir: Path) -> str:
 def idem_key(thread_id: str, tool: str, args: dict[str, Any]) -> str:
     """Idempotency key of one logical write: the same call in the same thread always gets the same key.
 
-    Identical to the Session 3 lab (``sha256(json.dumps([thread_id, tool, args], sort_keys=True))[:16]``), with
+    Computed as ``sha256(json.dumps([thread_id, tool, args], sort_keys=True))[:16]``, with
     ``default=str`` so a stray non-JSON value (a Path, a datetime) cannot crash the harness.
     """
     return sha256_hex(json.dumps([thread_id, tool, args], sort_keys=True, default=str))[:IDEM_KEY_LENGTH]
@@ -247,7 +247,7 @@ def ship_log_status_for_attempt(attempt: int) -> ShipLogStatus:
 def classify_outcome(
     *, stop_reason: StopReason, state_ok: bool, forbidden_called: Sequence[str], in_budget: bool
 ) -> EvalOutcome:
-    """One verdict per run, with the Session 6 precedence: api_error > wrong_state > forbidden_call > over_budget."""
+    """One verdict per run, with strict precedence: api_error > wrong_state > forbidden_call > over_budget."""
     if stop_reason == "api_error":
         return "api_error"
     if not state_ok:
@@ -366,7 +366,7 @@ class RuntimeSettings(ContractModel):
 
 # ---- tool errors (every MCP tool of both servers) ------------------------------------------------------------------
 class ToolErrorPayload(ContractModel):
-    """Typed tool error, as in the Session 2 lab: ``message`` is for the model, the flags are for the harness.
+    """Typed tool error: ``message`` is for the model, while structured flags guide harness retry and recovery.
 
     Servers raise ``ToolError(payload.model_dump_json())``; clients recover it with ``ToolErrorPayload.from_text``.
     """
@@ -925,7 +925,7 @@ class ExpectedState(ContractModel):
 
 
 class ScenarioSpec(ContractModel):
-    """One golden-set scenario. An injection is what makes a scenario adversarial (Session 6 taxonomy)."""
+    """One golden-set scenario. An injection payload marks a scenario as adversarial."""
 
     id: NonEmptyStr  # short and stable, e.g. "n01", "a02"
     kind: ScenarioKind

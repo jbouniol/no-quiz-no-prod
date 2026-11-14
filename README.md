@@ -83,13 +83,13 @@ uv run no-quiz-ui
 ```
 
 Open `http://127.0.0.1:8000`:
-- **Mode 1 (`⌘1`) — Workbench**: Dev Hero Launch Stage (`Plus Jakarta Sans` + `JetBrains Mono`, `.ambient-glow` + 24px engineering grid, top-bar `.env` API key & Notion popover) transitioning seamlessly into a 3-pane IDE split with live SSE MCP traces, Unified/Split `prod..staging` diff + SHA-256 commit bar, Notion Ship Log `v1` → `Remediation v2` inspector, keyboard-driven `1–4` + `Enter` Quiz Gate, vertical 4-Lock Production Pipeline, and Layer 4 Skill Matrix (`/forget`).
-- **Mode 2 (`⌘2`) — Benchmarks & Traces**: State-scored observability matrix across `normal`, `ambiguous`, `impossible`, and `adversarial` scenarios, `pass@k` & `pass^k`, Dual vs. Single cohort comparison, and 1-click full Trace & `RunFinalState` Replay.
+- **Mode 1 (`⌘1`) — Studio**: Minimalist developer launch stage over a reactive colorful radial aura (`.ambient-glow`) with floating corner controls and `.env` key manager, transitioning into an airy 3-pane glassmorphic Workbench with live SSE MCP traces, Unified/Split `prod..staging` diff + SHA-256 commit bar, Notion Ship Log `v1` → `Remediation v2` inspector, keyboard-driven `1–4` + `Enter` Quiz Gate, 4-Lock Production Gate, and collapsible Layer 4 Skill Memory (`/forget`).
+- **Mode 2 (`⌘2`) — Eval**: State-scored observability suite across `normal`, `ambiguous`, `impossible`, and `adversarial` scenarios, `pass@k` & `pass^k`, Dual vs. Single cohort comparison, and 1-click full Trace & `RunFinalState` Replay.
 
 ### 3. Run the 30-Scenario State-Based Evaluation Harness
 
 ```bash
-# Primary grading command: the 30-scenario Golden Set, live, dual topology, default model -> eval/results.jsonl + summary.md
+# Primary evaluation command: the 30-scenario Golden Set, live, dual topology, default model -> eval/results.jsonl + summary.md
 uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/ --workers 4
 
 # Full benchmark: 2 models x 2 topologies (eval/results_*.jsonl + comparison.md) + cross-family binary judge
@@ -128,7 +128,7 @@ uv run mcp dev src/no_quiz_no_prod/mcp_servers/notion_quiz_server.py
 > [!NOTE]
 > Every number below comes from real OpenRouter calls through the two real **stdio** MCP servers, with a fresh seeded sandbox per run. Runs are scored on backend ground-truth state only (`RunFinalState` vs `ExpectedState`, forbidden calls, step budget), never on what the model says about itself. Raw evidence: [`eval/results.jsonl`](eval/results.jsonl) and `eval/results_*.jsonl` (full traces), [`eval/summary.md`](eval/summary.md) and [`eval/comparison.md`](eval/comparison.md). Mode 2 of the Studio replays every run.
 
-### 1. Primary cohort: `~deepseek/deepseek-v4-flash-latest` · `dual` (the official grading cohort)
+### 1. Primary cohort: `~deepseek/deepseek-v4-flash-latest` · `dual` (default production cohort)
 
 | Kind | Scenarios | Strict pass | 95% Wilson CI | Avg steps | Avg cost / run |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -140,13 +140,13 @@ uv run mcp dev src/no_quiz_no_prod/mcp_servers/notion_quiz_server.py
 
 The right final state was reached in 30/30 runs. Zero forbidden calls, zero API errors, zero deploys without all 4 locks. The whole cohort used 2,218,987 tokens (1.95 M in / 0.27 M out) for **$0.151**, about $0.005 per passed run, with 47.6 s average latency. The only miss is a hidden failure: on `am01` the run ended in the right state, asking the right clarification with zero writes, but used 7 tool calls against a budget of 6 (`over_budget`). The zero-tool `do_nothing` control scores 0% on `normal` and `adversarial`, which is why results are reported per kind.
 
-### 2. Eval-driven fixes (Session 7 loop: measure → read the trace → fix the harness → re-measure)
+### 2. Eval-driven harness iterations (measure → inspect trace → harden harness → re-measure)
 
 | Iteration | Harness change | Live result (DeepSeek · dual) |
 | :--- | :--- | :--- |
-| 1. Exact official command (archived in [`eval/history/01_pre_fix_dual_deepseek/`](eval/history/01_pre_fix_dual_deepseek/summary.md)) | none (merged Wave 2) | 27/30 (90.0%): `normal` 12/14 |
+| 1. Initial baseline (archived in [`eval/history/01_pre_fix_dual_deepseek/`](eval/history/01_pre_fix_dual_deepseek/summary.md)) | none | 27/30 (90.0%): `normal` 12/14 |
 | 2. Current results (`eval/`) | **Unusable-turn guard** + 16k output budget | **29/30 (96.7%)**: `normal` 14/14 |
-| 3. Offline only (regression tests) | **Examiner dead-end guard** + `next_step` on `invalid_argument` | live re-run blocked: the OpenRouter key hit its $4.00 spending cap |
+| 3. Offline regression suite | **Examiner dead-end guard** + `next_step` on `invalid_argument` | live re-run pending API spending cap increase |
 
 - **Iteration 1 → 2.** Turn-level logging showed DeepSeek V4 Flash, a thinking model, sometimes spending the whole `max_tokens=8000` on hidden reasoning: 23–30k characters, `finish_reason="length"`, no text, no tool call. The harness parsed that empty turn as `STATUS: DONE`. On `n03` the run then ended "completed, nothing staged" (silent wrong state). On `n13` the Examiner was nudged until it stopped. Two fixes: `_node_agent` now re-asks such a turn up to twice with a harness note and otherwise stops as `api_error`, and agent turns get a shared `AGENT_MAX_OUTPUT_TOKENS = 16000`, the largest output budget every Studio model accepts. Replays of `n03`/`n13` went from 4/6 to 4/4, with 2 truncated turns recovered.
 - **Iteration 2 → 3.** Gemini's Examiner sent a quiz with two identical options. The server rejected it with `invalid_argument, retryable=false`, and the Examiner then answered `CLARIFICATION_NEEDED` ("please provide four distinct options"). Nobody can answer an Examiner, because a follow-up goes to the Coder, so `n12` and `ad06` died. Two fixes: an Examiner question is now decided by its deliverables (a nudge, or the quiz gate), and `invalid_argument` payloads now carry a `next_step` saying a corrected call is expected. Each fix has a regression test that fails on the previous code. The live re-run is pending a higher key limit: run the benchmark command above.
@@ -219,7 +219,7 @@ DeepSeek is the more reliable and cheaper default. Gemini is the low-latency opt
 | `tests/testkit.py` | Shared deterministic test kit: the scripted `LLMClient` stand-in, the SSE parser and the RULE-001 fix of the seed |
 | `eval/results.jsonl`, `eval/results_*.jsonl` | Live run records (one `EvalRunResult` per scenario run, full traces) for the primary cohort and each benchmark cohort |
 | `eval/summary.md`, `eval/comparison.md` | Generated reports: per-kind Wilson intervals, failure taxonomy, judge calibration, paired sign tests |
-| `eval/history/` | Archived earlier live runs (e.g. the pre-fix baseline of the Session 7 loop), kept out of the Studio's cohort view |
+| `eval/history/` | Archived earlier benchmark runs (e.g. pre-fix baseline), kept separate from the Studio's active cohort view |
 
 ### Domain Package Architecture
 
@@ -230,26 +230,22 @@ DeepSeek is the more reliable and cheaper default. Gemini is the low-latency opt
 | **Dual MCP Servers** | `src/no_quiz_no_prod/mcp_servers/` | `code_server.py` (`code-mcp`) and `notion_quiz_server.py` (`notion-quiz-mcp`) with `ToolAnnotations` and `ToolErrorPayload` |
 | **Agents, Graph & Memory** | `src/no_quiz_no_prod/graph/`, `agents/`, `memory/` | LangGraph `NoQuizWorkflow` (`dual` & `single` topologies, `interrupt()` HITL gates, retry backoff, Layer 4 skill memory) |
 | **Evaluation Harness** | `eval/`, `src/no_quiz_no_prod/eval/` | 30-scenario Golden Set (`scenarios.jsonl`: 14 normal, 5 ambiguous, 5 impossible, 6 adversarial) and parallel `run_eval.py` scorer |
-| **Web Studio & CLI** | `src/no_quiz_no_prod/ui/`, `cli.py` | Conversational 3-pane SSE Studio, Oral Defence Trace Explorer, and terminal HITL runner |
+| **Web Studio & CLI** | `src/no_quiz_no_prod/ui/`, `cli.py` | Conversational SSE Studio, Evaluation & Trace Explorer, and terminal HITL runner |
 
 ---
 
-## 15-Minute MSc Oral Defence Live Demo Runbook
+## End-to-End Product Walkthrough
 
-1. **Boot Clean Studio (`00:00 – 01:30`)**:
-   - Run `uv run no-quiz-ui` and open `http://127.0.0.1:8000`.
-   - Click **`↺ Reset Seed`** in the top header to confirm `prod == staging` cryptographic parity, then point out the `Dual: Coder → Examiner` topology selector and `Open Notion Hub ↗` pill.
-2. **Demo 1 — Happy-Path Verified Promotion (`01:30 – 06:00`)**:
-   - Click Quick-Launch Chip **`1. VAT Float Bugfix`** and press `⌘↵`.
-   - Watch live SSE step cards as `Coder` edits `staging/orders.py` (`Decimal("0.01")`, `ROUND_HALF_UP`) and runs `pytest`, followed by `Examiner` publishing Ship Log `v1` and Comprehension Quiz `v1`.
-   - Inspect the word-level diff (`Unified` / `Split`) and `diff_sha256` lock in Center Tab 1, answer the quiz with `1–4` + `Enter` in the Right Pane (unlocking **Lock 3**), and click **`✓ Approve & Deploy to Production`** (**Lock 4**) to verify `prod == staging`.
-3. **Demo 2 — Fault Tolerance, Adaptive Remediation v2 & Layer 4 Memory (`06:00 – 11:00`)**:
-   - Check **`Simulate write_timeout fault`** and launch **`4. Remediation v2 Flow`**. Highlight the `↻ Retry 1 · idem:... · replayed` badge proving idempotent write recovery after `outcome_unknown`.
-   - Deliberately select a distractor on **Quiz Attempt 1**: watch Center Tab 2 auto-focus with the pulsing coral **`⚠️ Pedagogical Remediation (v2)`** callout while **Layer 4 Developer Skill Profile** records the misconception (`Weakness Detected`). Complete Attempt 2 (or demonstrate `Blocked` containment on a second miss, plus 2-click GDPR `/forget`).
-4. **Demo 3 — State-Scored Golden Set & Trace Replay (`11:00 – 15:00`)**:
-   - Press `⌘2` to open **Trace & Golden Set Explorer**.
-   - Review `pass@k` vs. `pass^k`, the 4 scenario-kind KPI cards (`normal`, `ambiguous`, `impossible`, `adversarial`), and the `dual` vs. `single` cohort matrix.
-   - Click **`▶ Inspect Showcase Passed Run`** and **`▶ Inspect Showcase Failed / Blocked Run`** to walk the jury through step-level traces and `RunFinalState` backend evidence.
+1. **Verified Staging-to-Production Promotion**:
+   - Launch `uv run no-quiz-ui`, open `http://127.0.0.1:8000`, and select **Fix Decimal VAT Rounding Drift** from the launch stage.
+   - `Coder` stages the fix in `staging/orders.py` (`Decimal("0.01")`, `ROUND_HALF_UP`) and runs `pytest`, while `Examiner` publishes Ship Log `v1` and Comprehension Quiz `v1`.
+   - Review the word-level diff (`Unified` / `Split`) and cryptographic `diff_sha256` digest, answer the comprehension quiz (`1–4` + `Enter`) to unlock **Lock 3**, and click **Approve & Deploy** (**Lock 4**) to promote `staging/` into `prod/`.
+2. **Idempotent Fault Recovery, Adaptive Remediation `v2` & Skill Memory**:
+   - Enable the `fault` toggle in the Workbench composer and run **30-Day Refund Window & Remediation v2** to observe automatic retry with `idem:... · replayed` deduplication after a transient `write_timeout`.
+   - Select a distractor on **Quiz Attempt 1**: the Ship Log upgrades to **`Remediation v2`** with a targeted trap callout while **Layer 4 Skill Memory** records the misconception (`Weakness Detected`) to personalize future runs (resettable at any time via 2-click GDPR `Reset`).
+3. **Evaluation Suite & Trace Replay (`Eval` / `⌘2`)**:
+   - Switch to **Eval** to inspect `pass@k` and `pass^k`, per-kind accuracy (`normal`, `ambiguous`, `impossible`, `adversarial`), and the `dual` vs. `single` cohort ablation matrix.
+   - Click **Passed trace** or **Blocked trace** (or any row's **Inspect →** button) to audit step-by-step tool calls alongside ground-truth `RunFinalState` digests.
 
 ---
 

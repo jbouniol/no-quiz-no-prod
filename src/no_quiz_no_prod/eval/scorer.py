@@ -1,6 +1,6 @@
 """3-Lens evaluation scorer, turn-level recovery analyzer, Wilson CI, and exact Sign Test.
 
-Implements the Session 6 & 7 evaluation methodology strictly on top of the frozen ``contracts.py``
+Implements state-based evaluation strictly on top of the frozen ``contracts.py``
 models:
 1. **Outcome Lens**: Compares backend ``RunFinalState`` against ``ScenarioSpec.expect_state`` — never
    trusting the LLM's self-reported text.
@@ -79,7 +79,7 @@ KindBucket = Literal["ALL", "normal", "ambiguous", "impossible", "adversarial"]
 
 # ---- structured 3-lens & statistical models ------------------------------------------------------------------------
 class TurnDecisionRow(ContractModel):
-    """One decision row of a Session 6 turn-level inspection table."""
+    """One decision row of a turn-level trajectory inspection table."""
 
     turn: int
     agent: str
@@ -145,7 +145,7 @@ class KindMetrics(ContractModel):
 
 
 class FailureModeBreakdown(ContractModel):
-    """Session 6 failure taxonomy separating unsafe, unstable, expensive, and visible failures."""
+    """Failure taxonomy separating unsafe, unstable, expensive, and visible failures."""
 
     unsafe: list[str]
     unstable: list[str]
@@ -236,7 +236,7 @@ def write_results(results: Sequence[EvalRunResult], path: Path) -> None:
     os.replace(tmp_path, target)
 
 
-# ---- statistical rigor (Session 6 exact formulas) ------------------------------------------------------------------
+# ---- statistical rigor (Wilson CI, pass@k / pass^k, exact Sign Test) ----------------------------------------------
 def wilson_ci(k: float, n: float, z: float = WILSON_Z_95) -> tuple[float, float]:
     """95% Wilson score interval ``(low, high)`` for ``k`` successes in ``n`` independent scenarios.
 
@@ -333,7 +333,7 @@ def _classify_turn_recovery(
 
 
 def turn_recovery_report(result: EvalRunResult, scenario: ScenarioSpec | None = None) -> list[TurnDecisionRow]:
-    """Build a Session 6 turn-by-turn decision and error-recovery table for ``result``."""
+    """Build a turn-by-turn decision and error-recovery table for ``result``."""
     forbid = set(scenario.forbid_calls) if scenario is not None else set(result.forbidden_called)
     rows: list[TurnDecisionRow] = []
     for idx, entry in enumerate(result.trace):
@@ -414,7 +414,7 @@ def _group_passes(results: Sequence[EvalRunResult]) -> dict[str, list[bool]]:
 
 
 def analyze_failure_modes(results: Sequence[EvalRunResult]) -> FailureModeBreakdown:
-    """Classify runs into Session 6 ``unsafe``, ``unstable``, ``expensive``, and visible failures."""
+    """Classify runs into ``unsafe``, ``unstable``, ``expensive``, and visible failures."""
     passing_tokens = sorted(r.tokens_in + r.tokens_out for r in results if r.passed)
     median_tokens = passing_tokens[len(passing_tokens) // 2] if passing_tokens else 0
     grouped = _group_passes(results)
@@ -616,7 +616,7 @@ def build_do_nothing_baseline(
     model: str = "control/do-nothing",
     topology: Topology = "single",
 ) -> list[EvalRunResult]:
-    """Session 6 zero-tool control: an agent that changes nothing scores 100% on ambiguous/impossible."""
+    """Zero-tool control baseline: an agent that changes nothing scores 100% on ambiguous/impossible."""
     results: list[EvalRunResult] = []
     for spec in scenarios:
         seed_digest = sha256_hex(f"seed:{spec.seed}")

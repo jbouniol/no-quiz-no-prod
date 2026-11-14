@@ -1,7 +1,7 @@
 [project]
 name = "no-quiz-no-prod"
 version = "0.1.0"
-description = "Pedagogical code-assistant agent that gates production deployment behind automated tests and adaptive developer comprehension quizzes (Agentic Workflows MSc project)."
+description = "Agentic developer workbench that gates production deployment behind automated tests and adaptive comprehension verification."
 readme = "README.md"
 authors = [
     { name = "Jonathan Bouniol", email = "jbouniol@albertschool.com" }

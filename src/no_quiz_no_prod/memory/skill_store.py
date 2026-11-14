@@ -1,6 +1,6 @@
 """Layer 4 structured long-term memory: the developer skill profile behind a LangGraph ``BaseStore``.
 
-Session 4 layering: layer 4 holds exact facts found by key (here: one ``SkillProfileRecord`` per skill), as opposed to
+Memory layering: layer 4 holds exact facts found by key (here: one ``SkillProfileRecord`` per skill), as opposed to
 the per-thread checkpointer (layer 2). The namespace is ``("developers", user_id, "skills")`` and the keys are exactly
 ``ALL_SKILL_TAGS``: one record per skill, never a duplicate, never an unknown tag.
 
@@ -11,9 +11,9 @@ Two backends, one API:
   ``grade_quiz_answer`` already records the grade, so a graded quiz is never counted twice here.
 - standalone: a ``SqliteStore`` in ``<workspace_dir>/skill_memory.sqlite`` that applies ``record_quiz`` itself.
 
-Write guard (Session 4): ``SENSITIVE`` redacts secret-looking spans (key assignments, API keys, JWTs, IBANs, card
-numbers) before anything is stored, and misconceptions are length-capped. ``/forget`` is a GDPR erasure behind a
-LangGraph ``interrupt()`` confirmation (``build_forget_graph``), as in the Session 4 lab.
+Write guard: ``SENSITIVE`` redacts secret-looking spans (key assignments, API keys, JWTs, IBANs, card
+numbers) before anything is stored, and misconceptions are length-capped. ``/forget`` executes GDPR erasure behind a
+LangGraph ``interrupt()`` confirmation (``build_forget_graph``).
 """
 
 import json
@@ -75,7 +75,7 @@ def redact_sensitive(text: str | None, *, limit: int = MAX_MEMORY_TEXT_CHARS) ->
 
 
 def is_forget_command(text: str | None) -> bool:
-    """True for a ``/forget`` request (the Session 4 command)."""
+    """True for a ``/forget`` erasure command."""
     return (text or "").strip().lower().startswith(FORGET_COMMAND)
 
 
@@ -285,7 +285,7 @@ class SkillMemory:
             self._conn = None
 
 
-# ---- /forget with a human confirmation (interrupt, as in Session 4) ------------------------------------------------
+# ---- /forget with human confirmation (LangGraph interrupt) ---------------------------------------------------------
 class ForgetState(TypedDict, total=False):
     user_id: str
     will_delete: int

@@ -1,4 +1,4 @@
-"""FastAPI Conversational Studio & Oral Defence Explorer backend (`no-quiz-ui`).
+"""FastAPI Conversational Studio & Evaluation Explorer backend (`no-quiz-ui`).
 
 Implements every REST and SSE endpoint defined in ``docs/ui_design_spec.md`` §5,
 serializing canonical models from ``no_quiz_no_prod.contracts`` with zero duplicate
@@ -1498,7 +1498,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point for ``no-quiz-ui``."""
     parser = argparse.ArgumentParser(
         prog="no-quiz-ui",
-        description="Launch the No-Quiz-No-Prod Conversational Web Studio & Oral Defence Explorer.",
+        description="Launch the No-Quiz-No-Prod Conversational Web Studio & Evaluation Explorer.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")

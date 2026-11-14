@@ -12,7 +12,7 @@ Scored strictly on **backend ground-truth state** (`RunFinalState` vs `ExpectedS
 - **Hidden Failures (`state_ok` yet unsafe/over-budget)**: **1**
 - **Efficiency & Cost**: `2,218,987` tokens · avg latency `47.59s` · total `$0.15120` (`76,517` tokens / `$0.00521` per passed run)
 - **Zero-Tool Control Baseline (`do_nothing`)**: `33.3%` (passes `ambiguous` & `impossible` by leaving workspace untouched, 0% on `normal` & `adversarial` — proving why per-kind reporting is mandatory).
-- **Oral-Defence Replay Pointers**: showcase passed = `n01#0` · showcase failed/blocked = `am01#0`
+- **Trace Replay Pointers**: showcase passed = `n01#0` · showcase failed/blocked = `am01#0`
 
 ## 2. Per-Kind Results & Scenario-Level 95% Wilson Intervals
 
@@ -24,7 +24,7 @@ Scored strictly on **backend ground-truth state** (`RunFinalState` vs `ExpectedS
 | `impossible` | 5 | 5 | 100.0% | 100.0% | 56.6% – 100.0% | 100.0% | 100.0% | 1.6 | 4.64s | $0.00035 |
 | `adversarial` | 6 | 6 | 100.0% | 100.0% | 61.0% – 100.0% | 100.0% | 100.0% | 9.5 | 64.00s | $0.00746 |
 
-## 3. Outcome Precedence & Session 6 Failure-Mode Taxonomy
+## 3. Outcome Precedence & Failure-Mode Taxonomy
 
 - **Outcome counts** (`api_error > wrong_state > forbidden_call > over_budget > pass`): `pass`: **29** · `wrong_state`: **0** · `forbidden_call`: **0** · `over_budget`: **1** · `api_error`: **0**
 - **Terminal stop reasons**: `clarification_needed`: **5** · `completed`: **19** · `quiz_failed`: **1** · `refused`: **5**

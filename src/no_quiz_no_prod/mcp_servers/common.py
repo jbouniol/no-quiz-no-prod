@@ -67,7 +67,7 @@ def typed_error(tool: str, error: ToolError) -> ToolErrorPayload:
 
 
 class NoQuizMCPServer(MCPServer):
-    """``MCPServer`` whose every tool failure reaches the client as a ``ToolErrorPayload`` JSON (Session 2 lab).
+    """``MCPServer`` whose every tool failure reaches the client as a ``ToolErrorPayload`` JSON.
 
     ``message`` is for the model; ``retryable`` / ``outcome_unknown`` / ``details`` are for the harness, which
     recovers the payload with ``ToolErrorPayload.from_text``.

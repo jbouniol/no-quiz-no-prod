@@ -1,7 +1,7 @@
 """Markdown and JSON report generator for Golden Set runs and multi-cohort comparisons.
 
-Produces defence-ready ``eval/summary.md`` and ``eval/comparison.md`` reports with per-kind tables,
-scenario-level 95% Wilson confidence intervals, ``pass@k``/``pass^k`` reliability, Session 6 failure
+Produces structured ``eval/summary.md`` and ``eval/comparison.md`` reports with per-kind tables,
+scenario-level 95% Wilson confidence intervals, ``pass@k``/``pass^k`` reliability, trajectory failure
 modes (``unsafe``, ``unstable``, ``expensive``), turn-level fault recovery diagnostics, Cohen's kappa
 judge calibration, and paired Sign Test p-values.
 """
@@ -224,7 +224,7 @@ def generate_summary_markdown(
         lines.append(control_line)
     lines.extend(
         [
-            f"- **Oral-Defence Replay Pointers**: showcase passed = `{summary.showcase_passed_key or 'n/a'}` · showcase failed/blocked = `{summary.showcase_failed_or_blocked_key or 'n/a'}`",
+            f"- **Trace Replay Pointers**: showcase passed = `{summary.showcase_passed_key or 'n/a'}` · showcase failed/blocked = `{summary.showcase_failed_or_blocked_key or 'n/a'}`",
             "",
             "## 2. Per-Kind Results & Scenario-Level 95% Wilson Intervals",
             "",
@@ -248,7 +248,7 @@ def generate_summary_markdown(
     lines.extend(
         [
             "",
-            "## 3. Outcome Precedence & Session 6 Failure-Mode Taxonomy",
+            "## 3. Outcome Precedence & Failure-Mode Taxonomy",
             "",
             f"- **Outcome counts** (`api_error > wrong_state > forbidden_call > over_budget > pass`): {outcome_pills}",
             f"- **Terminal stop reasons**: {stop_pills}",

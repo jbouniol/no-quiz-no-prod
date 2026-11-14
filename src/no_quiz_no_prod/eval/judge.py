@@ -1,11 +1,11 @@
 """Cross-family binary LLM-as-a-Judge, position-bias swap test, and Cohen's kappa calibration.
 
-Addresses Session 6 & 7 evaluation pitfalls:
+Mitigates common LLM-judge evaluation pitfalls:
 - **Binary quote-backed criteria** (`Verdict` / `Criterion`): Every criterion is True/False and must
   cite verbatim evidence from the run record ("No quote, no pass").
 - **Cross-family routing**: Automatically selects the opposite model family (Anthropic Claude for
   DeepSeek/OpenRouter runs, DeepSeek/OpenRouter for Claude runs) when both keys are available,
-  mitigating Session 7 *self-preference bias*.
+  mitigating *self-preference bias*.
 - **Position-bias swap test** (`swap_test`): Evaluates run pairs in both `(A, B)` and `(B, A)` orders
   and drops inconsistent verdicts rather than guessing.
 - **Human alignment (`cohen_kappa`)**: Calibrates judge verdicts against the 20 human-labeled
@@ -335,9 +335,8 @@ def verdict_acceptable(verdict: Verdict | None) -> bool | None:
 def cohen_kappa(human: Sequence[bool], judge: Sequence[bool]) -> float:
     """Chance-corrected agreement ``(po - pe) / (1 - pe)`` between human and judge binary labels.
 
-    Matches the Session 6 benchmark check: on ``human = [True]*14 + [False]*6`` and
-    ``judge = [True]*11 + [False]*3 + [True] + [False]*5`` (16/20 agreements), returns ``0.5652...``
-    (``round(k, 3) == 0.565``).
+    On ``human = [True]*14 + [False]*6`` and ``judge = [True]*11 + [False]*3 + [True] + [False]*5``
+    (16/20 agreements), returns ``0.5652...`` (``round(k, 3) == 0.565``).
     """
     if len(human) != len(judge):
         raise ValueError(f"label sequences must have equal length, got {len(human)} vs {len(judge)}")
@@ -401,7 +400,7 @@ def _normalize_verdict(raw: Verdict, rubric: Mapping[str, str]) -> Verdict | Non
         Criterion(
             name=name,
             evidence=by_name[name].evidence.strip(),
-            # Enforce Session 6 "No quote, no pass" rule deterministically
+            # Enforce "No quote, no pass" rule deterministically
             passed=bool(by_name[name].passed and by_name[name].evidence.strip()),
         )
         for name in rubric
@@ -599,7 +598,7 @@ def swap_test(
                 consistent += 1
                 winner = first.key if pick_ab == "A" else second.key
             else:
-                winner = None  # Changed winner is dropped, never guessed (Session 6 rule)
+                winner = None  # Changed winner is dropped, never guessed
             details.append(
                 SwapPairOutcome(
                     scenario_id=first.id,
