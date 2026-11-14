@@ -340,3 +340,10 @@ uvx ruff check . && uvx ruff format --check .
 ```
 
 `tests/test_end_to_end_integration.py` drives the real Studio API over the real workflow and both stdio MCP servers with a scripted LLM. It covers the full loop (v1 → wrong answer → Layer 4 "Weakness Detected" → v2 remediation → right answer → human approval → system-role `deploy_to_production` → prod == staging). It also checks that the server answers `409 gate_locked` to premature, hash-mismatched, replayed and no-change approvals, and that even the harness's own stdio route cannot deploy without the human lock. Every test deploys to a local bare remote.
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+

@@ -3,6 +3,8 @@ name = "no-quiz-no-prod"
 version = "0.1.0"
 description = "Agentic developer workbench that gates production deployment behind automated tests and adaptive comprehension verification."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Jonathan Bouniol", email = "jbouniol@albertschool.com" }
 ]
