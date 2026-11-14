@@ -597,6 +597,7 @@ def test_live_runner_isolates_workspaces_and_captures_api_errors(monkeypatch: py
 
     seen_workspaces: list[Path] = []
     seen_user_ids: list[str] = []
+    closed_workspaces: list[Path] = []
 
     class _FakeNoQuizWorkflow:
         def __init__(
@@ -613,6 +614,14 @@ def test_live_runner_isolates_workspaces_and_captures_api_errors(monkeypatch: py
             self.topology = topology
             self.model = model or "~deepseek/deepseek-v4-flash-latest"
             self.mcp_transport = mcp_transport
+
+        def __enter__(self) -> _FakeNoQuizWorkflow:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            # MCP subprocesses + SQLite handles must be released while the temporary workspace still exists.
+            assert self.settings.workspace_dir.is_dir()
+            closed_workspaces.append(self.settings.workspace_dir)
 
         def run_scenario(
             self, scenario: ScenarioSpec, *, repeat: int = 0, user_id: str = "dev_default"
@@ -652,6 +661,8 @@ def test_live_runner_isolates_workspaces_and_captures_api_errors(monkeypatch: py
     assert len(results) == 2
     assert len(set(seen_workspaces)) == 2
     assert len(set(seen_user_ids)) == 2
+    assert sorted(closed_workspaces) == sorted(seen_workspaces)  # crashing runs are closed too
+    assert not any(path.exists() for path in seen_workspaces)  # temporary workspaces removed after close
     assert results[0].outcome == "pass"
     assert results[1].outcome == "api_error"
     assert "RuntimeError: simulated upstream 503 outage" in results[1].why

@@ -375,7 +375,12 @@ def _execute_live_scenario(
     base_settings: RuntimeSettings,
     mcp_transport: McpTransport,
 ) -> EvalRunResult:
-    """Run one live scenario inside a fresh temporary ``NO_QUIZ_WORKSPACE_DIR``."""
+    """Run one live scenario inside a fresh temporary ``NO_QUIZ_WORKSPACE_DIR``.
+
+    The workflow is a context manager: its 2 ``stdio`` MCP subprocesses, the ``mcp-bridge`` event-loop thread and
+    the SQLite checkpointer / skill-memory handles are closed before ``TemporaryDirectory`` removes the workspace,
+    even when the run crashes, so a 30-120 run campaign never leaks processes or file handles.
+    """
     from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
 
     started = time.perf_counter()
@@ -387,17 +392,17 @@ def _execute_live_scenario(
             }
         )
         try:
-            workflow = NoQuizWorkflow(
+            with NoQuizWorkflow(
                 settings=isolated_settings,
                 topology=cohort.topology,
                 model=cohort.model,
                 mcp_transport=mcp_transport,
-            )
-            return workflow.run_scenario(
-                scenario,
-                repeat=repeat,
-                user_id=f"eval_{cohort.slug}_{scenario.id}_r{repeat}",
-            )
+            ) as workflow:
+                return workflow.run_scenario(
+                    scenario,
+                    repeat=repeat,
+                    user_id=f"eval_{cohort.slug}_{scenario.id}_r{repeat}",
+                )
         except Exception as exc:
             elapsed = round(time.perf_counter() - started, 3)
             fallback_hash = sha256_hex(f"error:{scenario.seed}:{scenario.id}:{repeat}")
