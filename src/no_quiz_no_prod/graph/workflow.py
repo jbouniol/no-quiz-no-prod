@@ -20,9 +20,19 @@ Harness guarantees, independent of the model:
   staging tree they act on, so a re-run after a change is a new logical call while a retry replays). A retryable
   ``ToolErrorPayload`` (``timeout`` with ``outcome_unknown``, ``rate_limited``) is retried at most
   ``MAX_TOOL_RETRIES`` times with backoff and the SAME key; ``attempts`` and ``replayed`` land in the trace.
-- The quiz is graded server-side by the workspace; a wrong first answer updates Layer 4 memory and sends the
-  Examiner back for doc v2 + a new question; the deploy gate asks the human, records the decision on the harness
-  side (``apply_deploy_decision``) and only then calls ``code-mcp.deploy_to_production``. No agent can deploy.
+- The quiz is graded server-side by the workspace and the grade is checkpointed on its own, so a crash never
+  loses or repeats it; a wrong first answer updates Layer 4 memory and sends the Examiner back for doc v2 + a new
+  question (in single topology the code is frozen meanwhile: no write or test tool). The deploy gate asks the
+  human, who must name the diff they reviewed, records the decision on the harness side
+  (``apply_deploy_decision``) and only then calls ``code-mcp.deploy_to_production``. No agent can deploy.
+- Blocks and quiz attempts belong to the workspace's task epoch: a follow-up turn or a new thread on a blocked
+  workspace stops at once, and resumes the attempt count instead of restarting it.
+- A deploy the gate let through but whose release failed is never "refused": the thread pauses on ``release_gate``
+  with the ``PendingRelease`` in its state (re-approve the same diff, or reject), and ends ``release_failed`` once
+  ``MAX_RELEASE_REAPPROVALS`` are spent. An unanswered deploy call is reconciled with the workspace first.
+- Secrets and untrusted text: the quiz answer key never enters graph state or a checkpoint (sealed arguments stay
+  in process memory between the model turn and the tool call); every tool result reaches the model inside the
+  untrusted-data envelope. A crash of the harness is reported as ``harness_error``, never as a provider error.
 - Every step, artifact and pause is streamed as a ``RunEvent`` to ``on_event`` (the SSE payloads of the Studio).
 """
 
@@ -293,6 +303,7 @@ class WorkflowState(TypedDict, total=False):
     wrote_staging: bool
     nudges: int
     budget_exhausted: bool
+    code_frozen: bool  # single topology, remediation: the diff under the quiz must not change
     pending_release: dict[str, Any] | None  # PendingRelease: a gated deploy whose release was not published
     stop_reason: StopReason | None
     final_answer: str
@@ -343,7 +354,7 @@ def _assistant_message(turn: ChatTurnResponse) -> dict[str, Any]:
 def _active_spec(state: Mapping[str, Any]) -> AgentSpec:
     """The spec of the active agent: the single agent loses its write tools while it remediates (frozen code)."""
     role: AgentRole = state["phase"]
-    if role == "single" and state.get("attempt", 1) > 1:
+    if role == "single" and state.get("code_frozen"):
         return SINGLE_REMEDIATION
     return AGENTS[role]
 
@@ -660,6 +671,7 @@ class NoQuizWorkflow:
             "wrote_staging": False,
             "nudges": 0,
             "budget_exhausted": False,
+            "code_frozen": False,
             "pending_release": None,
             "stop_reason": "refused" if gate.blocked else None,
             "final_answer": EPOCH_BLOCKED.format(reason=gate.blocked_reason or "blocked") if gate.blocked else "",
@@ -835,7 +847,8 @@ class NoQuizWorkflow:
             if state.get("topology") == "single":
                 history = [*state["messages"]["single"], *build_single_remediation_messages(grade)]
                 messages = {**state["messages"], "single": history}
-                return Command(goto="agent", update={**update, "phase": "single", "messages": messages, "nudges": 0})
+                update |= {"phase": "single", "messages": messages, "nudges": 0, "code_frozen": True}
+                return Command(goto="agent", update=update)
             return self._examiner_turn(state, self.workspace.get_diff_report(), attempt=grade.attempt + 1, extra=update)
         return _finish("quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option))
 
