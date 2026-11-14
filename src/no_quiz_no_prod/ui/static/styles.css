@@ -2610,6 +2610,17 @@ a.mono-chip:hover {
   margin-top: var(--space-1-5);
 }
 
+.release-notice {
+  margin-top: 0;
+  margin-bottom: var(--space-2-5);
+}
+
+.floating-icon-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
 .btn-reject {
   height: 34px;
   padding: 0 var(--space-3);

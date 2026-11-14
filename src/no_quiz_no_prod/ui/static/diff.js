@@ -140,7 +140,9 @@ export function parseUnifiedDiff(unifiedText) {
   let newLine = 1;
 
   for (const rawLine of lines) {
-    if (rawLine.startsWith("--- ") || rawLine.startsWith("+++ ")) {
+    // "--- a/x" and "+++ b/x" are file headers only before the first hunk. Inside a hunk the same prefixes are
+    // a deleted "-- ..." line and an added "++ ..." line, and they must reach the reviewer.
+    if (!currentHunk && (rawLine.startsWith("--- ") || rawLine.startsWith("+++ "))) {
       continue;
     }
     const hunkMatch = rawLine.match(HUNK_HEADER_RE);
