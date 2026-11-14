@@ -389,6 +389,8 @@ def _execute_live_scenario(
             update={
                 "workspace_dir": Path(tmp_dir),
                 "notion_api_key": None,
+                "git_remote_url": None,  # releases go to the run's own local bare remote, never to GitHub
+                "github_token": None,
             }
         )
         try:

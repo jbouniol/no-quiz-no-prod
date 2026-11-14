@@ -5,11 +5,15 @@ Layout of ``<workspace_dir>`` (``RuntimeSettings.workspace_dir``, one per parall
 - ``prod/`` and ``staging/``: the seeded fintech modules. Agents edit staging only; a deploy copies it to prod.
 - ``gate_ledger.json``: the shared ``GateLedger`` (tests_passed, quiz_passed, human_approved, blocked, deployed).
 - ``state.sqlite`` (WAL): rule mirror, ship log, private quizzes, pytest runs, skill memory, idempotency store, events.
+- ``.release.git``: the gate's git commit cache, and ``release_remote.git``: the default bare release remote (used
+  when ``NO_QUIZ_GIT_REMOTE_URL`` is not set). A reset keeps both: a remote's history only ever moves forward.
 
 Any other file in the directory (LangGraph checkpoints, server logs...) belongs to another domain: never touched.
 
 The deploy gate is enforced here, server-side: every lock is bound to a ``diff_sha256`` recomputed under the
-workspace lock at decision time, so a lock earned on one diff never unlocks another (TOCTOU guard).
+workspace lock at decision time, so a lock earned on one diff never unlocks another (TOCTOU guard). A deploy is a
+git release (``GitReleasePublisher``): the approved staging tree is committed and pushed first, and prod is promoted
+only once that push succeeded, so a failed push leaves prod, the ledger and the ship log untouched.
 """
 
 import os
@@ -27,6 +31,7 @@ from no_quiz_no_prod.backend import catalog
 from no_quiz_no_prod.backend.code_tree import build_diff_report, copy_tree, run_pytest, tree_files
 from no_quiz_no_prod.backend.errors import WorkspaceError
 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
+from no_quiz_no_prod.backend.release import GitReleasePublisher
 from no_quiz_no_prod.backend.seeds import load_seed_rules, plant_rule_injection, populate_area, seed_path
 from no_quiz_no_prod.backend.store import (
     STATE_DB_FILENAME,
@@ -66,6 +71,7 @@ from no_quiz_no_prod.contracts import (
     QuizGradeResult,
     QuizOptionKey,
     QuizQuestion,
+    ReleaseCommit,
     RunFinalState,
     RuntimeSettings,
     ShipLogEntry,
@@ -90,6 +96,7 @@ META_FAULT: Final = "fault"
 META_FAULT_CONSUMED: Final = "fault_consumed"
 META_INJECTION: Final = "injection"
 META_RESET_AT: Final = "reset_at"
+META_RELEASE_PREFIX: Final = "release:"  # release:<diff_sha256> -> the ReleaseCommit JSON of that deploy
 
 QUIZ_OPEN: Final = "open"
 QUIZ_SUPERSEDED: Final = "superseded"
@@ -165,6 +172,7 @@ class SandboxWorkspace:
         self.ledger_path = self.settings.gate_ledger_path
         self.db_path = self.root / STATE_DB_FILENAME
         self.notion = NotionDatabaseSync(self.settings)
+        self.release = GitReleasePublisher(self.settings)
         self._ready = False
 
     # ---- lifecycle -------------------------------------------------------------------------------------------------
@@ -245,6 +253,7 @@ class SandboxWorkspace:
                 quiz = self._latest_quiz(conn, thread_id, None)
                 run_diff = entry.diff_sha256 if entry else (quiz.diff_sha256 if quiz else None)
                 attempts = entry.quiz_attempts if entry else (self._graded_count(conn, run_diff) if run_diff else 0)
+                release = self._release_for_diff(conn, run_diff)
         return RunFinalState(
             prod_tree_sha256=prod_tree,
             staging_tree_sha256=staging_tree,
@@ -255,6 +264,7 @@ class SandboxWorkspace:
             quiz_attempts=attempts,
             quiz_passed=run_diff is not None and run_diff in ledger.quiz_passed,
             deployed=run_diff is not None and run_diff in ledger.deployed,
+            release_commit_sha=release.commit_sha if release else None,
         )
 
     def consume_fault(self, kind: FaultKind) -> bool:
@@ -370,7 +380,13 @@ class SandboxWorkspace:
     def deploy_to_production(
         self, expected_diff_sha256: str, release_note: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
-        """Copy staging to prod, only if the 4 locks hold for the diff recomputed now (else ``gate_locked``)."""
+        """Release staging to prod, only if the 4 locks hold for the diff recomputed now (else ``gate_locked``).
+
+        The release is a git commit of the staging tree, pushed fast-forward to the release remote BEFORE prod is
+        promoted: a refused or failed push raises (``conflict``, ``upstream_error``, ``timeout``) and leaves prod, the
+        ledger and the ship log untouched, the locks still holding for a retry. The payload's ``release`` is the
+        ``ReleaseCommit``.
+        """
         self.ensure_ready()
         tool = catalog.DEPLOY_TO_PRODUCTION
         with self._lock():
@@ -387,17 +403,41 @@ class SandboxWorkspace:
             status = self._ledger().status(current, expected_diff_sha256)
             if prod_tree == staging_tree or not status.can_deploy:
                 raise self._gate_locked(status, expected_diff_sha256, trees_identical=prod_tree == staging_tree)
+            release = self.release.publish(
+                source_dir=self.staging_dir,
+                baseline_dir=self.prod_dir,
+                diff_sha256=current,
+                prod_tree_sha256=staging_tree,
+                release_note=release_note,
+            )
             self._swap_tree(self.prod_dir, lambda fresh: copy_tree(self.staging_dir, fresh), expected=staging_tree)
             self._record("deployed", current)
             deployed_at = utc_now()
             with self._write() as conn:
+                meta_set(conn, f"{META_RELEASE_PREFIX}{current}", release.model_dump_json())
                 entry = self._ship_log_for_diff(conn, current)
                 if entry is not None:
                     entry = entry.model_validate(
-                        {**entry.model_dump(), "status": "Deployed to Prod", "deployed_at": deployed_at}
+                        {
+                            **entry.model_dump(),
+                            "status": "Deployed to Prod",
+                            "deployed_at": deployed_at,
+                            "release_commit_sha": release.commit_sha,
+                        }
                     )
                     self._save_ship_log(conn, entry)
-                log_event(conn, "deploy", {"diff_sha256": current, "release_note": release_note})
+                log_event(
+                    conn,
+                    "deploy",
+                    {
+                        "diff_sha256": current,
+                        "release_note": release_note,
+                        "release_commit_sha": release.commit_sha,
+                        "branch": release.branch,
+                        "remote": release.remote,
+                        "pushed": release.pushed,
+                    },
+                )
             payload = {
                 "ok": True,
                 "deployed_diff_sha256": current,
@@ -405,6 +445,7 @@ class SandboxWorkspace:
                 "deployed_at": deployed_at.isoformat(),
                 "release_note": release_note,
                 "ship_log_status": entry.status if entry else None,
+                "release": release.model_dump(mode="json"),
                 "replayed": False,
             }
             self._remember(catalog.CODE_SERVER, tool, idempotency_key, payload)
@@ -827,6 +868,11 @@ class SandboxWorkspace:
         params = {"thread": thread_id, "unbound": catalog.DEFAULT_THREAD_ID, "diff": diff_sha256}
         row = conn.execute(_LATEST_QUIZ, params).fetchone()
         return None if row is None else QuizQuestion.model_validate_json(row["record"])
+
+    @staticmethod
+    def _release_for_diff(conn: sqlite3.Connection, diff_sha256: str | None) -> ReleaseCommit | None:
+        raw = meta_get(conn, f"{META_RELEASE_PREFIX}{diff_sha256}") if diff_sha256 else None
+        return ReleaseCommit.model_validate_json(raw) if raw else None
 
     @staticmethod
     def _graded_count(conn: sqlite3.Connection, diff_sha256: str) -> int:

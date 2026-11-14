@@ -266,12 +266,19 @@ class StdioMCPBridge(_SessionBridge):
     transport: McpTransport = "stdio"
 
     def server_parameters(self, server: McpServerName) -> StdioServerParameters:
-        """``python -m <module>`` bound to this run's workspace. The servers share the harness's view of Notion:
-        settings without a Notion key spawn them with ``NOTION_API_KEY=""`` (eval runs stay out of the live DBs)."""
+        """``python -m <module>`` bound to this run's workspace. The servers share the harness's view of Notion and
+        of the release remote: settings without a Notion key spawn them with ``NOTION_API_KEY=""`` (eval runs stay out
+        of the live DBs), settings without a remote URL or token blank those too (releases go to the workspace's local
+        bare remote, never to a GitHub remote configured in ``.env``)."""
         env = {name: os.environ[name] for name in PASSTHROUGH_ENV if os.environ.get(name)}
         env[EnvVar.NO_QUIZ_WORKSPACE_DIR.value] = str(self.settings.workspace_dir)
         if self.settings.notion_api_key is None:
             env[EnvVar.NOTION_API_KEY.value] = ""
+        if self.settings.git_remote_url is None:
+            env[EnvVar.NO_QUIZ_GIT_REMOTE_URL.value] = ""
+        if self.settings.github_token is None:
+            env[EnvVar.NO_QUIZ_GITHUB_TOKEN.value] = ""
+        env[EnvVar.NO_QUIZ_GIT_BRANCH.value] = self.settings.git_branch
         return StdioServerParameters(
             command=sys.executable, args=["-m", MCP_SERVER_MODULES[server]], env=env, cwd=str(PROJECT_ROOT)
         )

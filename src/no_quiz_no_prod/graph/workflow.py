@@ -87,6 +87,7 @@ from no_quiz_no_prod.contracts import (
     QuizGradeResult,
     QuizOptionKey,
     QuizQuestion,
+    ReleaseCommit,
     RunBudget,
     RunEvent,
     RunEventType,
@@ -144,6 +145,7 @@ QUIZ_BLOCKED: Final = (
 DEPLOY_READY: Final = "Locks 1-3 hold for diff {sha}: approve to deploy it to production, or reject it."
 DEPLOY_NOT_READY: Final = "Diff {sha} is missing {missing}: an approval will be refused by the server-side gate."
 DEPLOYED: Final = "Deployed to production: diff {sha} passed all four SHA-256 locks."
+RELEASED: Final = " Release commit {commit} is on {branch} ({remote})."
 REJECTED: Final = "Deployment rejected by the human reviewer: diff {sha} is blocked and production was not touched."
 GATE_REFUSED: Final = "The server-side gate refused the deployment: {message}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
@@ -339,6 +341,18 @@ def _parse_quiz_answer(value: Any) -> QuizAnswer:
     if not isinstance(option, str):
         raise ValueError("a quiz answer needs selected_option")
     return QuizAnswer(selected_option=option.strip().upper())  # type: ignore[arg-type]
+
+
+def _release_suffix(result: Any) -> str:
+    """The ``RELEASED`` sentence of a deploy result carrying a ``ReleaseCommit``; "" for any other result."""
+    release = result.get("release") if isinstance(result, Mapping) else None
+    if release is None:
+        return ""
+    try:
+        commit = ReleaseCommit.model_validate(release)
+    except ValidationError:
+        return ""
+    return RELEASED.format(commit=commit.commit_sha[:12], branch=commit.branch, remote=commit.remote)
 
 
 def _parse_deploy_decision(value: Any) -> DeployDecision:
@@ -769,7 +783,8 @@ class NoQuizWorkflow:
         self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=locks)
         trace = [human.model_dump(mode="json"), system.model_dump(mode="json")]
         if outcome.ok:
-            return {"trace": trace, "stop_reason": "completed", "final_answer": DEPLOYED.format(sha=sha)}
+            answer = DEPLOYED.format(sha=sha) + _release_suffix(outcome.result)
+            return {"trace": trace, "stop_reason": "completed", "final_answer": answer}
         message = outcome.error.message if outcome.error else "unknown error"
         return {"trace": trace, "stop_reason": "refused", "final_answer": GATE_REFUSED.format(message=message)}
 

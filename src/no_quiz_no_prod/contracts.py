@@ -21,6 +21,10 @@ hash, recomputed server-side at deploy time (UI order): 1. ``tests_passed`` (pyt
 ``sha256_matches`` (the hash the caller tested, quizzed and expects equals the recomputed one: zero drift, TOCTOU
 guard), 3. ``quiz_passed`` (comprehension quiz passed on it), 4. ``human_approved`` (explicit human sign-off on it).
 A quiz failed ``MAX_QUIZ_ATTEMPTS`` times, or a human rejection, blocks that diff for good.
+
+Once the four locks hold, the deploy is a real git release: the staging tree is committed and pushed (fast-forward
+only, never forced) to the release remote (a local bare repository by default, an HTTPS remote such as GitHub as an
+option), and prod is promoted only after that push succeeded (``ReleaseCommit``).
 """
 
 import hashlib
@@ -79,6 +83,7 @@ FaultKind = Literal[
     "rate_limit",  # the first tool call answers rate_limited (retryable)
 ]
 LLMProvider = Literal["openrouter", "anthropic"]
+ReleaseRemoteKind = Literal["local", "https"]  # local bare repository (default) or an HTTPS remote such as GitHub
 ToolErrorCode = Literal[
     "invalid_argument",  # well-formed call, wrong value (unknown file, rule code, option...)
     "not_found",  # the file, quiz, ship-log entry or rule does not exist
@@ -141,6 +146,9 @@ MCP_SERVER_MODULES: Final[Mapping[McpServerName, str]] = {  # `python -m <module
 TREE_HASH_IGNORED_DIRS: Final = frozenset({"__pycache__", ".pytest_cache"})
 TREE_HASH_IGNORED_FILES: Final = frozenset({".DS_Store"})
 TREE_HASH_IGNORED_SUFFIXES: Final = frozenset({".pyc"})
+DEFAULT_GIT_BRANCH: Final = "main"  # release branch pushed by deploy_to_production
+RELEASE_GIT_DIRNAME: Final = ".release.git"  # <workspace>/.release.git: the gate's local commit cache (never a remote)
+RELEASE_REMOTE_DIRNAME: Final = "release_remote.git"  # <workspace>/release_remote.git: the default bare remote
 
 
 # ---- base model & constrained scalars ------------------------------------------------------------------------------
@@ -162,6 +170,9 @@ class ContractModel(BaseModel):
 Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", description="Lowercase hex SHA-256 digest.")]
 RuleCode = Annotated[str, Field(pattern=r"^RULE-\d{3}$", description="Engineering rule code, e.g. RULE-001.")]
 IdemKey = Annotated[str, Field(pattern=rf"^[0-9a-f]{{{IDEM_KEY_LENGTH}}}$", description="Output of idem_key().")]
+GitObjectId = Annotated[
+    str, Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$", description="Full git object id (SHA-1 or SHA-256 repo).")
+]
 NonEmptyStr = Annotated[str, Field(min_length=1)]
 
 
@@ -271,6 +282,9 @@ class EnvVar(StrEnum):
     NOTION_RULES_DB_ID = "NOTION_RULES_DB_ID"
     NOTION_SKILLS_DB_ID = "NOTION_SKILLS_DB_ID"
     NO_QUIZ_WORKSPACE_DIR = "NO_QUIZ_WORKSPACE_DIR"
+    NO_QUIZ_GIT_REMOTE_URL = "NO_QUIZ_GIT_REMOTE_URL"
+    NO_QUIZ_GIT_BRANCH = "NO_QUIZ_GIT_BRANCH"
+    NO_QUIZ_GITHUB_TOKEN = "NO_QUIZ_GITHUB_TOKEN"
 
 
 def load_project_env(*, override: bool = False) -> bool:
@@ -295,6 +309,10 @@ class RuntimeSettings(ContractModel):
     """Typed view of the environment. Secrets are ``SecretStr``: they never appear in a repr, a log or a dump.
 
     Parallel eval runs isolate themselves by giving each spawned MCP server its own ``NO_QUIZ_WORKSPACE_DIR``.
+
+    Release remote: ``git_remote_url`` None means the local bare repository ``<workspace>/release_remote.git``; an
+    ``https://`` URL (e.g. GitHub) is pushed with ``github_token``, which is only ever handed to git through its
+    environment (never argv, a remote URL or a git config file). The URL is kept out of the repr as well.
     """
 
     openrouter_api_key: SecretStr | None = None
@@ -307,6 +325,9 @@ class RuntimeSettings(ContractModel):
     notion_rules_db_id: str | None = None
     notion_skills_db_id: str | None = None
     workspace_dir: Path = PROJECT_ROOT / DEFAULT_WORKSPACE_DIRNAME
+    git_remote_url: str | None = Field(default=None, repr=False)
+    git_branch: NonEmptyStr = DEFAULT_GIT_BRANCH
+    github_token: SecretStr | None = None
 
     @classmethod
     def from_env(
@@ -342,6 +363,9 @@ class RuntimeSettings(ContractModel):
             notion_rules_db_id=read(EnvVar.NOTION_RULES_DB_ID) or notion_ids.get("rules_db_id"),
             notion_skills_db_id=read(EnvVar.NOTION_SKILLS_DB_ID) or notion_ids.get("skill_profile_db_id"),
             workspace_dir=workspace if workspace.is_absolute() else PROJECT_ROOT / workspace,
+            git_remote_url=read(EnvVar.NO_QUIZ_GIT_REMOTE_URL),
+            git_branch=read(EnvVar.NO_QUIZ_GIT_BRANCH) or DEFAULT_GIT_BRANCH,
+            github_token=read(EnvVar.NO_QUIZ_GITHUB_TOKEN),
         )
 
     @property
@@ -362,6 +386,16 @@ class RuntimeSettings(ContractModel):
     def area_dir(self, area: WorkspaceArea) -> Path:
         """``<workspace>/prod`` or ``<workspace>/staging``."""
         return self.workspace_dir / area
+
+    @property
+    def release_git_dir(self) -> Path:
+        """``<workspace>/.release.git``: where the gate builds release commits before pushing them."""
+        return self.workspace_dir / RELEASE_GIT_DIRNAME
+
+    @property
+    def default_release_remote_dir(self) -> Path:
+        """``<workspace>/release_remote.git``: the bare remote used when ``git_remote_url`` is not set."""
+        return self.workspace_dir / RELEASE_REMOTE_DIRNAME
 
 
 # ---- tool errors (every MCP tool of both servers) ------------------------------------------------------------------
@@ -440,6 +474,7 @@ class ShipLogEntry(ContractModel):
     thread_id: str | None = None
     notion_page_id: str | None = None
     notion_url: str | None = None
+    release_commit_sha: GitObjectId | None = None  # the git release commit pushed by the deploy (Deployed to Prod)
 
     @model_validator(mode="after")
     def _deployed_entries_are_bound(self) -> Self:
@@ -708,6 +743,23 @@ class DeployGateStatus(ContractModel):
         return not self.blocked and not self.missing_locks
 
 
+class ReleaseCommit(ContractModel):
+    """The git release of one deploy: the commit holding the promoted tree, pushed (fast-forward only) to the remote.
+
+    ``remote`` is a display form that never carries credentials. ``pushed`` is False when the remote branch already
+    held this exact tree (a retried deploy): nothing was committed or pushed twice.
+    """
+
+    commit_sha: GitObjectId
+    parent_sha: GitObjectId | None = None  # the commit holding the pre-deploy prod tree
+    branch: NonEmptyStr
+    remote: NonEmptyStr
+    remote_kind: ReleaseRemoteKind
+    diff_sha256: Sha256Hex  # the gated change this release ships
+    prod_tree_sha256: Sha256Hex  # the prod tree after the deploy (== the staging tree that passed the 4 locks)
+    pushed: bool = True
+
+
 class GateLedger(ContractModel):
     """Append-only lock ledger at ``<workspace>/gate_ledger.json``, shared by both MCP servers and the harness.
 
@@ -896,6 +948,7 @@ class RunFinalState(ContractModel):
     quiz_attempts: int = Field(default=0, ge=0, le=MAX_QUIZ_ATTEMPTS)
     quiz_passed: bool = False
     deployed: bool = False  # the ledger records a deploy of this run's diff
+    release_commit_sha: GitObjectId | None = None  # the git release commit of that deploy
 
     @computed_field
     @property
@@ -1132,6 +1185,7 @@ __all__ = [
     "ALL_TOPOLOGIES",
     "ALL_WORKSPACE_AREAS",
     "DEFAULT_ANTHROPIC_MODEL",
+    "DEFAULT_GIT_BRANCH",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_OPENROUTER_MODEL",
     "DEFAULT_SEED",
@@ -1148,6 +1202,8 @@ __all__ = [
     "NOTION_IDS_FILE",
     "OPENROUTER_BASE_URL",
     "PROJECT_ROOT",
+    "RELEASE_GIT_DIRNAME",
+    "RELEASE_REMOTE_DIRNAME",
     "TERMINAL_SHIP_LOG_STATUSES",
     "TREE_HASH_IGNORED_DIRS",
     "TREE_HASH_IGNORED_FILES",
@@ -1169,6 +1225,7 @@ __all__ = [
     "FintechModule",
     "GateLedger",
     "GateLedgerEntry",
+    "GitObjectId",
     "HumanInterrupt",
     "HumanPersona",
     "IdemKey",
@@ -1187,6 +1244,8 @@ __all__ = [
     "QuizGradeResult",
     "QuizOptionKey",
     "QuizQuestion",
+    "ReleaseCommit",
+    "ReleaseRemoteKind",
     "RuleCode",
     "RuleDomain",
     "RuleSeverity",
