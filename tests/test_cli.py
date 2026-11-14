@@ -20,10 +20,12 @@ from no_quiz_no_prod.contracts import (
     EnvVar,
     PendingRelease,
     QuizAnswer,
+    RuntimeSettings,
     StopReason,
     ToolErrorPayload,
 )
 
+RunCli = Callable[..., tuple[int, str]]
 DIFF = "a" * 64
 THREAD = "cli_test"
 
@@ -67,8 +69,10 @@ class ScriptedWorkflow:
         self.after_decision = after_decision or outcome("completed")
         self.decisions: list[DeployDecision] = []
         self.quiz_answers: list[QuizAnswer] = []
+        self.started = False
 
     def start_run(self, task: str, **_: Any) -> SimpleNamespace:
+        self.started = True
         return self.first
 
     def submit_quiz(self, thread_id: str, answer: QuizAnswer, **_: Any) -> tuple[SimpleNamespace, SimpleNamespace]:
@@ -94,15 +98,25 @@ def typed(*answers: str) -> Callable[[str], str]:
     return read
 
 
-def run_cli(workflow: ScriptedWorkflow, *answers: str) -> tuple[int, str]:
-    args = cli.build_parser().parse_args(["run", "Fix VAT rounding", "--thread-id", THREAD])
-    out = io.StringIO()
-    code = cli._cmd_run(args, settings=SimpleNamespace(), workflow=workflow, input_fn=typed(*answers), out=out)  # type: ignore[arg-type]
-    return code, out.getvalue()
+@pytest.fixture
+def settings(tmp_path: Path) -> RuntimeSettings:
+    """Explicit settings: a temp workspace whose release remote is its own local bare repository."""
+    return RuntimeSettings(workspace_dir=tmp_path / "workspace")
+
+
+@pytest.fixture
+def run_cli(settings: RuntimeSettings) -> RunCli:
+    def run(workflow: ScriptedWorkflow, *answers: str) -> tuple[int, str]:
+        args = cli.build_parser().parse_args(["run", "Fix VAT rounding", "--thread-id", THREAD])
+        out = io.StringIO()
+        code = cli._cmd_run(args, settings=settings, workflow=workflow, input_fn=typed(*answers), out=out)
+        return code, out.getvalue()
+
+    return run
 
 
 # ---- BE-09: only an explicit answer is a decision ------------------------------------------------------------------
-def test_empty_enter_and_typos_at_the_deploy_prompt_ask_again_instead_of_rejecting() -> None:
+def test_empty_enter_and_typos_at_the_deploy_prompt_ask_again_instead_of_rejecting(run_cli: RunCli) -> None:
     workflow = ScriptedWorkflow(outcome(interrupt=deploy_gate()))
     code, transcript = run_cli(workflow, "", "maybe", "N0", "y")
     assert [decision.action for decision in workflow.decisions] == [
@@ -113,7 +127,7 @@ def test_empty_enter_and_typos_at_the_deploy_prompt_ask_again_instead_of_rejecti
     assert code == cli.EXIT_OK
 
 
-def test_closed_stdin_at_the_deploy_prompt_records_no_decision() -> None:
+def test_closed_stdin_at_the_deploy_prompt_records_no_decision(run_cli: RunCli) -> None:
     workflow = ScriptedWorkflow(outcome(interrupt=deploy_gate()))
     code, transcript = run_cli(workflow, "")  # one stray Enter, then EOF
     assert workflow.decisions == []  # before the fix: a "reject", which blocks the change
@@ -122,21 +136,21 @@ def test_closed_stdin_at_the_deploy_prompt_records_no_decision() -> None:
 
 
 @pytest.mark.parametrize("answer", sorted(cli.REJECT_ANSWERS))
-def test_an_explicit_rejection_is_recorded_and_has_its_own_exit_code(answer: str) -> None:
+def test_an_explicit_rejection_is_recorded_and_has_its_own_exit_code(answer: str, run_cli: RunCli) -> None:
     workflow = ScriptedWorkflow(outcome(interrupt=deploy_gate()), after_decision=outcome("human_rejected"))
     code, _ = run_cli(workflow, answer.upper())
     assert [decision.action for decision in workflow.decisions] == ["reject"]
     assert code == cli.EXIT_CODE_BY_STOP_REASON["human_rejected"] != cli.EXIT_OK
 
 
-def test_closed_stdin_at_the_quiz_prompt_submits_no_answer() -> None:
+def test_closed_stdin_at_the_quiz_prompt_submits_no_answer(run_cli: RunCli) -> None:
     workflow = ScriptedWorkflow(outcome(interrupt=quiz_gate()))
     code, _ = run_cli(workflow, "x")  # an invalid choice, then EOF
     assert workflow.quiz_answers == [] and code == cli.EXIT_NO_DECISION
 
 
 # ---- C8: a failed push comes back as a new gate, never as a silent end ----------------------------------------------
-def test_a_failed_release_is_shown_and_must_be_approved_again() -> None:
+def test_a_failed_release_is_shown_and_must_be_approved_again(run_cli: RunCli) -> None:
     error = ToolErrorPayload(code="timeout", message="git push did not answer", outcome_unknown=True)
     failed = PendingRelease(expected_diff_sha256=DIFF, attempts=1, error=error)
     workflow = ScriptedWorkflow(outcome(interrupt=deploy_gate(failed)))
@@ -148,6 +162,27 @@ def test_a_failed_release_is_shown_and_must_be_approved_again() -> None:
 
     unanswered = ScriptedWorkflow(outcome(interrupt=deploy_gate(failed)))
     assert run_cli(unanswered)[0] == cli.EXIT_NO_DECISION and unanswered.decisions == []
+
+
+# ---- C9: the release configuration is checked before the run starts ------------------------------------------------
+def test_a_bad_release_configuration_stops_before_any_model_call(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = settings.model_copy(update={"git_branch": "not a branch"})
+    workflow = ScriptedWorkflow(outcome("completed"))
+    args = cli.build_parser().parse_args(["run", "Fix VAT rounding"])
+    with pytest.raises(WorkspaceError) as refused:
+        cli._cmd_run(args, settings=bad, workflow=workflow, input_fn=typed(), out=io.StringIO())
+    assert refused.value.code == "invalid_argument" and not workflow.started
+
+    monkeypatch.setattr(cli.RuntimeSettings, "from_env", classmethod(lambda _cls: bad))
+    assert cli.main(["run", "Fix VAT rounding"]) == cli.EXIT_ERROR  # the user sees one line, not a traceback
+    assert capsys.readouterr().err.startswith("Error (invalid_argument): ")
+
+
+def test_a_valid_release_configuration_is_announced(run_cli: RunCli, settings: RuntimeSettings) -> None:
+    _, transcript = run_cli(ScriptedWorkflow(outcome("completed")))
+    assert f"Release target: {settings.default_release_remote_dir} (local) · branch main · git " in transcript
 
 
 # ---- BE-10: exit codes and one-line errors -------------------------------------------------------------------------
@@ -162,7 +197,7 @@ def test_every_stop_reason_has_an_exit_code_and_only_completed_is_zero() -> None
 
 
 @pytest.mark.parametrize("stop_reason", ALL_STOP_REASONS)
-def test_run_returns_the_exit_code_of_its_stop_reason(stop_reason: StopReason) -> None:
+def test_run_returns_the_exit_code_of_its_stop_reason(stop_reason: StopReason, run_cli: RunCli) -> None:
     code, transcript = run_cli(ScriptedWorkflow(outcome(stop_reason)))  # stdin closed: no clarification reply
     assert code == cli.EXIT_CODE_BY_STOP_REASON[stop_reason]
     assert f"stop_reason={stop_reason}" in transcript

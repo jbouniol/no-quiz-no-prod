@@ -15,7 +15,12 @@ import httpx
 
 from no_quiz_no_prod.backend.errors import WorkspaceError
 from no_quiz_no_prod.backend.notion_sync import NotionSyncError, provision_notion_databases
-from no_quiz_no_prod.backend.release import GitReleasePublisher, describe_release_remote, github_repo
+from no_quiz_no_prod.backend.release import (
+    GitReleasePublisher,
+    describe_release_remote,
+    github_repo,
+    validate_release_config,
+)
 from no_quiz_no_prod.backend.seeds import populate_area, seed_path
 from no_quiz_no_prod.backend.store import workspace_lock
 from no_quiz_no_prod.contracts import (
@@ -198,6 +203,15 @@ def _cmd_run(
     if not task:
         print("Error: a non-empty task prompt is required.", file=sys.stderr)
         return EXIT_USAGE
+
+    # A bad remote, branch, token or git version stops here (WorkspaceError, reported by main) instead of failing
+    # at the last step of the flow, after the tests, the quiz and the approval.
+    release = validate_release_config(cfg)
+    print(
+        f"Release target: {release.remote.display} ({release.remote.kind}) · branch {release.branch} "
+        f"· git {release.git_version}",
+        file=out,
+    )
 
     wf = workflow or _load_workflow(
         cfg,
