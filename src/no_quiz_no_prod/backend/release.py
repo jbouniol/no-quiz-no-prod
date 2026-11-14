@@ -1,72 +1,102 @@
 """GitReleasePublisher: a production deploy is a real git commit, pushed fast-forward to the release remote.
 
-Only ``SandboxWorkspace.deploy_to_production`` calls it, after the four locks hold and under the workspace lock, so
-no agent can ever reach it (no agent toolset holds ``deploy_to_production``, and there is no git tool at all).
+Who calls it: ``SandboxWorkspace.deploy_to_production``, once the four locks hold. No agent toolset holds
+``deploy_to_production`` and there is no git tool. That describes the tool surface only: nothing in this module can
+stop code running in the same process, or as the same OS user, from importing it. Keeping agent-written test code
+away from the publisher is the job of the test sandbox; what this module guarantees is listed under "Secrets".
 
 How one release is built, with the git CLI (no Python dependency):
 
-1. ``ls-remote`` + ``fetch`` read the tip of the release branch (``FETCH_HEAD``: no remote or tracking ref is ever
-   configured). A retried deploy whose tree the tip already holds stops here (``pushed=False``).
-2. The pre-deploy prod tree and the staging tree are written as git trees (a throwaway index, the
-   ``TREE_HASH_IGNORED_*`` patterns excluded), so each git tree holds exactly the files ``compute_tree_sha256`` hashes.
-3. When the tip does not hold the prod tree (first release, a reset, a commit pushed by someone else), a baseline
-   commit of the prod tree goes first, so the release commit's own diff is exactly the change the human approved.
-4. The release commit is pushed as ``<commit>:refs/heads/<branch>``: no ``+``, no ``--force``. A remote that moved
+1. ``prepare`` (local, under the workspace lock). Staging and prod are each copied to a private snapshot whose
+   ``compute_tree_sha256`` must equal the hash the gate approved. The git tree is built from that snapshot file by
+   file (``hash-object --no-filters`` and an index written entry by entry), so no ignore file, attributes file or
+   filter, the user's or the tree's own, can add, drop or rewrite a file. The tree is then read back from git and
+   hashed again: it must still be the approved SHA-256.
+2. ``publish`` (network, outside the lock). ``ls-remote`` + ``fetch`` read the tip of the release branch (no remote
+   or tracking ref is ever configured), then exactly one of:
+   - the tip already is this release (same ``Diff-SHA256`` and ``Thread`` trailers, same tree): a retried deploy,
+     nothing is committed or pushed again (``pushed=False``). An equal tree alone never counts;
+   - the tip does not hold the prod tree (someone else pushed, or the workspace was reset): ``remote_diverged``.
+     Nothing is pushed and no "sync" commit is ever written on the human's behalf;
+   - the branch does not exist: it is initialised with a baseline commit of the prod tree;
+   - the tip holds the prod tree: the release commit goes on top of it.
+3. The release commit is pushed as ``<commit>:refs/heads/<branch>``: no ``+``, no ``--force``. A remote that moved
    meanwhile rejects it (``conflict``) and nothing is overwritten. Its trailers record the gate evidence
    (``Diff-SHA256``, ``Quiz-Attempts``, ``Approved-By: human``, ``Rules``, ``Thread``).
+
+One whole ``publish`` is bounded by ``RELEASE_DEADLINE_S``; a git command that outlives its budget is killed with
+its whole process group.
 
 ``initialize_branch`` (``no-quiz-no-prod init-github``) pushes the seed as the first commit of a branch that does not
 exist yet, and ``inspect_remote`` (``init-github --verify``) only reads the advertised tip.
 
-Secrets: the GitHub token only ever reaches git as an ``http.<remote>.extraHeader`` set through ``GIT_CONFIG_*``
-environment variables of the network commands. It is never in argv, a remote URL, a git config file, a result, a log
-or an error (git's output is redacted anyway). The user's global and system git config are ignored, so no credential
-helper can store the token and no hook, signing key or rewrite rule interferes.
+Secrets: the GitHub token is read from ``settings.github_token`` only; this module never reads or writes
+``os.environ`` for it. It only ever reaches git as an ``http.<remote>.extraHeader`` set through ``GIT_CONFIG_*``
+environment variables of the network commands, and only for an ``https`` remote whose host is in
+``settings.git_allowed_hosts``; redirects are not followed. It is never in argv, a remote URL, a git config file, a
+result, a log or an error (git's output is redacted anyway). Known limit: while ``ls-remote``, ``fetch`` or ``push``
+runs, the header sits in the launch environment of that git process, which another process of the same OS user can
+read on some systems; the gate therefore never runs staged tests during a deploy. The user's global and system git
+config and home directory are ignored, so no credential helper or ``.netrc`` is used and no hook, signing key or
+rewrite rule interferes.
 """
 
 import base64
 import os
 import re
 import shutil
+import signal
 import subprocess
-from collections.abc import Callable, Mapping, Sequence
+import tempfile
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final
 from urllib.parse import urlsplit
 
+from no_quiz_no_prod.backend.code_tree import copy_tree, tree_files
 from no_quiz_no_prod.backend.errors import WorkspaceError
 from no_quiz_no_prod.contracts import (
-    TREE_HASH_IGNORED_DIRS,
-    TREE_HASH_IGNORED_FILES,
-    TREE_HASH_IGNORED_SUFFIXES,
+    GIT_LOCAL_TIMEOUT_S,
+    GIT_NETWORK_TIMEOUT_S,
+    RELEASE_DEADLINE_S,
     ReleaseCommit,
     ReleaseRemoteKind,
     RuntimeSettings,
     compute_tree_sha256,
+    diff_sha256_from_trees,
 )
 
 GIT_EXECUTABLE: Final = "git"
 GIT_MIN_VERSION: Final = (2, 31)  # GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n
-GIT_LOCAL_TIMEOUT_S: Final = 30.0
-GIT_NETWORK_TIMEOUT_S: Final = 120.0
 GIT_OUTPUT_TAIL_CHARS: Final = 600
 GATE_AUTHOR_NAME: Final = "No-Quiz-No-Prod Gate"
 GATE_AUTHOR_EMAIL: Final = "gate@no-quiz-no-prod.invalid"
 GITHUB_TOKEN_USER: Final = "x-access-token"  # GitHub's HTTPS basic-auth user for a token
-PUBLISH_INDEX_FILENAME: Final = "publish.index"
+SNAPSHOT_DIR_PREFIX: Final = "snapshot-"  # private copies of a tree, inside the commit cache
+REGULAR_FILE_MODE: Final = "100644"  # every released file: the tree hash covers paths and bytes, not modes
+EXPORTABLE_FILE_MODES: Final = frozenset({REGULAR_FILE_MODE, "100755"})
+HTTPS_DEFAULT_PORT: Final = 443
 REDACTED: Final = "***"
+TRAILER_DIFF: Final = "Diff-SHA256"
+TRAILER_THREAD: Final = "Thread"
+TRAILER_VALUE_MAX_CHARS: Final = 200
+BASELINE_COMMIT_MESSAGE: Final = (
+    "chore(release): initialize the release branch with production\n\n"
+    "Baseline of the production tree before the first gated deploy.\n"
+)
 _BRANCH_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _REJECTED_PUSH: Final = ("[rejected]", "non-fast-forward", "fetch first", "stale info", "! [remote rejected]")
 _GIT_VERSION: Final = re.compile(r"(\d+)\.(\d+)")
 GITHUB_HOST: Final = "github.com"
 _GITHUB_NAME: Final = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
-TRAILER_VALUE_MAX_CHARS: Final = 200
-# The only inherited variables git gets (least privilege: no API key of the parent process reaches it).
+# The only inherited variables git gets (least privilege: no API key of the parent process reaches it). HOME is not
+# one of them: git gets an unusable one, so no ~/.netrc, ~/.config/git/ignore or ~/.config/git/attributes applies.
 GIT_ENV_ALLOWLIST: Final = frozenset(
     {
         "PATH",
-        "HOME",
         "TMPDIR",
         "SYSTEMROOT",
         "HTTP_PROXY",
@@ -81,6 +111,20 @@ GIT_ENV_ALLOWLIST: Final = frozenset(
         "GIT_SSL_CAPATH",
     }
 )
+GIT_FIXED_ENV: Final[Mapping[str, str]] = {
+    "HOME": os.devnull,
+    "XDG_CONFIG_HOME": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_TRACE_REDACT": "1",
+    "GIT_AUTHOR_NAME": GATE_AUTHOR_NAME,
+    "GIT_AUTHOR_EMAIL": GATE_AUTHOR_EMAIL,
+    "GIT_COMMITTER_NAME": GATE_AUTHOR_NAME,
+    "GIT_COMMITTER_EMAIL": GATE_AUTHOR_EMAIL,
+    "LC_ALL": "C",
+    "LANG": "C",
+}
 
 # Process-wide git configuration of every gate command (passed through the environment, never written to a file).
 _BASE_GIT_CONFIG: Final[tuple[tuple[str, str], ...]] = (
@@ -88,6 +132,7 @@ _BASE_GIT_CONFIG: Final[tuple[tuple[str, str], ...]] = (
     ("core.hooksPath", os.devnull),  # no repository or template hook runs
     ("commit.gpgSign", "false"),
     ("core.autocrlf", "false"),  # committed bytes == hashed bytes
+    ("http.followRedirects", "false"),  # the token header never follows a redirect to another host
     ("protocol.allow", "never"),
     ("protocol.file.allow", "always"),
     ("protocol.https.allow", "always"),
@@ -116,6 +161,28 @@ class RemoteHead:
     remote_exists: bool = True  # False for the default local remote before its first use
 
 
+@dataclass(frozen=True)
+class ReleaseConfig:
+    """A release configuration that passed ``validate_release_config``."""
+
+    remote: ReleaseRemote
+    branch: str
+    git_version: str
+
+
+@dataclass(frozen=True)
+class PreparedRelease:
+    """A release built locally by ``prepare`` and not published yet: verified git trees and the commit message."""
+
+    diff_sha256: str
+    approved_tree_sha256: str  # the tree hash prod has once promoted (the staging tree that passed the 4 locks)
+    target_tree: str  # git tree of the approved staging snapshot
+    baseline_tree: str  # git tree of the prod snapshot the change was approved against
+    message: str
+    thread_id: str | None
+
+
+# ---- remote description (pure) -------------------------------------------------------------------------------------
 def github_repo(url: str | None) -> str | None:
     """``<owner>/<repo>`` of a credential-free ``https://github.com/<owner>/<repo>[.git]`` URL, else None."""
     if not url:
@@ -123,7 +190,7 @@ def github_repo(url: str | None) -> str | None:
     parts = urlsplit(url)
     if parts.scheme != "https" or "@" in parts.netloc or (parts.hostname or "").lower() != GITHUB_HOST:
         return None
-    if parts.port not in (None, 443) or parts.query or parts.fragment:
+    if parts.port not in (None, HTTPS_DEFAULT_PORT) or parts.query or parts.fragment:
         return None
     segments = parts.path.strip("/").split("/")
     if len(segments) != 2:
@@ -155,18 +222,54 @@ def describe_release_remote(settings: RuntimeSettings) -> dict[str, Any]:
     }
 
 
+def _token_may_go_to(url: str, settings: RuntimeSettings) -> bool:
+    """True when ``url`` is an ``https`` URL on the default port of a host in ``settings.git_allowed_hosts``."""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:  # a port that is not a number
+        return False
+    allowed = {host.lower() for host in settings.git_allowed_hosts}
+    return parts.scheme == "https" and (parts.hostname or "").lower() in allowed and port in (None, HTTPS_DEFAULT_PORT)
+
+
 def _trailer_value(text: object) -> str:
     """One-line trailer value: whitespace (newlines included) collapsed, bounded."""
     return " ".join(str(text).split())[:TRAILER_VALUE_MAX_CHARS] or "none"
 
 
-def _exclude_patterns() -> list[str]:
-    """``info/exclude`` lines mirroring the tree-hash ignore rules (directories, file names, suffixes)."""
-    return [
-        *(f"{name}/" for name in sorted(TREE_HASH_IGNORED_DIRS)),
-        *sorted(TREE_HASH_IGNORED_FILES),
-        *(f"*{suffix}" for suffix in sorted(TREE_HASH_IGNORED_SUFFIXES)),
-    ]
+def _trailers(message: str) -> dict[str, str]:
+    """``{key: value}`` of the last paragraph of a commit message: the trailer block ``prepare`` always writes last.
+
+    Parsed here rather than by git, so text in the release note above it can never pass for a trailer.
+    """
+    block = message.rstrip("\n").rsplit("\n\n", 1)[-1]
+    return dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+
+
+def _run_process(
+    argv: Sequence[str], *, stdin: bytes | None, timeout: float, env: Mapping[str, str], cwd: Path
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one command in its own process group; on timeout the whole group is killed before re-raising."""
+    with subprocess.Popen(  # fixed executable, no shell, token-free argv
+        list(argv),
+        stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(env),
+        cwd=cwd,
+        start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)  # git's helpers (git-remote-https) included
+            except ProcessLookupError:
+                pass  # the group is already gone
+            process.communicate()
+            raise
+    return subprocess.CompletedProcess(list(argv), process.returncode, stdout, stderr)
 
 
 class GitReleasePublisher:
@@ -177,60 +280,118 @@ class GitReleasePublisher:
         self.git_dir = settings.release_git_dir
 
     # ---- public API ----------------------------------------------------------------------------------------------
-    def publish(
+    def validate(self) -> ReleaseConfig:
+        """See ``validate_release_config``."""
+        remote = self.resolve_remote()  # pure validation first: a bad URL never reaches git
+        if remote.kind == "https" and self.settings.github_token is None:
+            raise WorkspaceError(
+                "invalid_argument", "NO_QUIZ_GITHUB_TOKEN is not set: a push to an https:// release remote needs it."
+            )
+        branch = self.settings.git_branch
+        if not _BRANCH_NAME.match(branch) or ".." in branch or branch.endswith((".lock", "/", ".")) or "//" in branch:
+            raise WorkspaceError("invalid_argument", f"NO_QUIZ_GIT_BRANCH {branch!r} is not a valid branch name.")
+        version = self._check_git_version()
+        self._git("check-ref-format", f"refs/heads/{branch}", in_repo=False)
+        return ReleaseConfig(remote=remote, branch=branch, git_version=version)
+
+    def prepare(
         self,
         *,
         source_dir: Path,
         baseline_dir: Path,
         diff_sha256: str,
-        prod_tree_sha256: str,
+        approved_tree_sha256: str,
+        baseline_tree_sha256: str,
         release_note: str,
         quiz_attempts: int = 0,
         applied_rules: Sequence[str] = (),
         thread_id: str | None = None,
-        reject_push: Callable[[], bool] | None = None,
-    ) -> ReleaseCommit:
-        """Commit ``source_dir`` (staging) on top of ``baseline_dir`` (prod) and push it to the release branch.
+    ) -> PreparedRelease:
+        """Build, locally, the release of ``source_dir`` (staging) on top of ``baseline_dir`` (prod).
 
-        ``prod_tree_sha256`` is the tree hash prod will have once promoted; ``quiz_attempts``, ``applied_rules`` and
-        ``thread_id`` (when known) become commit trailers next to ``Diff-SHA256``. Raises ``WorkspaceError`` (``conflict``
-        when the remote moved during the deploy, ``upstream_error`` for a refused or failed push, ``timeout`` with
-        ``outcome_unknown`` when git did not answer in time, ``invalid_argument`` for a bad remote or branch).
-
-        ``reject_push`` is the eval's ``push_rejected`` fault hook: asked once the release commit is built, a True
-        answer refuses that push as a retryable ``upstream_error`` before anything reaches the remote.
+        No network: call it under the workspace lock. ``approved_tree_sha256`` and ``baseline_tree_sha256`` are the
+        ``compute_tree_sha256`` of staging and prod that the gate approved as ``diff_sha256``; a directory that no
+        longer hashes to its value is refused (``conflict``), and so is a git tree that would not hold exactly the
+        hashed files (``internal_error``). ``quiz_attempts``, ``applied_rules`` and ``thread_id`` (when known)
+        become commit trailers next to ``Diff-SHA256``.
         """
-        remote = self.resolve_remote()  # pure validation first: a bad URL never reaches git
-        branch = self._branch()
-        self._check_git_version()
+        if diff_sha256 != diff_sha256_from_trees(baseline_tree_sha256, approved_tree_sha256):
+            raise WorkspaceError("invalid_argument", "diff_sha256 is not the diff of the baseline and approved trees")
+        self.validate()
         self._ensure_git_dir()
-        if remote.create:
-            self._ensure_bare_remote(Path(remote.target))
-        tip = self._remote_tip(remote, branch)
-        target_tree = self._write_tree(source_dir)
-        if tip is not None and self._tree_of(tip) == target_tree:  # a retried deploy: the remote already holds it
-            return self._release(tip, self._first_parent(tip), branch, remote, diff_sha256, prod_tree_sha256, False)
-        parent = tip
-        baseline_tree = self._write_tree(baseline_dir)
-        if parent is None or self._tree_of(parent) != baseline_tree:
-            message = (
-                "chore(release): sync the release branch with production\n\n"
-                "Baseline of the production tree before the next gated deploy.\n"
-            )
-            parent = self._commit_tree(baseline_tree, parent, message)
         trailers = {
-            "Diff-SHA256": diff_sha256,
-            "Prod-Tree-SHA256": prod_tree_sha256,
+            TRAILER_DIFF: diff_sha256,
+            "Prod-Tree-SHA256": approved_tree_sha256,
             "Gate": "tests_passed, sha256_matches, quiz_passed, human_approved",
             "Quiz-Attempts": str(quiz_attempts),
             "Approved-By": "human",
             "Rules": ", ".join(applied_rules) or "none",
-            **({"Thread": thread_id} if thread_id else {}),
+            **({TRAILER_THREAD: thread_id} if thread_id else {}),
         }
         message = f"deploy: {self._subject(release_note)}\n\n{release_note.strip()}\n\n" + "".join(
             f"{key}: {_trailer_value(value)}\n" for key, value in trailers.items()
         )
-        commit = self._commit_tree(target_tree, parent, message)
+        return PreparedRelease(
+            diff_sha256=diff_sha256,
+            approved_tree_sha256=approved_tree_sha256,
+            target_tree=self._verified_tree(source_dir, approved_tree_sha256, "staging"),
+            baseline_tree=self._verified_tree(baseline_dir, baseline_tree_sha256, "production"),
+            message=message,
+            thread_id=thread_id,
+        )
+
+    def publish(
+        self,
+        prepared: PreparedRelease | None = None,
+        *,
+        before_push: Callable[[ReleaseCommit], None] | None = None,
+        reject_push: Callable[[], bool] | None = None,
+        **directories: Any,
+    ) -> ReleaseCommit:
+        """Push ``prepared`` to the release branch (network: call it WITHOUT the workspace lock).
+
+        Returns the release; ``pushed`` is False when the branch tip already is this release (a retried deploy).
+        Raises ``WorkspaceError``: ``remote_diverged`` when the tip does not hold the prod tree (nothing is pushed,
+        a human must reconcile), ``conflict`` when the remote moved during the deploy, ``upstream_error`` for a
+        refused or failed push, ``timeout`` with ``outcome_unknown`` when git did not answer in time,
+        ``invalid_argument`` for a bad remote or branch.
+
+        ``before_push`` receives the commit about to be pushed (the gate journals its intent there).
+        ``reject_push`` is the eval's ``push_rejected`` fault hook: asked once the release commit is built, a True
+        answer refuses that push as a retryable ``upstream_error`` before anything reaches the remote.
+        """
+        if prepared is None:  # TRANSITION: workspace.py still passes the directories; goes away with its migration
+            prepared = self.prepare(
+                approved_tree_sha256=directories.pop("prod_tree_sha256"),
+                baseline_tree_sha256=compute_tree_sha256(directories["baseline_dir"]),
+                **directories,
+            )
+        deadline = time.monotonic() + RELEASE_DEADLINE_S
+        config = self.validate()
+        remote, branch = config.remote, config.branch
+        self._ensure_git_dir()
+        if remote.create:
+            self._ensure_bare_remote(Path(remote.target))
+        tip = self._remote_tip(remote, branch, deadline)
+        if tip is not None and self._is_same_release(tip, prepared):
+            return self._release(tip, self._first_parent(tip), config, prepared, pushed=False)
+        if tip is None:
+            parent = self._commit_tree(prepared.baseline_tree, None, BASELINE_COMMIT_MESSAGE)
+        elif self._tree_of(tip) == prepared.baseline_tree:
+            parent = tip
+        else:
+            raise WorkspaceError(
+                "remote_diverged",
+                f"The release branch {branch!r} does not hold the current production tree: someone else pushed to "
+                "it, or the workspace was reset. Nothing was pushed and production was not touched. A human must "
+                "reconcile them: bring the branch back to the production tree, or release to a new branch "
+                "(NO_QUIZ_GIT_BRANCH), which is initialised from production. No sync commit is ever pushed for you.",
+                details={"branch": branch, "remote": remote.display, "remote_tip": tip},
+            )
+        commit = self._commit_tree(prepared.target_tree, parent, prepared.message)
+        release = self._release(commit, parent, config, prepared, pushed=True)
+        if before_push is not None:
+            before_push(release)
         if reject_push is not None and reject_push():
             raise WorkspaceError(
                 "upstream_error",
@@ -239,9 +400,50 @@ class GitReleasePublisher:
                 retryable=True,
                 details={"branch": branch, "remote": remote.display, "fault": "push_rejected"},
             )
-        self._push(remote, commit, branch)
+        self._push(remote, commit, branch, deadline)
         self._git("update-ref", f"refs/heads/{branch}", commit)  # local record of the last release
-        return self._release(commit, parent, branch, remote, diff_sha256, prod_tree_sha256, True)
+        return release
+
+    def export_tree(self, commit_sha: str, destination: Path) -> None:
+        """Write the files of a commit (or tree) of the commit cache into the empty directory ``destination``.
+
+        Raw blobs, no checkout: no filter, attribute or end-of-line conversion applies. The gate promotes prod from
+        the release commit with it, in the normal path and when it completes a journaled release after a restart.
+        """
+        listing = self._git("ls-tree", "-r", "-z", "--full-tree", commit_sha)
+        for record in filter(None, listing.split("\0")):
+            meta, relative = record.split("\t", 1)
+            mode, kind, blob = meta.split()
+            path = PurePosixPath(relative)
+            if kind != "blob" or mode not in EXPORTABLE_FILE_MODES or path.is_absolute() or ".." in path.parts:
+                raise WorkspaceError(
+                    "internal_error", f"commit {commit_sha} holds an entry the gate never writes ({mode} {kind})"
+                )
+            target = destination / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(self._git_bytes("cat-file", "blob", blob))
+
+    def remote_has_commit(self, commit_sha: str) -> bool:
+        """True when the release branch of the remote contains ``commit_sha`` (network: ``ls-remote`` + ``fetch``).
+
+        For reconciliation after a restart: did the push of a journaled release land? A network failure raises.
+        """
+        deadline = time.monotonic() + RELEASE_DEADLINE_S
+        config = self.validate()
+        if config.remote.create and not (Path(config.remote.target) / "HEAD").is_file():
+            return False
+        self._ensure_git_dir()
+        tip = self._remote_tip(config.remote, config.branch, deadline)
+        return tip is not None and (tip == commit_sha or self._is_ancestor(commit_sha, tip))
+
+    def discard_default_remote(self) -> None:
+        """Delete the workspace's own bare remote (a workspace reset); a configured remote is never touched.
+
+        Without it every deploy after a reset would be ``remote_diverged``: the old releases would no longer match
+        the reseeded prod. The next deploy initialises the branch again.
+        """
+        if self.settings.git_remote_url is None:
+            shutil.rmtree(self.settings.default_release_remote_dir, ignore_errors=True)
 
     def is_released(self, release: ReleaseCommit, prod_dir: Path) -> bool:
         """True when ``release`` is on its remote branch and holds the current tree of ``prod_dir``.
@@ -258,10 +460,8 @@ class GitReleasePublisher:
             if not Path(remote.target).exists():
                 return False
             self._ensure_git_dir()
-            tip = self._remote_tip(remote, release.branch)
-            if tip is None or not self._is_ancestor(release.commit_sha, tip):
-                return False
-            return self._tree_of(release.commit_sha) == self._write_tree(prod_dir)
+            tip = self._remote_tip(remote, release.branch, time.monotonic() + RELEASE_DEADLINE_S)
+            return tip is not None and self._is_ancestor(release.commit_sha, tip)
         except WorkspaceError:
             return False
 
@@ -272,9 +472,8 @@ class GitReleasePublisher:
     def inspect_remote(self) -> RemoteHead:
         """Read-only check of the configuration and of the remote (``init-github --verify``): git version, remote
         URL, branch name, then ``ls-remote`` (access + tip). Nothing is fetched, committed or pushed."""
-        version = self._check_git_version()
-        remote = self.resolve_remote()
-        branch = self._branch()
+        config = self.validate()
+        remote, branch, version = config.remote, config.branch, config.git_version
         if remote.create and not (Path(remote.target) / "HEAD").is_file():
             return RemoteHead(remote=remote, branch=branch, tip=None, git_version=version, remote_exists=False)
         return RemoteHead(remote=remote, branch=branch, tip=self._advertised_tip(remote, branch), git_version=version)
@@ -285,9 +484,8 @@ class GitReleasePublisher:
         An existing branch is left exactly as it is (``created=False``); a new one is created by a plain
         fast-forward push (``conflict`` if someone created it meanwhile, never forced).
         """
-        remote = self.resolve_remote()
-        branch = self._branch()
-        version = self._check_git_version()
+        config = self.validate()
+        remote, branch, version = config.remote, config.branch, config.git_version
         self._ensure_git_dir()
         if remote.create:
             self._ensure_bare_remote(Path(remote.target))
@@ -300,7 +498,8 @@ class GitReleasePublisher:
         return RemoteHead(remote=remote, branch=branch, tip=commit, git_version=version, created=True)
 
     def resolve_remote(self) -> ReleaseRemote:
-        """The configured remote, validated: an ``https://`` URL without credentials, or a local repository path.
+        """The configured remote, validated: an ``https://`` URL without credentials on an allowed host, or a local
+        repository path. Pure: no git, no network.
 
         Never echoes the configured URL in an error, since a misconfigured one may embed a secret.
         """
@@ -317,6 +516,14 @@ class GitReleasePublisher:
                 )
             if not parts.hostname or parts.query or parts.fragment:
                 raise WorkspaceError("invalid_argument", "NO_QUIZ_GIT_REMOTE_URL is not a valid https:// git URL.")
+            if not _token_may_go_to(url, self.settings):
+                allowed = ", ".join(self.settings.git_allowed_hosts)
+                raise WorkspaceError(
+                    "invalid_argument",
+                    "NO_QUIZ_GIT_REMOTE_URL points at a host the release token may not be sent to. Allowed hosts "
+                    f"(default port only): {allowed}. Add a host you trust with NO_QUIZ_GIT_ALLOWED_HOSTS.",
+                    details={"allowed_hosts": list(self.settings.git_allowed_hosts)},
+                )
             return ReleaseRemote(target=url, display=url, kind="https")
         local = Path(parts.path) if parts.scheme == "file" and not parts.netloc else Path(url)
         if parts.scheme not in ("", "file") or not local.is_absolute():
@@ -327,13 +534,6 @@ class GitReleasePublisher:
         return ReleaseRemote(target=str(local), display=str(local), kind="local")
 
     # ---- git steps -----------------------------------------------------------------------------------------------
-    def _branch(self) -> str:
-        branch = self.settings.git_branch
-        if not _BRANCH_NAME.match(branch) or ".." in branch or branch.endswith((".lock", "/", ".")) or "//" in branch:
-            raise WorkspaceError("invalid_argument", f"NO_QUIZ_GIT_BRANCH {branch!r} is not a valid branch name.")
-        self._git("check-ref-format", f"refs/heads/{branch}", in_repo=False)
-        return branch
-
     def _check_git_version(self) -> str:
         """The installed git version (e.g. "2.50.1"); ``internal_error`` below ``GIT_MIN_VERSION``."""
         output = self._git("version", in_repo=False).strip()
@@ -347,51 +547,105 @@ class GitReleasePublisher:
         if not (self.git_dir / "HEAD").is_file():
             shutil.rmtree(self.git_dir, ignore_errors=True)
             self._git("init", "--quiet", "--bare", str(self.git_dir), in_repo=False)
-        exclude = self.git_dir / "info" / "exclude"
-        exclude.parent.mkdir(parents=True, exist_ok=True)
-        exclude.write_text("\n".join(_exclude_patterns()) + "\n", encoding="utf-8")
 
     def _ensure_bare_remote(self, path: Path) -> None:
         if not (path / "HEAD").is_file():
             path.parent.mkdir(parents=True, exist_ok=True)
             self._git("init", "--quiet", "--bare", str(path), in_repo=False)
 
-    def _advertised_tip(self, remote: ReleaseRemote, branch: str) -> str | None:
+    def _advertised_tip(self, remote: ReleaseRemote, branch: str, deadline: float | None = None) -> str | None:
         """The commit id the remote advertises for the branch (``ls-remote``), or None if the branch is new."""
         ref = f"refs/heads/{branch}"
-        listing = self._git("ls-remote", "--heads", remote.target, ref, remote=remote)
+        listing = self._git("ls-remote", "--heads", remote.target, ref, remote=remote, deadline=deadline)
         tips = [line.split("\t", 1)[0] for line in listing.splitlines() if line.endswith(f"\t{ref}")]
         return tips[0] if tips else None
 
-    def _remote_tip(self, remote: ReleaseRemote, branch: str) -> str | None:
+    def _remote_tip(self, remote: ReleaseRemote, branch: str, deadline: float) -> str | None:
         """The commit the remote branch points at, with its objects fetched, or None if the branch is new."""
-        advertised = self._advertised_tip(remote, branch)
+        advertised = self._advertised_tip(remote, branch, deadline)
         if advertised is None:
             return None
         ref = f"refs/heads/{branch}"
-        self._git("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote.target, ref, remote=remote)
+        fetch = ("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote.target, ref)
+        self._git(*fetch, remote=remote, deadline=deadline)
         # no FETCH_HEAD and no ref is written: the objects are now local, so the advertised tip resolves directly
         return self._git("rev-parse", "--verify", f"{advertised}^{{commit}}").strip()
 
     def _is_ancestor(self, commit: str, tip: str) -> bool:
+        """True when ``commit`` is ``tip`` or one of its ancestors; False too when the cache does not know it."""
         try:
+            self._git("cat-file", "-e", f"{commit}^{{commit}}")
             self._git("merge-base", "--is-ancestor", commit, tip)
         except WorkspaceError as error:
-            if error.payload.details.get("exit_code") == 1:  # git's "not an ancestor" answer
+            if error.payload.details.get("exit_code") in (1, 128):  # "not an ancestor" / "no such commit"
                 return False
             raise
         return True
 
-    def _write_tree(self, directory: Path) -> str:
-        """The git tree of ``directory`` (tree-hash ignore rules applied), built in a throwaway index."""
-        index = self.git_dir / PUBLISH_INDEX_FILENAME
-        index.unlink(missing_ok=True)
-        env = {"GIT_INDEX_FILE": str(index)}
+    def _is_same_release(self, tip: str, prepared: PreparedRelease) -> bool:
+        """True when the branch tip is ``prepared`` itself, already pushed: identity, never an equal tree alone."""
+        _, _, message = self._git("cat-file", "commit", tip).partition("\n\n")
+        trailers = _trailers(message)
+        thread = _trailer_value(prepared.thread_id) if prepared.thread_id else None
+        return (
+            trailers.get(TRAILER_DIFF) == prepared.diff_sha256
+            and trailers.get(TRAILER_THREAD) == thread
+            and self._tree_of(tip) == prepared.target_tree
+        )
+
+    @contextmanager
+    def _scratch_dir(self) -> Iterator[Path]:
+        """A private directory inside the commit cache, removed on exit."""
+        scratch = Path(tempfile.mkdtemp(prefix=SNAPSHOT_DIR_PREFIX, dir=self.git_dir))
         try:
-            self._git(f"--work-tree={directory}", "add", "--all", "--", ".", env=env, cwd=directory)
-            return self._git("write-tree", env=env).strip()
+            yield scratch
         finally:
-            index.unlink(missing_ok=True)
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def _verified_tree(self, directory: Path, expected_sha256: str, what: str) -> str:
+        """The git tree of exactly the files that make ``directory`` hash to ``expected_sha256``.
+
+        Built from a private copy, so a write that lands in ``directory`` after the check cannot change the tree;
+        then read back from git and hashed again, so nothing but the approved bytes can be pushed.
+        """
+        with self._scratch_dir() as scratch:
+            snapshot, readback = scratch / "snapshot", scratch / "readback"
+            snapshot.mkdir()
+            readback.mkdir()
+            copy_tree(directory, snapshot)
+            if compute_tree_sha256(snapshot) != expected_sha256:
+                raise WorkspaceError(
+                    "conflict",
+                    f"The {what} tree changed since it was approved: nothing was committed or pushed. Review the "
+                    "current diff and earn the locks again.",
+                    retryable=False,
+                    details={"tree": what, "expected_tree_sha256": expected_sha256},
+                )
+            tree = self._write_tree(snapshot)
+            self.export_tree(tree, readback)
+            if compute_tree_sha256(readback) != expected_sha256:
+                raise WorkspaceError(
+                    "internal_error", f"the git tree built for {what} does not hold exactly the approved files"
+                )
+            return tree
+
+    def _write_tree(self, directory: Path) -> str:
+        """The git tree of the files ``compute_tree_sha256(directory)`` hashes, as plain regular files.
+
+        Plumbing only: each blob is stored unfiltered and listed in a throwaway index by name, so no ``.gitignore``,
+        ``.gitattributes``, global ignore file or filter is consulted.
+        """
+        files = tree_files(directory)
+        with self._scratch_dir() as scratch:
+            env = {"GIT_INDEX_FILE": str(scratch / "index")}
+            if files:
+                paths = [str(path) for path in files.values()]
+                blobs = self._git("hash-object", "-w", "--no-filters", "--", *paths).split()
+                entries = "".join(
+                    f"{REGULAR_FILE_MODE} {blob}\t{relative}\0" for relative, blob in zip(files, blobs, strict=True)
+                )
+                self._git("update-index", "-z", "--index-info", env=env, stdin=entries)
+            return self._git("write-tree", env=env).strip()
 
     def _tree_of(self, commit: str) -> str:
         return self._git("rev-parse", "--verify", f"{commit}^{{tree}}").strip()
@@ -404,11 +658,12 @@ class GitReleasePublisher:
         args = ["commit-tree", tree, *(["-p", parent] if parent else []), "-F", "-"]
         return self._git(*args, stdin=message).strip()
 
-    def _push(self, remote: ReleaseRemote, commit: str, branch: str) -> None:
+    def _push(self, remote: ReleaseRemote, commit: str, branch: str, deadline: float | None = None) -> None:
         """Fast-forward push of ``commit`` to ``branch``: the refspec has no ``+`` and no force flag exists here."""
         refspec = f"{commit}:refs/heads/{branch}"
+        push = ("push", "--quiet", "--porcelain", "--no-verify", remote.target, refspec)
         try:
-            self._git("push", "--quiet", "--porcelain", "--no-verify", remote.target, refspec, remote=remote)
+            self._git(*push, remote=remote, deadline=deadline)
         except WorkspaceError as error:
             output = str(error.payload.details.get("git_output", ""))
             if error.code == "upstream_error" and any(marker in output for marker in _REJECTED_PUSH):
@@ -422,23 +677,17 @@ class GitReleasePublisher:
             raise
 
     def _release(
-        self,
-        commit: str,
-        parent: str | None,
-        branch: str,
-        remote: ReleaseRemote,
-        diff_sha256: str,
-        prod_tree_sha256: str,
-        pushed: bool,
+        self, commit: str, parent: str | None, config: ReleaseConfig, prepared: PreparedRelease, *, pushed: bool
     ) -> ReleaseCommit:
+        remote = config.remote
         return ReleaseCommit(
             commit_sha=commit,
             parent_sha=parent,
-            branch=branch,
+            branch=config.branch,
             remote=remote.display,
             remote_kind=remote.kind,
-            diff_sha256=diff_sha256,
-            prod_tree_sha256=prod_tree_sha256,
+            diff_sha256=prepared.diff_sha256,
+            prod_tree_sha256=prepared.approved_tree_sha256,
             pushed=pushed,
             commit_url=github_commit_url(remote.target if remote.kind == "https" else None, commit),
         )
@@ -451,7 +700,8 @@ class GitReleasePublisher:
     # ---- process plumbing ----------------------------------------------------------------------------------------
     def _secrets(self) -> list[str]:
         """Every form a configured token could take in git's output (raw and as its basic-auth header value)."""
-        token = self.settings.github_token.get_secret_value() if self.settings.github_token else ""
+        secret = self.settings.github_token
+        token = secret.get_secret_value() if secret else ""
         return [secret for secret in (token, self._basic_auth(token) if token else "") if secret]
 
     @staticmethod
@@ -466,24 +716,15 @@ class GitReleasePublisher:
     def _environment(self, remote: ReleaseRemote | None, extra: Mapping[str, str] | None) -> dict[str, str]:
         """A clean git environment: only ``GIT_ENV_ALLOWLIST`` inherited, user/system config ignored, gate identity.
 
-        The token header is added for network commands to an ``https`` remote only, scoped to that remote's URL.
+        The token header is added for network commands only, to an ``https`` remote on an allowed host only, and
+        scoped to that remote's URL.
         """
-        env = {name: value for name, value in os.environ.items() if name in GIT_ENV_ALLOWLIST}
-        env |= {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_TRACE_REDACT": "1",
-            "GIT_AUTHOR_NAME": GATE_AUTHOR_NAME,
-            "GIT_AUTHOR_EMAIL": GATE_AUTHOR_EMAIL,
-            "GIT_COMMITTER_NAME": GATE_AUTHOR_NAME,
-            "GIT_COMMITTER_EMAIL": GATE_AUTHOR_EMAIL,
-            "LC_ALL": "C",
-            "LANG": "C",
-        }
+        env = {name: value for name, value in os.environ.items() if name in GIT_ENV_ALLOWLIST} | dict(GIT_FIXED_ENV)
         config = list(_BASE_GIT_CONFIG)
         token = self.settings.github_token
         if remote is not None and remote.kind == "https" and token is not None:
+            if not _token_may_go_to(remote.target, self.settings):
+                raise WorkspaceError("invalid_argument", "the release token may not be sent to this remote's host")
             header = f"Authorization: Basic {self._basic_auth(token.get_secret_value())}"
             config.append((f"http.{remote.target}.extraHeader", header))
         env["GIT_CONFIG_COUNT"] = str(len(config))
@@ -492,35 +733,38 @@ class GitReleasePublisher:
             env[f"GIT_CONFIG_VALUE_{index}"] = value
         return env | dict(extra or {})
 
-    def _git(
+    def _git(self, *args: str, **options: Any) -> str:
+        """``_git_bytes`` as text (file-system encoding: any path git prints survives the round trip)."""
+        return os.fsdecode(self._git_bytes(*args, **options))
+
+    def _git_bytes(
         self,
         *args: str,
         in_repo: bool = True,
         remote: ReleaseRemote | None = None,
         env: Mapping[str, str] | None = None,
         stdin: str | None = None,
-        cwd: Path | None = None,
-    ) -> str:
+        deadline: float | None = None,
+    ) -> bytes:
         """Run one git command and return its stdout; any failure is a ``WorkspaceError`` with redacted output.
 
         ``in_repo`` runs it against the gate's commit cache; ``remote`` marks a network command (longer timeout, the
-        token header when applicable).
+        token header when applicable); ``deadline`` (``time.monotonic()``) caps the timeout of this command.
         """
         prefix: Sequence[str] = [f"--git-dir={self.git_dir}"] if in_repo else []
         argv = [GIT_EXECUTABLE, *prefix, *args]
         timeout = GIT_NETWORK_TIMEOUT_S if remote is not None else GIT_LOCAL_TIMEOUT_S
-        workdir = cwd or self.settings.workspace_dir
+        if deadline is not None:
+            timeout = max(min(timeout, deadline - time.monotonic()), 0.0)
+        workdir = self.settings.workspace_dir
         workdir.mkdir(parents=True, exist_ok=True)  # a missing cwd must not read as "git is not installed"
         try:
-            completed = subprocess.run(  # fixed executable, no shell, token-free argv
+            completed = _run_process(
                 argv,
-                input=stdin,
-                capture_output=True,
-                text=True,
+                stdin=None if stdin is None else os.fsencode(stdin),
                 timeout=timeout,
                 env=self._environment(remote, env),
                 cwd=workdir,
-                check=False,
             )
         except FileNotFoundError:
             if shutil.which(GIT_EXECUTABLE) is not None:
@@ -535,21 +779,39 @@ class GitReleasePublisher:
                 outcome_unknown=remote is not None,
             ) from None
         if completed.returncode != 0:
-            output = self._redact(f"{completed.stderr}\n{completed.stdout}".strip())
+            raw = b"\n".join((completed.stderr, completed.stdout)).decode("utf-8", errors="replace")
             where = f" ({remote.display})" if remote is not None else ""
             raise WorkspaceError(
                 "upstream_error" if remote is not None else "internal_error",
                 f"git {args[0]}{where} failed with exit code {completed.returncode}.",
-                details={"git_command": args[0], "exit_code": completed.returncode, "git_output": output},
+                details={
+                    "git_command": args[0],
+                    "exit_code": completed.returncode,
+                    "git_output": self._redact(raw.strip()),
+                },
             )
         return completed.stdout
 
 
+def validate_release_config(settings: RuntimeSettings) -> ReleaseConfig:
+    """The one check of the release configuration: harness, CLI and UI call it when a run starts.
+
+    Verifies the remote URL (an ``https://`` URL without credentials on an allowed host, or an absolute local path),
+    that an ``https`` remote has a token, the branch name, and git >= ``GIT_MIN_VERSION``. No network and no write
+    beyond creating the workspace directory. Raises ``WorkspaceError``: ``invalid_argument`` for the configuration,
+    ``internal_error`` for git. No message echoes the URL or the token.
+    """
+    return GitReleasePublisher(settings).validate()
+
+
 __all__ = [
     "GitReleasePublisher",
+    "PreparedRelease",
+    "ReleaseConfig",
     "ReleaseRemote",
     "RemoteHead",
     "describe_release_remote",
     "github_commit_url",
     "github_repo",
+    "validate_release_config",
 ]
