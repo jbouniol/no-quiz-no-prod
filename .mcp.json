@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.code_server"]
+    },
+    "notion-quiz-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.notion_quiz_server"]
+    }
+  }
+}

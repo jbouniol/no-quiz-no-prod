@@ -7,11 +7,43 @@ authors = [
     { name = "Jonathan Bouniol", email = "jbouniol@albertschool.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "anthropic>=0.49.0",
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "langgraph>=1.2.16",
+    "langgraph-checkpoint-sqlite>=3.1.2",
+    "mcp[cli]>=2.3.0",
+    "openai>=3.31.0",
+    "pydantic>=2.14.1",
+    "python-dotenv>=1.2.4",
+    "uvicorn>=0.34.0",
+]
 
 [project.scripts]
-no-quiz-no-prod = "no_quiz_no_prod:main"
+no-quiz-no-prod = "no_quiz_no_prod.cli:main"
+no-quiz-ui = "no_quiz_no_prod.ui.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
