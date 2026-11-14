@@ -9,12 +9,19 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Final, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Final, Literal, TextIO
 
 import httpx
 
+from no_quiz_no_prod.backend import SandboxWorkspace
 from no_quiz_no_prod.backend.errors import WorkspaceError
-from no_quiz_no_prod.backend.notion_sync import NotionSyncError, provision_notion_databases
+from no_quiz_no_prod.backend.notion_sync import (
+    NOTION_API_BASE,
+    NOTION_TIMEOUT_S,
+    NOTION_VERSION,
+    NotionSyncError,
+    provision_notion_databases,
+)
 from no_quiz_no_prod.backend.release import (
     GitReleasePublisher,
     describe_release_remote,
@@ -43,10 +50,10 @@ from no_quiz_no_prod.contracts import (
 )
 from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
 from no_quiz_no_prod.llm import LLMError
-from no_quiz_no_prod.ui.server import WorkflowBackend, WorkspaceBackend, _load_default_workspace
-from no_quiz_no_prod.ui.server import main as run_ui_server
 
-NOTION_API_VERSION = "2022-06-28"
+if TYPE_CHECKING:
+    from no_quiz_no_prod.ui.server import WorkflowBackend, WorkspaceBackend
+
 KEY_SHORTCUT_MAP: dict[str, QuizOptionKey] = {
     "1": "A",
     "2": "B",
@@ -328,7 +335,7 @@ def _cmd_reset(
     out: TextIO = sys.stdout,
 ) -> int:
     cfg = settings or RuntimeSettings.from_env()
-    ws = workspace or _load_default_workspace(cfg)
+    ws: WorkspaceBackend = workspace or SandboxWorkspace(settings=cfg)
     state = ws.reset(
         args.seed,
         preserve_skill_memory=not args.reset_skill_memory,
@@ -345,14 +352,17 @@ def _cmd_reset(
 def _verify_notion_database(api_key: str, db_id: str) -> tuple[bool, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Notion-Version": NOTION_API_VERSION,
+        "Notion-Version": NOTION_VERSION,
     }
     try:
-        resp = httpx.get(f"https://api.notion.com/v1/databases/{db_id}", headers=headers, timeout=10.0)
+        resp = httpx.get(f"{NOTION_API_BASE}/databases/{db_id}", headers=headers, timeout=NOTION_TIMEOUT_S)
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
     if resp.status_code == 200:
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            return False, "invalid JSON response"
         title_parts = data.get("title") or []
         title = "".join(part.get("plain_text", "") for part in title_parts) or db_id
         return True, title
@@ -561,6 +571,13 @@ def build_parser() -> argparse.ArgumentParser:
     ui_p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     ui_p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     ui_p.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
+    ui_p.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Extra host name the Studio answers to, besides loopback and --host (repeatable).",
+    )
 
     # 4. init-notion
     notion_p = sub.add_parser(
@@ -621,9 +638,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "reset":
         return _cmd_reset(args)
     if args.command == "ui":
+        from no_quiz_no_prod.ui.server import main as run_ui_server
+
         ui_args = ["--host", args.host, "--port", str(args.port)]
         if args.reload:
             ui_args.append("--reload")
+        for host in args.allowed_host:
+            ui_args.extend(["--allowed-host", host])
         return run_ui_server(ui_args)
     if args.command == "init-notion":
         return _cmd_init_notion(args)

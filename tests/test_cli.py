@@ -245,3 +245,32 @@ def test_typed_failures_and_ctrl_c_map_to_exit_codes(
 
     monkeypatch.setattr(cli, "_dispatch", interrupt)
     assert cli.main(["reset"]) == cli.EXIT_INTERRUPTED
+
+
+def test_ui_subcommand_forwards_repeatable_allowed_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    import no_quiz_no_prod.ui.server as ui_server
+
+    captured: list[list[str]] = []
+
+    def fake_ui_main(argv: list[str] | None = None) -> int:
+        captured.append(list(argv or []))
+        return 0
+
+    monkeypatch.setattr(ui_server, "main", fake_ui_main)
+    code = cli.main(
+        ["ui", "--host", "0.0.0.0", "--port", "8080", "--reload", "--allowed-host", "dev.local", "--allowed-host", "ci"]
+    )
+    assert code == cli.EXIT_OK
+    assert captured == [
+        [
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8080",
+            "--reload",
+            "--allowed-host",
+            "dev.local",
+            "--allowed-host",
+            "ci",
+        ]
+    ]
