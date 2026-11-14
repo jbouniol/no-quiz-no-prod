@@ -10,7 +10,14 @@ from typing import Any
 from mcp import StdioServerParameters
 from mcp.types import CallToolResult, TextContent
 
-from no_quiz_no_prod.contracts import DEFAULT_GIT_BRANCH, MCP_SERVER_MODULES, EnvVar, McpServerName, ToolErrorPayload
+from no_quiz_no_prod.contracts import (
+    DEFAULT_GIT_BRANCH,
+    MCP_SERVER_ENV_ALLOWLIST,
+    MCP_SERVER_MODULES,
+    EnvVar,
+    McpServerName,
+    ToolErrorPayload,
+)
 
 WRAPPED_RESULT_KEY = "result"  # MCPServer wraps a non-object return value (a list) as {"result": value}
 # A launched server reads .env itself: without these, a GitHub remote and token configured there would be used.
@@ -29,9 +36,13 @@ def server_parameters(
     ``env`` is merged over the SDK's default environment, e.g. ``{"NOTION_API_KEY": ""}`` keeps an eval run off the
     real Notion workspace (an empty value counts as unset). The release remote is hermetic by default: the URL and
     token are blanked (deploys go to the workspace's local bare remote) unless ``env`` sets them explicitly, since an
-    empty variable wins over the ``.env`` the server loads.
+    empty variable wins over the ``.env`` the server reads. Least privilege: whatever ``env`` says, every project
+    variable outside the server's allow-list (``MCP_SERVER_ENV_ALLOWLIST``: LLM keys for both servers, the Notion key
+    for code-mcp, the release remote and token for notion-quiz-mcp) is launched empty.
     """
     extra = HERMETIC_RELEASE_ENV | dict(env or {})
+    allowed = MCP_SERVER_ENV_ALLOWLIST[server] | {EnvVar.NO_QUIZ_ENV_FILE}
+    extra |= {var.value: "" for var in EnvVar if var not in allowed}
     if workspace_dir is not None:
         extra[EnvVar.NO_QUIZ_WORKSPACE_DIR.value] = str(workspace_dir)
     return StdioServerParameters(command=sys.executable, args=["-m", MCP_SERVER_MODULES[server]], env=extra)
