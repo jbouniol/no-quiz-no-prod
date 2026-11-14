@@ -11,7 +11,6 @@ import argparse
 import asyncio
 import inspect
 import json
-import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -297,6 +296,8 @@ class QuizSubmitRequest(BaseModel):
     selected_option: QuizOptionKey
     user_id: str = DEFAULT_USER_ID
     question_id: str | None = None
+    model: str | None = None
+    topology: Topology | None = None
 
 
 class DeploySubmitRequest(BaseModel):
@@ -306,6 +307,8 @@ class DeploySubmitRequest(BaseModel):
     expected_diff_sha256: str | None = None
     reason: str = ""
     user_id: str = DEFAULT_USER_ID
+    model: str | None = None
+    topology: Topology | None = None
 
 
 # ---- pure serialization & helper functions -------------------------------------------------------------------------
@@ -352,27 +355,13 @@ def _resolve_hub_url(notion_ids: dict[str, str]) -> str | None:
     return None
 
 
-def _load_notion_rules(settings: RuntimeSettings, *, seed_index_override: Path | None = None) -> list[NotionRule]:
-    sqlite_path = settings.workspace_dir / "state.sqlite"
-    if sqlite_path.is_file():
-        try:
-            with sqlite3.connect(sqlite_path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT rule_code, title, domain, severity, status, body_markdown, skill_tags, "
-                    "notion_page_id, notion_url FROM notion_rules ORDER BY rule_code"
-                ).fetchall()
-            parsed: list[NotionRule] = []
-            for row in rows:
-                data = dict(row)
-                raw_tags = data.get("skill_tags")
-                if isinstance(raw_tags, str):
-                    data["skill_tags"] = json.loads(raw_tags) if raw_tags.strip() else []
-                parsed.append(NotionRule.model_validate(data))
-            if parsed:
-                return parsed
-        except (sqlite3.Error, ValueError, ValidationError):
-            pass
+def _load_notion_rules(
+    workspace: WorkspaceBackend | None = None, *, seed_index_override: Path | None = None
+) -> list[NotionRule]:
+    list_rules_fn = getattr(workspace, "list_rules", None) if workspace is not None else None
+    if callable(list_rules_fn):
+        items = list_rules_fn()
+        return [r if isinstance(r, NotionRule) else NotionRule.model_validate(r) for r in items]
 
     seed_index = seed_index_override or (PROJECT_ROOT / "seeds" / DEFAULT_SEED / "rules" / "index.json")
     if seed_index.is_file():
@@ -500,6 +489,46 @@ class StudioManager:
             session.workflow = self._workflow_factory(self.settings, session.topology, session.model)
         return session.workflow
 
+    @property
+    def _threads_meta_path(self) -> Path:
+        return self.settings.workspace_dir / "ui_threads.json"
+
+    def persist_thread_meta(self, thread_id: str, *, model: str, topology: Topology) -> None:
+        data: dict[str, dict[str, str]] = {}
+        if self._threads_meta_path.is_file():
+            try:
+                loaded = json.loads(self._threads_meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except (OSError, ValueError):
+                data = {}
+        data[thread_id] = {"model": model, "topology": topology}
+        self._threads_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        self._threads_meta_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+    def resolve_thread_meta(
+        self, thread_id: str, *, model_hint: str | None = None, topology_hint: Topology | None = None
+    ) -> tuple[str, Topology]:
+        saved: dict[str, str] = {}
+        if self._threads_meta_path.is_file():
+            try:
+                loaded = json.loads(self._threads_meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get(thread_id), dict):
+                    saved = loaded[thread_id]
+            except (OSError, ValueError):
+                saved = {}
+        catalogue = _build_models_catalogue(self.settings)
+        model = model_hint or saved.get("model") or str(catalogue["default_model"])
+        saved_topo = saved.get("topology")
+        topology: Topology = (
+            topology_hint if topology_hint is not None else (saved_topo if saved_topo in ("dual", "single") else "dual")
+        )
+        return model, topology
+
+    def clear_thread_meta(self) -> None:
+        if self._threads_meta_path.is_file():
+            self._threads_meta_path.unlink()
+
     def snapshot_artifacts(
         self, thread_id: str | None = None, *, expected_diff_sha256: str | None = None
     ) -> tuple[DiffReport, PytestReport | None, ShipLogEntry | None, PublicQuizView | None, DeployGateStatus]:
@@ -535,7 +564,7 @@ class StudioManager:
 
         diff, pytest_rep, ship_log, quiz, locks = self.snapshot_artifacts(active_tid, expected_diff_sha256=expected_sha)
         notion_ids = _read_notion_metadata(self.notion_ids_file)
-        rules = _load_notion_rules(self.settings)
+        rules = _load_notion_rules(self.workspace)
         skills = _normalize_skill_profile(self.workspace.get_skill_profile(user_id=user_id), user_id)
 
         interrupt_dump = session.interrupt.model_dump(mode="json") if session and session.interrupt else None
@@ -774,6 +803,7 @@ def create_app(
             preserve_skill_memory=not req.reset_skill_memory,
         )
         manager.sessions.clear()
+        manager.clear_thread_meta()
         manager.latest_thread_id = None
         state_payload = manager.build_state_payload(user_id=req.user_id, thread_id=None)
         return {
@@ -806,6 +836,7 @@ def create_app(
             session.user_id = req.user_id
             session.interrupt = None
             session.stop_reason = None
+        manager.persist_thread_meta(thread_id, model=chosen_model, topology=req.topology)
         manager.latest_thread_id = thread_id
 
         # Arm transient fault when requested on a clean workspace via #14 contract reset()
@@ -1000,11 +1031,13 @@ def create_app(
         remediation_trace: list[ToolCallTrace] = []
 
         if session is None:
-            catalogue = _build_models_catalogue(manager.settings)
+            resolved_model, resolved_topology = manager.resolve_thread_meta(
+                thread_id, model_hint=req.model, topology_hint=req.topology
+            )
             session = _ThreadSession(
                 thread_id=thread_id,
-                model=str(catalogue["default_model"]),
-                topology="dual",
+                model=resolved_model,
+                topology=resolved_topology,
                 user_id=req.user_id,
             )
 
@@ -1182,11 +1215,13 @@ def create_app(
 
         session = manager.sessions.get(thread_id)
         if session is None:
-            catalogue = _build_models_catalogue(manager.settings)
+            resolved_model, resolved_topology = manager.resolve_thread_meta(
+                thread_id, model_hint=req.model, topology_hint=req.topology
+            )
             session = _ThreadSession(
                 thread_id=thread_id,
-                model=str(catalogue["default_model"]),
-                topology="dual",
+                model=resolved_model,
+                topology=resolved_topology,
                 user_id=req.user_id,
             )
 

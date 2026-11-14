@@ -1281,6 +1281,8 @@ async function submitQuizAnswer() {
         selected_option: store.selectedQuizOption,
         user_id: DEFAULT_USER_ID,
         question_id: store.quiz.question_id,
+        model: $("model-select").value || null,
+        topology: $("topology-select").value || "dual",
       }),
     });
     if (!resp.ok) {
@@ -1354,6 +1356,8 @@ async function submitDeployDecision(action) {
             ? "Comprehension verified; approved in Live Studio."
             : "Rejected by developer in Live Studio.",
         user_id: DEFAULT_USER_ID,
+        model: $("model-select").value || null,
+        topology: $("topology-select").value || "dual",
       }),
     });
     const data = await resp.json();

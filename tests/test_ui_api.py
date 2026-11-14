@@ -5,7 +5,6 @@ from __future__ import annotations
 import io
 import json
 import re
-import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -95,29 +94,6 @@ class StubSandboxWorkspace:
             for child in d.glob("*.py"):
                 child.unlink()
             (d / "orders.py").write_text("def calc(x):\n    return round(x * 1.2, 2)\n", encoding="utf-8")
-
-        sqlite_path = self.settings.workspace_dir / "state.sqlite"
-        with sqlite3.connect(sqlite_path) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS notion_rules ("
-                "rule_code TEXT PRIMARY KEY, title TEXT, domain TEXT, severity TEXT, "
-                "status TEXT, body_markdown TEXT, skill_tags TEXT, notion_page_id TEXT, notion_url TEXT)"
-            )
-            conn.execute("DELETE FROM notion_rules")
-            conn.execute(
-                "INSERT INTO notion_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "RULE-001",
-                    "Monetary Decimal Precision & Half-Up Rounding",
-                    "Monetary & Rounding",
-                    "Critical",
-                    "Active",
-                    "Always use `Decimal('0.01')` with `ROUND_HALF_UP`.",
-                    json.dumps(["decimal_rounding"]),
-                    None,
-                    None,
-                ),
-            )
 
         if self.settings.gate_ledger_path.is_file():
             self.settings.gate_ledger_path.unlink()
@@ -358,6 +334,18 @@ class StubSandboxWorkspace:
 
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int:
         return len(self.skills.pop(user_id, {}))
+
+    def list_rules(self) -> list[NotionRule]:
+        return [
+            NotionRule(
+                rule_code="RULE-001",
+                title="Monetary Decimal Precision & Half-Up Rounding",
+                domain="Monetary & Rounding",
+                severity="Critical",
+                body_markdown="Always use `Decimal('0.01')` with `ROUND_HALF_UP`.",
+                skill_tags=["decimal_rounding"],
+            )
+        ]
 
     def snapshot_final_state(self, thread_id: str | None = None) -> RunFinalState:
         diff = self.get_diff_report()
@@ -1013,8 +1001,11 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
 ) -> None:
     client, stub_ws, _ = studio_env
 
-    # 1. Start a valid run so Locks 1-3 can be satisfied on thread 'thr_persist'
-    client.post("/api/runs/stream", json={"prompt": "Stage fix", "thread_id": "thr_persist"})
+    # 1. Start a valid 'single' topology run so Locks 1-3 can be satisfied on thread 'thr_persist'
+    client.post(
+        "/api/runs/stream",
+        json={"prompt": "Stage fix", "thread_id": "thr_persist", "topology": "single"},
+    )
     diff_sha = client.get("/api/state?thread_id=thr_persist").json()["workspace"]["diff"]["diff_sha256"]
 
     # 2. Simulate a server restart / --reload by wiping in-memory StudioManager sessions!
@@ -1029,6 +1020,7 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
     resumed_quiz = client.post("/api/runs/thr_persist/quiz", json={"selected_option": "A"})
     assert resumed_quiz.status_code == 200
     assert resumed_quiz.json()["grade"]["passed"] is True
+    assert client.app.state.studio.sessions["thr_persist"].topology == "single"
 
     client.app.state.studio.sessions.clear()
     fake_deploy = client.post(
@@ -1132,12 +1124,7 @@ def test_eval_deduplication_and_seed_rules_body_file(
         ),
         encoding="utf-8",
     )
-    empty_ws_settings = RuntimeSettings.from_env(
-        environ={"NO_QUIZ_WORKSPACE_DIR": str(tmp_path / "empty_ws")},
-        load_env_file=False,
-        notion_ids_file=None,
-    )
-    loaded_rules = _load_notion_rules(empty_ws_settings, seed_index_override=idx_path)
+    loaded_rules = _load_notion_rules(None, seed_index_override=idx_path)
     assert len(loaded_rules) == 1
     assert isinstance(loaded_rules[0], NotionRule)
     assert "Use Decimal." in loaded_rules[0].body_markdown
