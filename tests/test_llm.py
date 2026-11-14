@@ -1,15 +1,16 @@
 """Offline tests of the unified LLM client: provider routing, retries, cost accounting, format translation.
 
 No network and no key: the SDK clients are either replaced by small fakes, or the real OpenAI SDK is driven through an
-``httpx.MockTransport`` so its own retry loop runs against scripted HTTP answers.
+``httpx2.MockTransport`` so its own retry loop runs against scripted HTTP answers.
 """
 
 import json
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
 import anthropic
-import httpx
+import httpx2
 import openai
 import pytest
 from pydantic import BaseModel
@@ -46,7 +47,7 @@ class Verdict(BaseModel):
 def completion(
     content: str | None = "ok",
     *,
-    tool_calls: list[tuple[str, str, str | None]] | None = None,
+    tool_calls: Sequence[tuple[str, str, str | None]] = (),
     usage: dict[str, Any] | None = None,
     finish_reason: str = "stop",
     parsed: Any = None,
@@ -55,7 +56,7 @@ def completion(
     """An OpenAI-SDK-shaped chat completion (only what the client reads)."""
     calls = [
         SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=arguments))
-        for call_id, name, arguments in tool_calls or []
+        for call_id, name, arguments in tool_calls
     ]
     message = SimpleNamespace(
         content=content,
@@ -74,7 +75,8 @@ class FakeCompletions:
     """Records every request and answers from a queue (an exception in the queue is raised)."""
 
     def __init__(self, *answers: Any) -> None:
-        self.answers, self.requests = list(answers), []
+        self.answers = list(answers)
+        self.requests: list[dict[str, Any]] = []
 
     def _next(self, **params: Any) -> Any:
         self.requests.append(params)
@@ -172,7 +174,7 @@ def test_sdk_clients_are_built_with_the_retry_and_timeout_policy(monkeypatch: py
     assert custom._openrouter()["max_retries"] == 0 and custom._openrouter()["timeout"] == 5.0  # type: ignore[index]
 
 
-def scripted_transport(*statuses: int) -> tuple[httpx.MockTransport, list[httpx.Request]]:
+def scripted_transport(*statuses: int) -> tuple[httpx2.MockTransport, list[httpx2.Request]]:
     """HTTP answers for the real OpenAI SDK: the given statuses in order, then 200 with a completion."""
     queue, seen = list(statuses), []
     body = {
@@ -184,22 +186,22 @@ def scripted_transport(*statuses: int) -> tuple[httpx.MockTransport, list[httpx.
         "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.00042},
     }
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         seen.append(request)
         if queue:
-            return httpx.Response(queue.pop(0), headers={"retry-after-ms": "1"}, json={"error": {"message": "busy"}})
-        return httpx.Response(200, json=body)
+            return httpx2.Response(queue.pop(0), headers={"retry-after-ms": "1"}, json={"error": {"message": "busy"}})
+        return httpx2.Response(200, json=body)
 
-    return httpx.MockTransport(handler), seen
+    return httpx2.MockTransport(handler), seen
 
 
-def real_sdk_client(transport: httpx.MockTransport, max_retries: int) -> LLMClient:
+def real_sdk_client(transport: httpx2.MockTransport, max_retries: int) -> LLMClient:
     client = LLMClient(model="x/y", settings=SETTINGS, max_retries=max_retries)
     client._openrouter_client = openai.OpenAI(
         base_url="http://openrouter.invalid/api/v1",
         api_key="sk-or-test",
         max_retries=max_retries,
-        http_client=httpx.Client(transport=transport),
+        http_client=httpx2.Client(transport=transport),
     )
     return client
 
@@ -227,7 +229,7 @@ def test_exhausted_retries_and_non_retryable_failures_become_one_llm_error() -> 
 
 
 def test_anthropic_sdk_errors_and_empty_replies_are_llm_errors() -> None:
-    request = httpx.Request("POST", "http://anthropic.invalid/v1/messages")
+    request = httpx2.Request("POST", "http://anthropic.invalid/v1/messages")
     client, _ = anthropic_client(anthropic.APIConnectionError(request=request))
     with pytest.raises(LLMError, match="anthropic call failed") as raised:
         client.chat_with_tools(MESSAGES)
@@ -298,7 +300,7 @@ def test_openrouter_tool_calls_are_normalized_and_bad_arguments_are_reported_not
 
 
 def test_openai_history_is_translated_to_alternating_anthropic_turns() -> None:
-    history = [
+    history: list[dict[str, Any]] = [
         {"role": "system", "content": "Rules."},
         {"role": "developer", "content": "More rules."},
         {"role": "user", "content": "Fix it"},

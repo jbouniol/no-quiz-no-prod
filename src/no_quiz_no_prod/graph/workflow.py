@@ -34,7 +34,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Annotated, Any, Final, Literal, NotRequired, Protocol, TypedDict
 
@@ -232,6 +232,19 @@ class WorkspaceHarness(Protocol):
     def upsert_skill_record(self, record: SkillProfileRecord) -> SkillProfileRecord: ...
 
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int: ...
+
+
+class ChatClient(Protocol):
+    """What the harness needs from an LLM client (``LLMClient``, or a scripted stand-in in tests)."""
+
+    def chat_with_tools(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = ...,
+        max_tokens: int = ...,
+    ) -> ChatTurnResponse: ...
 
 
 class ThreadStateError(ValueError):
@@ -453,7 +466,7 @@ def _pending(snapshot: Any) -> HumanInterrupt | None:
     return None
 
 
-def _finish(stop_reason: StopReason, answer: str, **update: Any) -> Command[Literal["finish"]]:
+def _finish(stop_reason: StopReason, answer: str, **update: Any) -> Command[str]:
     return Command(goto="finish", update={**update, "stop_reason": stop_reason, "final_answer": answer})
 
 
@@ -468,7 +481,7 @@ class NoQuizWorkflow:
     def __init__(
         self,
         settings: RuntimeSettings | None = None,
-        llm_client: LLMClient | None = None,
+        llm_client: ChatClient | None = None,
         topology: Topology = "dual",
         model: str | None = None,
         mcp_transport: McpTransport = "stdio",
@@ -505,7 +518,7 @@ class NoQuizWorkflow:
 
     # ---- lazy collaborators ----------------------------------------------------------------------------------------
     @property
-    def llm(self) -> LLMClient:
+    def llm(self) -> ChatClient:
         with self._lock:
             if self._llm is None:
                 self._llm = LLMClient(model=self.model, settings=self.settings)
@@ -743,7 +756,7 @@ class NoQuizWorkflow:
             "budget_exhausted": exhausted,
         }
 
-    def _node_handoff(self, state: WorkflowState) -> Command[Literal["agent", "quiz_gate", "finish"]]:
+    def _node_handoff(self, state: WorkflowState) -> Command[str]:
         role = state["phase"]
         text = state.get("last_text") or ""
         status = parse_agent_status(text, wrote_staging=bool(state.get("wrote_staging")))
@@ -802,9 +815,7 @@ class NoQuizWorkflow:
         )
         return {"trace": [entry.model_dump(mode="json")], "last_grade": grade.model_dump(mode="json")}
 
-    def _node_quiz_outcome(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["deploy_gate", "agent", "finish"]]:
+    def _node_quiz_outcome(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         """Everything that follows a checkpointed grade: Layer 4 memory, events, then the route. Safe to re-run."""
         thread_id = _thread_id(config)
         grade = QuizGradeResult.model_validate(state["last_grade"])
@@ -828,9 +839,7 @@ class NoQuizWorkflow:
             return self._examiner_turn(state, self.workspace.get_diff_report(), attempt=grade.attempt + 1, extra=update)
         return _finish("quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option))
 
-    def _node_deploy_gate(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["release_gate", "finish"]]:
+    def _node_deploy_gate(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         thread_id = _thread_id(config)
         diff = self.workspace.get_diff_report()
         gate = self.workspace.get_gate_status(diff.diff_sha256)
@@ -852,9 +861,7 @@ class NoQuizWorkflow:
         )
         return self._decide(state, thread_id, decision, release)
 
-    def _node_release_gate(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["release_gate", "finish"]]:
+    def _node_release_gate(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         """A gated deploy whose release failed: the human re-approves the SAME diff (a real Lock 4, the server
         revoked the first approval) or rejects it. Same arguments and idempotency key: never a new change."""
         thread_id = _thread_id(config)
@@ -882,7 +889,7 @@ class NoQuizWorkflow:
 
     def _decide(
         self, state: WorkflowState, thread_id: str, decision: DeployDecision, release: PendingRelease
-    ) -> Command[Literal["release_gate", "finish"]]:
+    ) -> Command[str]:
         """Record the human's decision (harness side), then, on approval, make the system's deploy call.
 
         ``release`` is the publish this approval is for (its ``attempts`` already counts this one). The route:
@@ -963,7 +970,7 @@ class NoQuizWorkflow:
     # ---- node helpers ----------------------------------------------------------------------------------------------
     def _examiner_turn(
         self, state: WorkflowState, diff: DiffReport, *, attempt: int, extra: Mapping[str, Any]
-    ) -> Command[Literal["agent", "finish"]]:
+    ) -> Command[str]:
         """A fresh, isolated Examiner context for one attempt (dual topology).
 
         Fails closed when the diff does not fit the brief: a quiz written from a truncated diff would unlock a
@@ -988,7 +995,7 @@ class NoQuizWorkflow:
         )
 
     @staticmethod
-    def _nudge(state: WorkflowState, text: str) -> Command[Literal["agent", "finish"]]:
+    def _nudge(state: WorkflowState, text: str) -> Command[str]:
         """A harness reminder to the active agent, at most ``MAX_HANDOFF_NUDGES`` times, then a stop."""
         nudges = state.get("nudges", 0)
         if nudges >= MAX_HANDOFF_NUDGES:
@@ -1252,8 +1259,9 @@ class NoQuizWorkflow:
         pending = _pending(snapshot)
         values = snapshot.values or {}
         graded = QUIZ_OUTCOME_NODE in (snapshot.next or ()) and not snapshot.interrupts
+        resume: Command[Any] | None = None
         if graded:  # the grade is in the checkpoint, only its consequences are missing
-            question_id, resume = (values.get("quiz") or {}).get("question_id"), None
+            question_id = (values.get("quiz") or {}).get("question_id")
         elif pending is not None and pending.kind == "quiz" and pending.quiz is not None:
             update = {} if values.get("user_id") else {"user_id": user_id}
             question_id = pending.quiz.question_id
