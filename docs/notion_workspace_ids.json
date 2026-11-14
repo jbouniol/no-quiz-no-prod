@@ -1,0 +1,284 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-14T00:34:43+00:00",
+  "instructions_version": "0.0.6",
+  "parent_project_page_id": "3ef2eeb1-0d3e-81bb-9571-edf4ceac4c74",
+  "hub_title": "No-Quiz-No-Prod — Agentic Hub",
+  "hub_page_id": "4182eeb1-0d3e-8182-9bd9-fd43108f40a2",
+  "hub_url": "https://app.notion.com/p/4182eeb10d3e81829bd9fd43108f40a2",
+  "rules_db_id": "4182eeb1-0d3e-81d5-8b86-c078239f578f",
+  "rules_db_url": "https://app.notion.com/p/4182eeb10d3e81d58b86c078239f578f",
+  "rules_data_source_id": "4182eeb1-0d3e-81f7-bd40-000b674cb6f6",
+  "rules_data_source_url": "collection://4182eeb1-0d3e-81f7-bd40-000b674cb6f6",
+  "ship_log_db_id": "4182eeb1-0d3e-811d-943d-fa2dbab9757c",
+  "ship_log_db_url": "https://app.notion.com/p/4182eeb10d3e811d943dfa2dbab9757c",
+  "ship_log_data_source_id": "4182eeb1-0d3e-8108-914c-000bfedbfa78",
+  "ship_log_data_source_url": "collection://4182eeb1-0d3e-8108-914c-000bfedbfa78",
+  "skill_profile_db_id": "4182eeb1-0d3e-81c5-8028-e4af31239204",
+  "skill_profile_db_url": "https://app.notion.com/p/4182eeb10d3e81c58028e4af31239204",
+  "skill_profile_data_source_id": "4182eeb1-0d3e-8121-b472-000bb4ace3c2",
+  "skill_profile_data_source_url": "collection://4182eeb1-0d3e-8121-b472-000bb4ace3c2",
+  "rule_page_ids": {
+    "RULE-001": "4182eeb1-0d3e-8124-9a4a-f832a760daf8",
+    "RULE-002": "4182eeb1-0d3e-81af-8835-feff2ff13b42",
+    "RULE-003": "4182eeb1-0d3e-81a5-8bc9-cd050288aa60",
+    "RULE-004": "4182eeb1-0d3e-81a0-86dc-e1ba88b0e8aa"
+  },
+  "env": {
+    "NOTION_RULES_DB_ID": "4182eeb1-0d3e-81d5-8b86-c078239f578f",
+    "NOTION_SHIP_LOG_DB_ID": "4182eeb1-0d3e-811d-943d-fa2dbab9757c",
+    "NOTION_SKILLS_DB_ID": "4182eeb1-0d3e-81c5-8028-e4af31239204"
+  },
+  "databases": {
+    "rules": {
+      "title": "Engineering Rules & Policies",
+      "db_id": "4182eeb1-0d3e-81d5-8b86-c078239f578f",
+      "db_url": "https://app.notion.com/p/4182eeb10d3e81d58b86c078239f578f",
+      "data_source_id": "4182eeb1-0d3e-81f7-bd40-000b674cb6f6",
+      "data_source_url": "collection://4182eeb1-0d3e-81f7-bd40-000b674cb6f6",
+      "properties": [
+        {
+          "name": "Rule Title",
+          "type": "title"
+        },
+        {
+          "name": "Rule Code",
+          "type": "rich_text"
+        },
+        {
+          "name": "Domain",
+          "type": "select",
+          "options": [
+            "Monetary & Rounding",
+            "Auth & Security",
+            "Discounts & VIP",
+            "Refunds & Testing"
+          ]
+        },
+        {
+          "name": "Severity",
+          "type": "select",
+          "options": [
+            "Critical",
+            "Mandatory",
+            "Guideline"
+          ]
+        },
+        {
+          "name": "Status",
+          "type": "status",
+          "options": [
+            "Draft",
+            "In Review",
+            "Active"
+          ]
+        }
+      ]
+    },
+    "ship_log": {
+      "title": "Feature Ship Log & Pedagogical Docs",
+      "db_id": "4182eeb1-0d3e-811d-943d-fa2dbab9757c",
+      "db_url": "https://app.notion.com/p/4182eeb10d3e811d943dfa2dbab9757c",
+      "data_source_id": "4182eeb1-0d3e-8108-914c-000bfedbfa78",
+      "data_source_url": "collection://4182eeb1-0d3e-8108-914c-000bfedbfa78",
+      "properties": [
+        {
+          "name": "Feature / Fix",
+          "type": "title"
+        },
+        {
+          "name": "Status",
+          "type": "status",
+          "options": [
+            "Staging",
+            "Quiz Pending",
+            "Remediation v2",
+            "Blocked",
+            "Deployed to Prod"
+          ]
+        },
+        {
+          "name": "Doc Version",
+          "type": "select",
+          "options": [
+            "v1",
+            "v2",
+            "v3"
+          ]
+        },
+        {
+          "name": "Changed Files",
+          "type": "multi_select",
+          "options": [
+            "orders.py",
+            "discounts.py",
+            "auth.py",
+            "refunds.py",
+            "test_fintech.py"
+          ]
+        },
+        {
+          "name": "Targeted Weaknesses",
+          "type": "multi_select",
+          "options": [
+            "decimal_rounding",
+            "sql_parameterization",
+            "auth_token_validation",
+            "idempotency_and_retries",
+            "boundary_conditions",
+            "refund_policy_compliance"
+          ]
+        },
+        {
+          "name": "Quiz Attempts",
+          "type": "number"
+        },
+        {
+          "name": "Diff SHA-256",
+          "type": "rich_text"
+        },
+        {
+          "name": "Applied Rules",
+          "type": "relation",
+          "relation_to": "rules",
+          "dual_property": "Linked Shipments"
+        },
+        {
+          "name": "Deployed At",
+          "type": "date"
+        }
+      ]
+    },
+    "skill_profile": {
+      "title": "Developer Skill Profile (Layer 4 Memory)",
+      "db_id": "4182eeb1-0d3e-81c5-8028-e4af31239204",
+      "db_url": "https://app.notion.com/p/4182eeb10d3e81c58028e4af31239204",
+      "data_source_id": "4182eeb1-0d3e-8121-b472-000bb4ace3c2",
+      "data_source_url": "collection://4182eeb1-0d3e-8121-b472-000bb4ace3c2",
+      "properties": [
+        {
+          "name": "Skill Tag",
+          "type": "title"
+        },
+        {
+          "name": "Mastery",
+          "type": "status",
+          "options": [
+            "Not Assessed",
+            "Weakness Detected",
+            "Practicing",
+            "Mastered"
+          ]
+        },
+        {
+          "name": "Fail Count",
+          "type": "number"
+        },
+        {
+          "name": "Pass Count",
+          "type": "number"
+        },
+        {
+          "name": "Last Misconception",
+          "type": "rich_text"
+        },
+        {
+          "name": "Evidence Shipments",
+          "type": "relation",
+          "relation_to": "ship_log"
+        }
+      ]
+    }
+  },
+  "rule_pages": {
+    "RULE-001": {
+      "page_id": "4182eeb1-0d3e-8124-9a4a-f832a760daf8",
+      "url": "https://app.notion.com/p/4182eeb10d3e81249a4af832a760daf8",
+      "title": "Monetary Precision & Cent Rounding"
+    },
+    "RULE-002": {
+      "page_id": "4182eeb1-0d3e-81af-8835-feff2ff13b42",
+      "url": "https://app.notion.com/p/4182eeb10d3e81af8835feff2ff13b42",
+      "title": "Authentication, Timing-Safe HMAC & Parameterized SQL"
+    },
+    "RULE-003": {
+      "page_id": "4182eeb1-0d3e-81a5-8bc9-cd050288aa60",
+      "url": "https://app.notion.com/p/4182eeb10d3e81a58bc9cd050288aa60",
+      "title": "VIP Tiers & Coupon Stacking Policy"
+    },
+    "RULE-004": {
+      "page_id": "4182eeb1-0d3e-81a0-86dc-e1ba88b0e8aa",
+      "url": "https://app.notion.com/p/4182eeb10d3e81a086dce1ba88b0e8aa",
+      "title": "Refund Window, Idempotency & Mandatory Staging Tests"
+    }
+  },
+  "ship_log_showcases": {
+    "SHIP_1": {
+      "page_id": "4182eeb1-0d3e-8187-bc94-fc6e59344b99",
+      "url": "https://app.notion.com/p/4182eeb10d3e8187bc94fc6e59344b99",
+      "title": "Fix VAT float drift in orders.py",
+      "status": "Deployed to Prod",
+      "doc_version": "v2"
+    },
+    "SHIP_2": {
+      "page_id": "4182eeb1-0d3e-8146-94c2-f93abd52d22f",
+      "url": "https://app.notion.com/p/4182eeb10d3e814694c2f93abd52d22f",
+      "title": "Harden HMAC token verification in auth.py",
+      "status": "Blocked",
+      "doc_version": "v2"
+    }
+  },
+  "skill_profile_pages": {
+    "decimal_rounding": {
+      "page_id": "4182eeb1-0d3e-8185-8360-e12a501255ca",
+      "url": "https://app.notion.com/p/4182eeb10d3e81858360e12a501255ca"
+    },
+    "sql_parameterization": {
+      "page_id": "4182eeb1-0d3e-812e-93cb-e485b34b9c31",
+      "url": "https://app.notion.com/p/4182eeb10d3e812e93cbe485b34b9c31"
+    },
+    "auth_token_validation": {
+      "page_id": "4182eeb1-0d3e-810c-bca9-d7e80d82fcb9",
+      "url": "https://app.notion.com/p/4182eeb10d3e810cbca9d7e80d82fcb9"
+    },
+    "idempotency_and_retries": {
+      "page_id": "4182eeb1-0d3e-816c-992a-c293babdb9b0",
+      "url": "https://app.notion.com/p/4182eeb10d3e816c992ac293babdb9b0"
+    },
+    "boundary_conditions": {
+      "page_id": "4182eeb1-0d3e-81f9-9e35-d5d7155fa9f3",
+      "url": "https://app.notion.com/p/4182eeb10d3e81f99e35d5d7155fa9f3"
+    },
+    "refund_policy_compliance": {
+      "page_id": "4182eeb1-0d3e-8182-a1e4-ccb5a18aa91d",
+      "url": "https://app.notion.com/p/4182eeb10d3e8182a1e4ccb5a18aa91d"
+    }
+  },
+  "views": {
+    "ship_board": {
+      "name": "Ship Board",
+      "view_id": "4182eeb1-0d3e-8151-adac-000c58b27b20",
+      "url": "view://4182eeb1-0d3e-8151-adac-000c58b27b20"
+    },
+    "ship_audit_trail": {
+      "name": "Audit Trail",
+      "view_id": "4182eeb1-0d3e-8105-a55e-000c6deba137",
+      "url": "view://4182eeb1-0d3e-8105-a55e-000c6deba137"
+    },
+    "rules_active_critical": {
+      "name": "Active · Critical",
+      "view_id": "4182eeb1-0d3e-8165-80bd-000c8b6e57ad",
+      "url": "view://4182eeb1-0d3e-8165-80bd-000c8b6e57ad"
+    },
+    "skills_mastery_board": {
+      "name": "Mastery Board",
+      "view_id": "4182eeb1-0d3e-8106-b8c8-000c91384c4e",
+      "url": "view://4182eeb1-0d3e-8106-b8c8-000c91384c4e"
+    },
+    "hub_live_ship_board": {
+      "name": "Live Ship Board",
+      "view_id": "4182eeb1-0d3e-81c9-9afe-000c87095b48",
+      "url": "view://4182eeb1-0d3e-81c9-9afe-000c87095b48"
+    }
+  }
+}
