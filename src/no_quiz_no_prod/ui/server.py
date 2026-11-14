@@ -68,6 +68,7 @@ from no_quiz_no_prod.contracts import (
 STATIC_DIR: Final = Path(__file__).resolve().parent / "static"
 SERVICE_NAME: Final = "no-quiz-no-prod-ui"
 SECONDARY_OPENROUTER_MODELS: Final[tuple[tuple[str, str], ...]] = (
+    ("google/gemini-2.5-flash", "OpenRouter · Gemini 2.5 Flash"),  # the second benchmarked cohort (eval/README)
     ("openai/gpt-4o-mini", "OpenRouter · GPT-4o Mini"),
     ("anthropic/claude-sonnet-4.5", "OpenRouter · Claude Sonnet 4.5"),
 )

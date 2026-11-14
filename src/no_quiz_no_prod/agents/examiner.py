@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
 from no_quiz_no_prod.agents.prompts import EXAMINER_SYSTEM_PROMPT
-from no_quiz_no_prod.agents.tools import RULE_CODE_PATTERN, THREAD_ARG, TOOLS, AgentSpec
+from no_quiz_no_prod.agents.tools import AGENT_MAX_OUTPUT_TOKENS, RULE_CODE_PATTERN, THREAD_ARG, TOOLS, AgentSpec
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
     ALL_SKILL_TAGS,
@@ -28,7 +28,7 @@ from no_quiz_no_prod.contracts import (
 )
 
 EXAMINER_TOOLS: Final = ("search_notion_rules", "read_notion_rule", "upsert_ship_log_doc", "create_comprehension_quiz")
-EXAMINER_MAX_TOKENS: Final = 8000  # the whole Markdown doc travels inside one tool call
+EXAMINER_MAX_TOKENS: Final = AGENT_MAX_OUTPUT_TOKENS  # the whole Markdown doc travels inside one tool call
 DIFF_CHARS_FOR_EXAMINER: Final = 12_000  # the brief stays small even for a multi-file change
 RULE_CHARS_FOR_EXAMINER: Final = 3_000
 REMEDIATION_HEADING: Final = "### Why Option {option} Was a Trap (Remediation v2)"

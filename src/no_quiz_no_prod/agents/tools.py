@@ -28,6 +28,11 @@ RULE_CODE_PATTERN: Final = r"^RULE-\d{3}$"
 QUIZ_OPTION_ARGS: Final = tuple(f"option_{key.lower()}" for key in ALL_QUIZ_OPTION_KEYS)
 QUIZ_EXPLANATION_ARGS: Final = tuple(f"explanation_{key.lower()}" for key in ALL_QUIZ_OPTION_KEYS)
 SEALED: Final = "[sealed: the answer key stays server-side]"
+# Output budget of one agent turn. A complete module rewrite or the whole Markdown doc travels inside one tool call,
+# AFTER the hidden reasoning of thinking models: live DeepSeek V4 Flash runs spent all 8000 tokens of the former
+# budget on reasoning (finish_reason="length", no tool call) on 1 heavy turn in 3. 16000 is the largest value every
+# model of the Studio catalogue accepts (openai/gpt-4o-mini caps completions at 16384).
+AGENT_MAX_OUTPUT_TOKENS: Final = 16_000
 
 
 def _text(description: str) -> dict[str, Any]:
@@ -236,6 +241,7 @@ def check_toolsets(specs: Sequence[AgentSpec]) -> None:
 
 
 __all__ = [
+    "AGENT_MAX_OUTPUT_TOKENS",
     "HARNESS_ONLY_TOOLS",
     "IDEMPOTENCY_ARG",
     "QUIZ_EXPLANATION_ARGS",

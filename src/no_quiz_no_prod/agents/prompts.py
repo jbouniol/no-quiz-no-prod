@@ -15,6 +15,8 @@ import json
 import re
 from typing import Any, Final, Literal
 
+from no_quiz_no_prod.contracts import ToolErrorCode
+
 AgentStatus = Literal["done", "clarification_needed", "refused"]
 
 ROLE_HEADER_CODER: Final = "# Role: Coder"
@@ -22,6 +24,13 @@ ROLE_HEADER_EXAMINER: Final = "# Role: Pedagogical Examiner"
 ROLE_HEADER_SINGLE: Final = "# Role: Single Agent"
 HARNESS_PREFIX: Final = "[harness]"
 UNTRUSTED_TAG: Final = "untrusted_tool_output"
+INVALID_ARGUMENT: Final[ToolErrorCode] = "invalid_argument"
+# A live Gemini 2.5 Flash Examiner read `retryable: false` on a rejected quiz (two identical options) as "only the
+# developer can fix this" and stopped: the payload now says that a corrected call is expected.
+INVALID_ARGUMENT_NEXT_STEP: Final = (
+    "Your arguments were rejected and nothing was applied: fix what the message names and call the tool again "
+    "(retryable=false only means the harness will not replay this exact call). Never ask the developer to fix it."
+)
 STATUS_TOKENS: Final[dict[str, AgentStatus]] = {
     "DONE": "done",
     "CLARIFICATION_NEEDED": "clarification_needed",
@@ -187,9 +196,12 @@ def harness_message(text: str) -> dict[str, str]:
 def render_tool_result(tool: str, result: Any = None, error: Any = None, attempts: int = 1) -> str:
     """Spotlighting: a tool result as JSON inside an untrusted-data envelope the model cannot close early."""
     if error is not None:
-        body: Any = {"error": error.model_dump(mode="json") if hasattr(error, "model_dump") else error}
+        payload = error.model_dump(mode="json") if hasattr(error, "model_dump") else error
+        body: Any = {"error": payload}
         if attempts > 1:
             body["harness_retries"] = attempts - 1
+        if isinstance(payload, dict) and payload.get("code") == INVALID_ARGUMENT:
+            body["next_step"] = INVALID_ARGUMENT_NEXT_STEP
     else:
         body = result
     text = json.dumps(body, ensure_ascii=False, default=str).replace(f"</{UNTRUSTED_TAG}", f"<\\/{UNTRUSTED_TAG}")
@@ -223,6 +235,8 @@ __all__ = [
     "FINAL_MESSAGE_FORMAT",
     "GATE_CONTEXT",
     "HARNESS_PREFIX",
+    "INVALID_ARGUMENT",
+    "INVALID_ARGUMENT_NEXT_STEP",
     "REMEDIATION_GUIDE",
     "ROLE_HEADER_CODER",
     "ROLE_HEADER_EXAMINER",

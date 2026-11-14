@@ -11,6 +11,9 @@ Harness guarantees, independent of the model:
 - Step budget: an LLM-initiated tool call is a step; once ``steps >= max_steps`` the router goes to ``give_up``
   (``stop_reason="max_steps"``) and no further call runs. ReAct as in the Session 3 lab: one call per model turn
   (extra parallel calls are answered "not executed", never run).
+- Unusable turns: a model turn with no tool call and no text (a thinking model that spent its whole output budget on
+  hidden reasoning, ``finish_reason="length"``) is asked again with a harness note, at most
+  ``MAX_UNUSABLE_TURN_RETRIES`` times, then stops as ``api_error``. It is never read as a final "done" message.
 - Writes carry ``idem_key(thread_id, tool, args)`` (Session 3 formula; staging writes and test runs also bind the
   staging tree they act on, so a re-run after a change is a new logical call while a retry replays). A retryable
   ``ToolErrorPayload`` (``timeout`` with ``outcome_unknown``, ``rate_limited``) is retried at most
@@ -109,6 +112,7 @@ MAX_TOOL_RETRIES: Final = 2  # retries after the first attempt, for retryable to
 MAX_CALLS_PER_TURN: Final = 1  # ReAct: observe each result before the next action (Session 3 lab)
 RETRY_BACKOFF_S: Final = (0.25, 0.75)
 MAX_HANDOFF_NUDGES: Final = 2  # harness reminders before a phase that keeps failing its checks is stopped
+MAX_UNUSABLE_TURN_RETRIES: Final = 2  # re-asks after a model turn with no tool call and no text (truncated or empty)
 EVAL_STEP_HEADROOM: Final = 4  # eval hard cap = scenario budget + headroom, so over_budget stays observable
 MAX_HITL_ROUNDS: Final = MAX_QUIZ_ATTEMPTS + 1  # every quiz attempt, then one deploy decision
 TREE_BOUND_TOOLS: Final = frozenset({"write_staging_file", "run_staging_tests"})
@@ -145,6 +149,13 @@ GATE_REFUSED: Final = "The server-side gate refused the deployment: {message}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
 SKIPPED_CALL: Final = "Not executed: the step budget of this run is exhausted."
 ONE_CALL_PER_TURN: Final = "Not executed: the harness runs ONE tool call per turn. Call it again if you still need it."
+UNUSABLE_TURN: Final = (
+    "Your last reply {problem} before any tool call or text, so nothing happened. Keep your reasoning short, then "
+    "call ONE tool now, or write your final message starting with its STATUS line."
+)
+UNUSABLE_TURN_STOP: Final = (
+    "Stopped: the model returned no usable turn {count} times in a row (its last reply {problem})."
+)
 
 
 class WorkspaceHarness(Protocol):
@@ -271,6 +282,17 @@ def _assistant_message(turn: ChatTurnResponse) -> dict[str, Any]:
             for call in turn.tool_calls
         ]
     return message
+
+
+def _unusable_turn(turn: ChatTurnResponse, max_tokens: int) -> str | None:
+    """Why a model turn carries no decision at all (no tool call, no text), or None when it is usable.
+
+    Thinking models can spend the whole output budget on hidden reasoning (``finish_reason="length"``): such a turn
+    must be asked again, never read as a final message (an empty text parses as "done": a silent no-op run).
+    """
+    if turn.tool_calls or turn.content.strip():
+        return None
+    return f"hit the {max_tokens}-token output limit" if turn.finish_reason == "length" else "was empty"
 
 
 def _refusal(code: Literal["invalid_argument", "forbidden"], message: str) -> ToolOutcome:
@@ -537,25 +559,39 @@ class NoQuizWorkflow:
         }
 
     def _node_agent(self, state: WorkflowState) -> dict[str, Any]:
+        """One model turn of the active agent; a turn with no tool call and no text is asked again (bounded)."""
         spec = AGENTS[state["phase"]]
         history = state["messages"][spec.role]
         model = state.get("model") or self.model
-        try:
-            turn = self.llm.chat_with_tools(history, spec.tool_specs(), model=model, max_tokens=spec.max_tokens)
-        except LLMError as exc:
-            return {
-                "stop_reason": "api_error",
-                "final_answer": str(exc) or "the LLM provider failed",
-                "pending_calls": [],
-            }
+        prompt, budget, problem = history, _budget(state), ""
+        for _attempt in range(MAX_UNUSABLE_TURN_RETRIES + 1):
+            try:
+                turn = self.llm.chat_with_tools(prompt, spec.tool_specs(), model=model, max_tokens=spec.max_tokens)
+            except LLMError as exc:
+                return {
+                    "stop_reason": "api_error",
+                    "final_answer": str(exc) or "the LLM provider failed",
+                    "pending_calls": [],
+                    "budget": budget.model_dump(mode="json"),
+                }
+            budget = _with_usage(budget, turn.usage)  # an unusable turn still costs its tokens
+            problem = _unusable_turn(turn, spec.max_tokens) or ""
+            if not problem:
+                return {
+                    "messages": {
+                        **state["messages"],
+                        spec.role: [*prompt, turn.assistant_message or _assistant_message(turn)],
+                    },
+                    "pending_calls": [call.model_dump(mode="json") for call in turn.tool_calls],
+                    "last_text": turn.content,
+                    "budget": budget.model_dump(mode="json"),
+                }
+            prompt = [*history, harness_message(UNUSABLE_TURN.format(problem=problem))]
         return {
-            "messages": {
-                **state["messages"],
-                spec.role: [*history, turn.assistant_message or _assistant_message(turn)],
-            },
-            "pending_calls": [call.model_dump(mode="json") for call in turn.tool_calls],
-            "last_text": turn.content,
-            "budget": _with_usage(_budget(state), turn.usage).model_dump(mode="json"),
+            "stop_reason": "api_error",
+            "final_answer": UNUSABLE_TURN_STOP.format(count=MAX_UNUSABLE_TURN_RETRIES + 1, problem=problem),
+            "pending_calls": [],
+            "budget": budget.model_dump(mode="json"),
         }
 
     @staticmethod
@@ -614,6 +650,10 @@ class NoQuizWorkflow:
         text = state.get("last_text") or ""
         status = parse_agent_status(text, wrote_staging=bool(state.get("wrote_staging")))
         answer = strip_status_line(text)
+        if role == "examiner" and status == "clarification_needed":
+            # The Examiner has no channel to the developer (a follow-up goes to the Coder): its question is a dead
+            # end, so its deliverables decide instead (a nudge naming what is missing, or the quiz gate).
+            status = "done"
         if status != "done":
             return _finish(status, answer)
         diff = self.workspace.get_diff_report()
@@ -1199,6 +1239,7 @@ __all__ = [
     "EVAL_STEP_HEADROOM",
     "MAX_HANDOFF_NUDGES",
     "MAX_TOOL_RETRIES",
+    "MAX_UNUSABLE_TURN_RETRIES",
     "RETRY_BACKOFF_S",
     "NoQuizWorkflow",
     "WorkflowInput",

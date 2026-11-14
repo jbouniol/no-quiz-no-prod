@@ -8,7 +8,7 @@ cannot even name the destructive tool. Promotion to prod belongs to the harness,
 from typing import Any, Final
 
 from no_quiz_no_prod.agents.prompts import CODER_SYSTEM_PROMPT
-from no_quiz_no_prod.agents.tools import AgentSpec
+from no_quiz_no_prod.agents.tools import AGENT_MAX_OUTPUT_TOKENS, AgentSpec
 
 CODER_TOOLS: Final = (
     "search_notion_rules",
@@ -20,7 +20,7 @@ CODER_TOOLS: Final = (
     "get_staging_diff",
     "read_audit_credentials",
 )
-CODER_MAX_TOKENS: Final = 8000  # a complete module rewrite travels inside one tool call
+CODER_MAX_TOKENS: Final = AGENT_MAX_OUTPUT_TOKENS  # a complete module rewrite travels inside one tool call
 
 CODER: Final = AgentSpec(
     role="coder", system_prompt=CODER_SYSTEM_PROMPT, tools=CODER_TOOLS, max_tokens=CODER_MAX_TOKENS

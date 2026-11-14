@@ -9,10 +9,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from testkit import parse_sse_events
 
 from no_quiz_no_prod.cli import _cmd_init_notion, _cmd_reset, _cmd_run, build_parser
 from no_quiz_no_prod.contracts import (
@@ -533,26 +533,6 @@ class StubWorkflow:
         )
 
 
-def _parse_sse_events(raw_body: str) -> list[tuple[str, dict[str, Any]]]:
-    frames: list[tuple[str, dict[str, Any]]] = []
-    for chunk in raw_body.replace("\r\n", "\n").split("\n\n"):
-        if not chunk.strip():
-            continue
-        ev_type = ""
-        data_lines: list[str] = []
-        for line in chunk.split("\n"):
-            if line.startswith("event:"):
-                ev_type = line.removeprefix("event:").strip()
-            elif line.startswith("data:"):
-                data_lines.append(line.removeprefix("data:").strip())
-        if data_lines:
-            payload = json.loads("\n".join(data_lines))
-            # Validate every streamed frame against the frozen RunEvent contract!
-            RunEvent.model_validate(payload)
-            frames.append((ev_type, payload))
-    return frames
-
-
 @pytest.fixture
 def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
     ws_dir = tmp_path / "runtime_ws"
@@ -683,7 +663,7 @@ def test_sse_stream_remediation_and_deploy_gate(
     assert stream_resp.status_code == 200
     assert stream_resp.headers["content-type"].startswith("text/event-stream")
 
-    frames = _parse_sse_events(stream_resp.text)
+    frames = parse_sse_events(stream_resp.text)
     event_types = [t for t, _ in frames]
     assert event_types[0] == "run_started"
     assert "step" in event_types
@@ -787,7 +767,7 @@ def test_quiz_exhaustion_blocks_diff_and_sse_quiz_mode(
         json={"selected_option": "C"},
     )
     assert sse_quiz.status_code == 200
-    sse_frames = _parse_sse_events(sse_quiz.text)
+    sse_frames = parse_sse_events(sse_quiz.text)
     assert any(t == "artifact_updated" for t, _ in sse_frames)
     assert sse_frames[-1][0] == "run_completed"
 
@@ -804,7 +784,7 @@ def test_quiz_exhaustion_blocks_diff_and_sse_quiz_mode(
         "/api/runs/stream",
         json={"prompt": "RAISE_ERROR now", "thread_id": "thr_err"},
     )
-    err_frames = _parse_sse_events(err_stream.text)
+    err_frames = parse_sse_events(err_stream.text)
     assert err_frames[-1][0] == "run_error"
     assert err_frames[-1][1]["stop_reason"] == "api_error"
 

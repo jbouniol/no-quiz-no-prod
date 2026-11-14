@@ -5,20 +5,28 @@ process: the 11 MCP tools of #14 §3 (as the "inprocess" tool dispatcher) and th
 #14 §4, sharing one sandbox, one gate ledger and one skill profile.
 """
 
-import copy
 import difflib
 import json
 import shutil
-from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from testkit import ScriptedLLM, call, turn
 
-from no_quiz_no_prod.agents import AGENTS, CODER, EXAMINER, SINGLE, TOOLS, parse_agent_status, strip_status_line
-from no_quiz_no_prod.agents.prompts import ROLE_HEADER_CODER, ROLE_HEADER_EXAMINER, ROLE_HEADER_SINGLE, UNTRUSTED_TAG
+from no_quiz_no_prod.agents import (
+    AGENTS,
+    CODER,
+    EXAMINER,
+    SINGLE,
+    TOOLS,
+    parse_agent_status,
+    render_tool_result,
+    strip_status_line,
+)
+from no_quiz_no_prod.agents.prompts import UNTRUSTED_TAG
 from no_quiz_no_prod.agents.tools import SEALED
 from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
@@ -55,7 +63,7 @@ from no_quiz_no_prod.graph.mcp_bridge import (
     decode_call_result,
 )
 from no_quiz_no_prod.graph.workflow import NoQuizWorkflow, WorkflowOutcome, make_graph
-from no_quiz_no_prod.llm import ChatTurnResponse, LLMUsage, NormalizedToolCall
+from no_quiz_no_prod.llm import ChatTurnResponse
 from no_quiz_no_prod.memory import SkillMemory, redact_sensitive
 
 # ---- the seeded sandbox --------------------------------------------------------------------------------------------
@@ -353,58 +361,7 @@ class FakeBackend:
         return {"ok": True, "deployed": True, "diff_sha256": diff.diff_sha256}
 
 
-# ---- the scripted LLM ----------------------------------------------------------------------------------------------
-USAGE = LLMUsage(tokens_in=100, tokens_out=20, cost_usd=0.0001, latency_s=0.0, model="fake/scripted")
-ROLE_BY_HEADER = {ROLE_HEADER_CODER: "coder", ROLE_HEADER_EXAMINER: "examiner", ROLE_HEADER_SINGLE: "single"}
-
-
-def call(name: str, **args: Any) -> tuple[str, dict[str, Any]]:
-    return name, args
-
-
-def turn(*calls: tuple[str, dict[str, Any]], text: str = "") -> ChatTurnResponse:
-    tool_calls = [
-        NormalizedToolCall(id=f"call_{index}_{name}", name=name, args=args) for index, (name, args) in enumerate(calls)
-    ]
-    message: dict[str, Any] = {"role": "assistant", "content": text}
-    if tool_calls:
-        message["tool_calls"] = [
-            {"id": c.id, "type": "function", "function": {"name": c.name, "arguments": json.dumps(c.args)}}
-            for c in tool_calls
-        ]
-    return ChatTurnResponse(
-        content=text,
-        tool_calls=tool_calls,
-        usage=USAGE,
-        finish_reason="tool_calls" if tool_calls else "stop",
-        assistant_message=message,
-    )
-
-
-class ScriptedLLM:
-    """Plays each agent from a queue of turns; records every call (role, messages, visible tool names)."""
-
-    model = "fake/scripted"
-
-    def __init__(self, **scripts: list[ChatTurnResponse]) -> None:
-        self.scripts = {role: deque(turns) for role, turns in scripts.items()}
-        self.calls: list[SimpleNamespace] = []
-
-    def chat_with_tools(self, messages, tools=None, model=None, temperature=0.0, max_tokens=2000) -> ChatTurnResponse:
-        system = messages[0]["content"]
-        role = next(role for header, role in ROLE_BY_HEADER.items() if system.startswith(header))
-        tool_names = [spec["function"]["name"] for spec in tools or []]
-        self.calls.append(SimpleNamespace(role=role, messages=copy.deepcopy(list(messages)), tools=tool_names))
-        queue = self.scripts.get(role)
-        if not queue:
-            raise AssertionError(f"the {role} has no scripted turn left")
-        return queue.popleft()
-
-    def briefs(self, role: str = "examiner") -> list[str]:
-        """The first user message of every fresh context of ``role``."""
-        return [c.messages[1]["content"] for c in self.calls if c.role == role and len(c.messages) == 2]
-
-
+# ---- the scripted LLM (``ScriptedLLM``, ``call`` and ``turn`` come from the shared ``testkit``) --------------------
 def coder_fix(
     final: str = "STATUS: DONE\nTotals use Decimal ROUND_HALF_UP (RULE-001); tests green.",
 ) -> list[ChatTurnResponse]:
@@ -664,6 +621,55 @@ def test_one_tool_call_per_turn_like_the_session3_lab(tmp_path: Path, backend: F
     assert backend.calls == [("read_code_file", {"path": "orders.py"})]  # the second call never ran
     answers = [m for m in llm.calls[1].messages if m["role"] == "tool"]
     assert len(answers) == 2 and "ONE tool call per turn" in answers[1]["content"]
+
+
+def test_truncated_or_empty_turns_are_asked_again_never_read_as_done(tmp_path: Path, backend: FakeBackend) -> None:
+    """Live DeepSeek V4 Flash regression (n03, n13): the hidden reasoning ate the whole output budget
+    (``finish_reason="length"``, no tool call, no text) and the empty text parsed as "done" -> "nothing staged"."""
+    truncated, empty = turn(finish_reason="length"), turn()
+    llm = ScriptedLLM(coder=[truncated, *coder_fix()], examiner=[empty, truncated, *doc_and_quiz(1, "A")])
+    result = make_workflow(tmp_path, backend, llm).run_scenario(scenario(max_steps=14))
+    assert result.passed, result.why
+    assert result.steps == 7  # the three unusable turns cost tokens but no tool step
+    assert result.tokens_in == 100 * len(llm.calls)  # ...and every one of them is accounted
+    retry_note = llm.calls[1].messages[-1]["content"]
+    assert retry_note.startswith("[harness]") and f"{CODER.max_tokens}-token output limit" in retry_note
+    examiner_calls = [c for c in llm.calls if c.role == "examiner"]
+    assert [len(c.messages) for c in examiner_calls[:3]] == [2, 3, 3]  # same fresh context + ONE note: no pile-up
+    assert "was empty" in examiner_calls[1].messages[-1]["content"]
+    assert "output limit" in examiner_calls[2].messages[-1]["content"]
+
+
+def test_repeated_unusable_turns_stop_as_api_error_with_zero_writes(tmp_path: Path, backend: FakeBackend) -> None:
+    llm = ScriptedLLM(coder=[turn(finish_reason="length") for _ in range(3)])
+    result = make_workflow(tmp_path, backend, llm).run_scenario(scenario(max_steps=14))
+    assert result.stop_reason == "api_error" and result.outcome == "api_error"
+    assert "no usable turn 3 times" in result.final_answer and "output limit" in result.final_answer
+    assert backend.writes == 0 and backend.calls == [] and result.tokens_in == 300
+
+
+def test_an_examiner_question_is_a_dead_end_so_its_deliverables_decide(tmp_path: Path, backend: FakeBackend) -> None:
+    """Live Gemini 2.5 Flash regression (n12, ad06): after a rejected quiz the Examiner asked the developer to fix
+    it; nobody can answer an Examiner (a follow-up goes to the Coder), so the run died as clarification_needed."""
+    upsert, quiz, done = doc_and_quiz(1, "A")
+    question = turn(text="STATUS: CLARIFICATION_NEEDED\nPlease provide four distinct options for the quiz?")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, question, quiz, done])
+    result = make_workflow(tmp_path, backend, llm).run_scenario(scenario(max_steps=14))
+    assert result.passed, result.why
+    nudges = [
+        c.messages[-1]["content"]
+        for c in llm.calls
+        if c.role == "examiner" and str(c.messages[-1]["content"]).startswith("[harness]")
+    ]
+    assert len(nudges) == 1 and "Before you finish" in nudges[0] and "create_comprehension_quiz" in nudges[0]
+
+
+def test_rejected_arguments_tell_the_agent_to_fix_and_call_again() -> None:
+    rejected = ToolErrorPayload(code="invalid_argument", message="Invalid quiz: the four options must be distinct")
+    hint = json.loads(render_tool_result("create_comprehension_quiz", error=rejected).splitlines()[1])
+    assert "call the tool again" in hint["next_step"] and hint["error"]["retryable"] is False
+    locked = ToolErrorPayload(code="gate_locked", message="missing locks")
+    assert "next_step" not in json.loads(render_tool_result("deploy_to_production", error=locked).splitlines()[1])
 
 
 def test_clarification_follow_up_continues_the_same_thread(tmp_path: Path, backend: FakeBackend) -> None:
