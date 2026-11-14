@@ -14,7 +14,15 @@ import pytest
 
 from no_quiz_no_prod import cli
 from no_quiz_no_prod.backend.errors import WorkspaceError
-from no_quiz_no_prod.contracts import ALL_STOP_REASONS, DeployDecision, EnvVar, QuizAnswer, StopReason
+from no_quiz_no_prod.contracts import (
+    ALL_STOP_REASONS,
+    DeployDecision,
+    EnvVar,
+    PendingRelease,
+    QuizAnswer,
+    StopReason,
+    ToolErrorPayload,
+)
 
 DIFF = "a" * 64
 THREAD = "cli_test"
@@ -31,11 +39,12 @@ def outcome(stop_reason: StopReason | None = None, interrupt: Any = None) -> Sim
     )
 
 
-def deploy_gate() -> SimpleNamespace:
+def deploy_gate(release: PendingRelease | None = None) -> SimpleNamespace:
     gate = SimpleNamespace(
         diff_sha256=DIFF, tests_passed=True, sha256_matches=True, quiz_passed=True, human_approved=False
     )
-    return SimpleNamespace(kind="deploy_approval", gate=gate, quiz=None)
+    kind = "release_retry" if release is not None else "deploy_approval"
+    return SimpleNamespace(kind=kind, gate=gate, quiz=None, release=release)
 
 
 def quiz_gate() -> SimpleNamespace:
@@ -47,7 +56,7 @@ def quiz_gate() -> SimpleNamespace:
         stem="Why?",
         options={"A": "a", "B": "b", "C": "c", "D": "d"},
     )
-    return SimpleNamespace(kind="quiz", quiz=quiz, gate=None)
+    return SimpleNamespace(kind="quiz", quiz=quiz, gate=None, release=None)
 
 
 class ScriptedWorkflow:
@@ -124,6 +133,21 @@ def test_closed_stdin_at_the_quiz_prompt_submits_no_answer() -> None:
     workflow = ScriptedWorkflow(outcome(interrupt=quiz_gate()))
     code, _ = run_cli(workflow, "x")  # an invalid choice, then EOF
     assert workflow.quiz_answers == [] and code == cli.EXIT_NO_DECISION
+
+
+# ---- C8: a failed push comes back as a new gate, never as a silent end ----------------------------------------------
+def test_a_failed_release_is_shown_and_must_be_approved_again() -> None:
+    error = ToolErrorPayload(code="timeout", message="git push did not answer", outcome_unknown=True)
+    failed = PendingRelease(expected_diff_sha256=DIFF, attempts=1, error=error)
+    workflow = ScriptedWorkflow(outcome(interrupt=deploy_gate(failed)))
+    code, transcript = run_cli(workflow, "", "y")  # a stray Enter does not re-approve either
+    assert "Release attempt 1 was not published (timeout: git push did not answer)" in transcript
+    assert "may have reached the remote" in transcript and "approval was revoked" in transcript
+    assert [(d.action, d.expected_diff_sha256) for d in workflow.decisions] == [("approve", DIFF)]
+    assert code == cli.EXIT_OK
+
+    unanswered = ScriptedWorkflow(outcome(interrupt=deploy_gate(failed)))
+    assert run_cli(unanswered)[0] == cli.EXIT_NO_DECISION and unanswered.decisions == []
 
 
 # ---- BE-10: exit codes and one-line errors -------------------------------------------------------------------------

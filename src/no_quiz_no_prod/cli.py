@@ -27,6 +27,8 @@ from no_quiz_no_prod.contracts import (
     NOTION_IDS_FILE,
     DeployAction,
     DeployDecision,
+    InterruptKind,
+    PendingRelease,
     QuizAnswer,
     QuizOptionKey,
     RunEvent,
@@ -50,6 +52,7 @@ KEY_SHORTCUT_MAP: dict[str, QuizOptionKey] = {
     "C": "C",
     "D": "D",
 }
+DEPLOY_INTERRUPT_KINDS: Final[frozenset[InterruptKind]] = frozenset({"deploy_approval", "release_retry"})
 APPROVE_ANSWERS: Final = frozenset({"y", "yes", "a", "approve"})
 REJECT_ANSWERS: Final = frozenset({"n", "no", "r", "reject"})
 
@@ -69,6 +72,8 @@ EXIT_CODE_BY_STOP_REASON: Final[dict[StopReason, int]] = {
     "quiz_failed": 5,
     "human_rejected": 6,
     "max_steps": 7,
+    "release_failed": 8,
+    "harness_error": 10,
 }
 
 
@@ -154,6 +159,18 @@ def _prompt_deploy_action(input_fn: Callable[[str], str], *, out: TextIO = sys.s
         print("  No decision recorded — enter y to approve, or n to reject (a rejection blocks this change).", file=out)
 
 
+def _print_failed_release(release: PendingRelease, out: TextIO) -> None:
+    """Why the gate asks again: the previous approval was revoked by a release that was not published."""
+    error = release.error
+    reason = f"{error.code}: {error.message}" if error is not None else "no error recorded"
+    print(f"\n✗ Release attempt {release.attempts} was not published ({reason}).", file=out)
+    if error is not None and error.outcome_unknown:
+        print("  The outcome is unknown: the push may have reached the remote.", file=out)
+    print(
+        "  Production was not promoted and the approval was revoked. Approving again retries the same diff.", file=out
+    )
+
+
 def _stop_without_decision(gate: str, thread_id: str, out: TextIO) -> int:
     print(
         f"\nStopped: input closed at the {gate}. No decision was recorded for thread {thread_id}; "
@@ -235,8 +252,10 @@ def _cmd_run(
                     )
                 continue
 
-            if intr.kind == "deploy_approval" and intr.gate is not None:
+            if intr.kind in DEPLOY_INTERRUPT_KINDS and intr.gate is not None:
                 gate = intr.gate
+                if intr.release is not None:
+                    _print_failed_release(intr.release, out)
                 print(f"\n=== 4-Lock Production Gate [diff={gate.diff_sha256[:12]}] ===", file=out)
                 print(f"  Lock 1 (tests_passed)   : {gate.tests_passed}", file=out)
                 print(f"  Lock 2 (sha256_matches) : {gate.sha256_matches}", file=out)
