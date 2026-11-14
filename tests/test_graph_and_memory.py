@@ -41,6 +41,7 @@ from no_quiz_no_prod.agents import (
 from no_quiz_no_prod.agents.examiner import DIFF_CHARS_FOR_EXAMINER, render_diff
 from no_quiz_no_prod.agents.prompts import UNTRUSTED_TAG, untrusted
 from no_quiz_no_prod.agents.tools import SEALED
+from no_quiz_no_prod.backend.errors import WorkspaceError
 from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
     DEFAULT_SEED,
@@ -1439,6 +1440,22 @@ def test_a_harness_crash_is_a_harness_error_not_a_provider_error(tmp_path: Path,
     workflow._harvest = broken  # type: ignore[method-assign]
     result = workflow.run_scenario(scenario(max_steps=14))
     assert result.stop_reason == "harness_error" and result.outcome == "harness_error"
+
+
+def test_a_broken_release_configuration_stops_the_run_before_any_agent(tmp_path: Path, backend: FakeBackend) -> None:
+    """AG-42D: a bad remote or branch was only discovered by the deploy, after the quiz and the approval."""
+    for broken in (
+        {"git_remote_url": "https://not-allowed.example/acme/releases.git", "github_token": "ghp-x"},
+        {"git_remote_url": "https://user:secret@github.com/acme/releases.git", "github_token": "ghp-x"},
+        {"git_branch": "bad..branch"},
+    ):
+        llm = ScriptedLLM(coder=coder_fix())
+        workflow = make_workflow(tmp_path, backend, llm)
+        workflow.settings = workflow.settings.model_copy(update=broken)
+        with pytest.raises(WorkspaceError) as raised:
+            workflow.start_run(TASK, thread_id="t-config")
+        assert raised.value.payload.code == "invalid_argument" and "secret" not in raised.value.payload.message
+        assert llm.calls == [] and backend.calls == []
 
 
 # ---- MCP bridge: least privilege, timeouts, reconnection (AG-41D, AG-39D, AG-07) -----------------------------------

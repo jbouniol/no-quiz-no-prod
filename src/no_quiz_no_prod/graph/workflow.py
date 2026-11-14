@@ -1179,7 +1179,10 @@ class NoQuizWorkflow:
         max_steps: int = DEFAULT_MAX_STEPS,
         on_event: Callable[[RunEvent], None] | None = None,
     ) -> WorkflowOutcome:
-        """Start a thread (or a follow-up turn on a finished one) and run it to its first pause or its end."""
+        """Start a thread (or a follow-up turn on a finished one) and run it to its first pause or its end.
+
+        Raises ``ThreadStateError`` for a thread paused on a human gate, and the backend's ``WorkspaceError`` when
+        the release configuration is invalid (``check_release_config``): in both cases no agent ran."""
         return self._start(task, thread_id=thread_id, user_id=user_id, max_steps=max_steps, on_event=on_event)
 
     def _start(
@@ -1204,6 +1207,7 @@ class NoQuizWorkflow:
             raise ThreadStateError(
                 f"thread {thread_id!r} is paused on a human gate: use submit_quiz / submit_deploy_decision"
             )
+        self.check_release_config()
         prior = _budget(snapshot.values or {})
         with self._listening(thread_id, on_event):
             self._emit(
@@ -1215,6 +1219,16 @@ class NoQuizWorkflow:
             )
             payload = {"task": task, "user_id": user_id, "max_steps": max_steps, "injection_text": injection_text}
             return self._drive(config, payload)
+
+    def check_release_config(self) -> None:
+        """Validate the release remote, branch, allowed host and git version before any agent runs.
+
+        A broken release configuration used to surface at the very last step, after the quiz and the approval.
+        Raises the backend's typed ``WorkspaceError`` (``invalid_argument`` / ``internal_error``); no network.
+        """
+        from no_quiz_no_prod.backend.release import validate_release_config  # lazy: the release publisher's domain
+
+        validate_release_config(self.settings)
 
     def submit_quiz(
         self,
