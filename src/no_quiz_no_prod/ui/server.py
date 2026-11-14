@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Final, Protocol
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -75,7 +75,6 @@ SECONDARY_OPENROUTER_MODELS: Final[tuple[tuple[str, str], ...]] = (
 ARTIFACT_TRIGGER_TOOLS: Final[frozenset[str]] = frozenset(
     {
         "write_staging_file",
-        "stage_edit",
         "run_staging_tests",
         "upsert_ship_log_doc",
         "create_comprehension_quiz",
@@ -252,18 +251,22 @@ class _StandaloneWorkspaceFallback:
 def _load_default_workspace(settings: RuntimeSettings) -> WorkspaceBackend:
     try:
         from no_quiz_no_prod.backend.workspace import SandboxWorkspace  # type: ignore[import-not-found]
-    except ImportError:
-        return _StandaloneWorkspaceFallback(settings)
+    except ModuleNotFoundError as exc:
+        if exc.name in {"no_quiz_no_prod.backend", "no_quiz_no_prod.backend.workspace"}:
+            return _StandaloneWorkspaceFallback(settings)
+        raise
     return SandboxWorkspace(settings=settings)
 
 
 def _default_workflow_factory(settings: RuntimeSettings, topology: Topology, model: str) -> WorkflowBackend:
     try:
         from no_quiz_no_prod.graph.workflow import NoQuizWorkflow  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError(
-            "LangGraph workflow package (`no_quiz_no_prod.graph.workflow`) is not installed in this worktree."
-        ) from exc
+    except ModuleNotFoundError as exc:
+        if exc.name in {"no_quiz_no_prod.graph", "no_quiz_no_prod.graph.workflow"}:
+            raise RuntimeError(
+                "LangGraph workflow package (`no_quiz_no_prod.graph.workflow`) is not installed in this worktree."
+            ) from exc
+        raise
     return NoQuizWorkflow(settings=settings, topology=topology, model=model)
 
 
@@ -349,13 +352,7 @@ def _resolve_hub_url(notion_ids: dict[str, str]) -> str | None:
     return None
 
 
-def _load_notion_rules(workspace: WorkspaceBackend, settings: RuntimeSettings) -> list[NotionRule]:
-    for attr in ("list_rules", "get_rules", "get_notion_rules"):
-        getter = getattr(workspace, attr, None)
-        if callable(getter):
-            items = getter()
-            return [r if isinstance(r, NotionRule) else NotionRule.model_validate(r) for r in items]
-
+def _load_notion_rules(settings: RuntimeSettings, *, seed_index_override: Path | None = None) -> list[NotionRule]:
     sqlite_path = settings.workspace_dir / "state.sqlite"
     if sqlite_path.is_file():
         try:
@@ -377,12 +374,24 @@ def _load_notion_rules(workspace: WorkspaceBackend, settings: RuntimeSettings) -
         except (sqlite3.Error, ValueError, ValidationError):
             pass
 
-    seed_index = PROJECT_ROOT / "seeds" / DEFAULT_SEED / "rules" / "index.json"
+    seed_index = seed_index_override or (PROJECT_ROOT / "seeds" / DEFAULT_SEED / "rules" / "index.json")
     if seed_index.is_file():
         try:
             items = json.loads(seed_index.read_text(encoding="utf-8"))
             if isinstance(items, list):
-                return [NotionRule.model_validate(item) for item in items]
+                resolved: list[NotionRule] = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    entry = dict(item)
+                    body_file = entry.pop("body_file", None)
+                    if not entry.get("body_markdown") and isinstance(body_file, str) and body_file.strip():
+                        md_path = seed_index.parent / body_file
+                        if md_path.is_file():
+                            entry["body_markdown"] = md_path.read_text(encoding="utf-8")
+                    allowed = {k: v for k, v in entry.items() if k in NotionRule.model_fields}
+                    resolved.append(NotionRule.model_validate(allowed))
+                return resolved
         except (OSError, ValueError, ValidationError):
             return []
     return []
@@ -526,7 +535,7 @@ class StudioManager:
 
         diff, pytest_rep, ship_log, quiz, locks = self.snapshot_artifacts(active_tid, expected_diff_sha256=expected_sha)
         notion_ids = _read_notion_metadata(self.notion_ids_file)
-        rules = _load_notion_rules(self.workspace, self.settings)
+        rules = _load_notion_rules(self.settings)
         skills = _normalize_skill_profile(self.workspace.get_skill_profile(user_id=user_id), user_id)
 
         interrupt_dump = session.interrupt.model_dump(mode="json") if session and session.interrupt else None
@@ -565,17 +574,23 @@ class StudioManager:
                 if extra.is_file() and extra != primary:
                     candidate_files.append(extra)
 
+        seen_keys: set[tuple[str, Topology, str, int]] = set()
         runs: list[EvalRunResult] = []
         used_sources: list[str] = []
         for path in candidate_files:
-            file_runs: list[EvalRunResult] = []
+            added = 0
             for raw_line in path.read_text(encoding="utf-8").splitlines():
                 stripped = raw_line.strip()
                 if not stripped:
                     continue
-                file_runs.append(EvalRunResult.model_validate_json(stripped))
-            if file_runs:
-                runs.extend(file_runs)
+                parsed_run = EvalRunResult.model_validate_json(stripped)
+                dedupe_key = (parsed_run.model, parsed_run.topology, parsed_run.id, parsed_run.repeat)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                runs.append(parsed_run)
+                added += 1
+            if added > 0:
                 try:
                     rel = path.relative_to(PROJECT_ROOT).as_posix()
                 except ValueError:
@@ -793,18 +808,14 @@ def create_app(
             session.stop_reason = None
         manager.latest_thread_id = thread_id
 
-        # Arm transient fault when requested on a clean workspace
-        if req.fault is not None:
-            fault_setter = getattr(manager.workspace, "set_fault", None)
-            if callable(fault_setter):
-                fault_setter(req.fault)
-            elif manager.workspace.get_diff_report().trees_identical:
-                await _invoke_maybe_async(
-                    manager.workspace.reset,
-                    DEFAULT_SEED,
-                    fault=req.fault,
-                    preserve_skill_memory=True,
-                )
+        # Arm transient fault when requested on a clean workspace via #14 contract reset()
+        if req.fault is not None and manager.workspace.get_diff_report().trees_identical:
+            await _invoke_maybe_async(
+                manager.workspace.reset,
+                DEFAULT_SEED,
+                fault=req.fault,
+                preserve_skill_memory=True,
+            )
 
         async def event_generator() -> AsyncIterator[str]:
             seq = 0
@@ -988,7 +999,16 @@ def create_app(
         budget: RunBudget | None = None
         remediation_trace: list[ToolCallTrace] = []
 
-        if session is not None:
+        if session is None:
+            catalogue = _build_models_catalogue(manager.settings)
+            session = _ThreadSession(
+                thread_id=thread_id,
+                model=str(catalogue["default_model"]),
+                topology="dual",
+                user_id=req.user_id,
+            )
+
+        try:
             wf = manager.get_workflow_for_session(session)
             grade, outcome = await _invoke_maybe_async(
                 wf.submit_quiz,
@@ -997,54 +1017,25 @@ def create_app(
                 user_id=req.user_id,
                 on_event=collect_event,
             )
-            session.interrupt = outcome.interrupt
-            session.stop_reason = outcome.stop_reason
-            session.budget = outcome.budget
-            session.final_answer = outcome.final_answer
-            session.expected_diff_sha256 = grade.diff_sha256
-            interrupt = outcome.interrupt
-            stop_reason = outcome.stop_reason
-            budget = outcome.budget
-            remediation_trace = list(outcome.trace)
-        else:
-            # Direct workspace grading fallback when no LangGraph session was registered in memory
-            question_id = req.question_id
-            if question_id is None:
-                active_quiz = manager.workspace.get_latest_public_quiz(thread_id=thread_id)
-                if active_quiz is None:
-                    raise HTTPException(status_code=404, detail=f"No active quiz found for thread '{thread_id}'.")
-                question_id = active_quiz.question_id
-            try:
-                grade = await _invoke_maybe_async(
-                    manager.workspace.grade_quiz_answer,
-                    question_id,
-                    req.selected_option,
-                    user_id=req.user_id,
-                )
-            except KeyError as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "gate_locked",
+                    "message": f"No resumable workflow quiz interrupt for thread '{thread_id}': {exc}",
+                },
+            )
 
-            locks_after = manager.workspace.get_gate_status(expected_diff_sha256=grade.diff_sha256)
-            diff_after = manager.workspace.get_diff_report()
-            if grade.deployment_blocked:
-                stop_reason = "quiz_failed"
-            elif grade.passed:
-                interrupt = HumanInterrupt(
-                    kind="deploy_approval",
-                    thread_id=thread_id,
-                    message="Comprehension verified. Review the 4-lock gate to approve production deployment.",
-                    gate=locks_after,
-                    diff=diff_after,
-                )
-            else:
-                next_q = manager.workspace.get_latest_public_quiz(thread_id=thread_id, diff_sha256=grade.diff_sha256)
-                if next_q is not None and next_q.attempt > grade.attempt:
-                    interrupt = HumanInterrupt(
-                        kind="quiz",
-                        thread_id=thread_id,
-                        message="Review Remediation v2 and complete Comprehension Quiz Attempt 2 of 2.",
-                        quiz=next_q,
-                    )
+        manager.sessions[thread_id] = session
+        session.interrupt = outcome.interrupt
+        session.stop_reason = outcome.stop_reason
+        session.budget = outcome.budget
+        session.final_answer = outcome.final_answer
+        session.expected_diff_sha256 = grade.diff_sha256
+        interrupt = outcome.interrupt
+        stop_reason = outcome.stop_reason
+        budget = outcome.budget
+        remediation_trace = list(outcome.trace)
 
         manager.latest_thread_id = thread_id
         diff, pytest_rep, ship_log, latest_quiz, locks = manager.snapshot_artifacts(
@@ -1190,10 +1181,16 @@ def create_app(
                 )
 
         session = manager.sessions.get(thread_id)
-        stop_reason: StopReason = "completed" if decision.approved else "human_rejected"
-        deployed_ok = False
+        if session is None:
+            catalogue = _build_models_catalogue(manager.settings)
+            session = _ThreadSession(
+                thread_id=thread_id,
+                model=str(catalogue["default_model"]),
+                topology="dual",
+                user_id=req.user_id,
+            )
 
-        if session is not None:
+        try:
             wf = manager.get_workflow_for_session(session)
             outcome = await _invoke_maybe_async(
                 wf.submit_deploy_decision,
@@ -1201,52 +1198,45 @@ def create_app(
                 decision,
                 user_id=req.user_id,
             )
-            session.interrupt = outcome.interrupt
-            session.stop_reason = outcome.stop_reason
-            session.budget = outcome.budget
-            session.final_answer = outcome.final_answer
-            stop_reason = outcome.stop_reason or stop_reason
-            deployed_ok = bool(outcome.final_state.deployed)
-            if decision.approved and not deployed_ok:
-                post_locks = manager.workspace.get_gate_status(expected_diff_sha256=decision.expected_diff_sha256)
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "deployed": False,
-                        "code": "gate_locked",
-                        "missing_locks": list(post_locks.missing_locks),
-                        "locks": post_locks.model_dump(mode="json"),
-                        "message": outcome.final_answer
-                        or f"Server-side production gate rejected deployment for diff {post_locks.diff_sha256[:8]}.",
-                    },
-                )
-            if deployed_ok:
-                session.deployed_diff_sha256 = expected_sha
-        else:
-            applied_locks = await _invoke_maybe_async(
-                manager.workspace.apply_deploy_decision,
-                decision,
-                thread_id=thread_id,
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "deployed": False,
+                    "code": "gate_locked",
+                    "missing_locks": list(pre_locks.missing_locks),
+                    "locks": pre_locks.model_dump(mode="json"),
+                    "message": f"No resumable workflow deploy gate for thread '{thread_id}': {exc}",
+                },
             )
-            if decision.approved:
-                if not applied_locks.can_deploy:
-                    return JSONResponse(
-                        status_code=409,
-                        content={
-                            "deployed": False,
-                            "code": "gate_locked",
-                            "missing_locks": list(applied_locks.missing_locks),
-                            "locks": applied_locks.model_dump(mode="json"),
-                            "message": (
-                                f"Server-side production gate rejected deployment: "
-                                f"missing_locks={applied_locks.missing_locks} for diff {applied_locks.diff_sha256[:8]}."
-                            ),
-                        },
-                    )
-                deploy_helper = getattr(manager.workspace, "deploy_staging_to_prod", None)
-                if callable(deploy_helper):
-                    await _invoke_maybe_async(deploy_helper, expected_sha, req.reason or "Approved via Studio")
-                deployed_ok = True
+
+        manager.sessions[thread_id] = session
+        session.interrupt = outcome.interrupt
+        session.stop_reason = outcome.stop_reason
+        session.budget = outcome.budget
+        session.final_answer = outcome.final_answer
+        stop_reason: StopReason = outcome.stop_reason or ("completed" if decision.approved else "human_rejected")
+
+        ledger_proved = manager.settings.gate_ledger_path.is_file() and (
+            expected_sha in GateLedger.load(manager.settings.gate_ledger_path).deployed
+        )
+        deployed_ok = bool(outcome.final_state.deployed or ledger_proved)
+
+        if decision.approved and not deployed_ok:
+            post_locks = manager.workspace.get_gate_status(expected_diff_sha256=decision.expected_diff_sha256)
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "deployed": False,
+                    "code": "gate_locked",
+                    "missing_locks": list(post_locks.missing_locks),
+                    "locks": post_locks.model_dump(mode="json"),
+                    "message": outcome.final_answer
+                    or f"Server-side production gate rejected deployment for diff {post_locks.diff_sha256[:8]}.",
+                },
+            )
+        if deployed_ok:
+            session.deployed_diff_sha256 = expected_sha
 
         manager.latest_thread_id = thread_id
         post_diff = manager.workspace.get_diff_report()

@@ -1800,9 +1800,13 @@ function renderExplorerView() {
   const cohortRows = cohorts
     .map((c) => {
       const fmtPct = (v) => `${(Number(v || 0) * 100).toFixed(1)}%`;
+      const isDryRunCohort = String(c.model || "").startsWith("dry-run:");
+      const dryBadge = isDryRunCohort
+        ? ` <span class="pill" data-status="Staging">DRY-RUN</span>`
+        : "";
       return (
         `<tr>` +
-          `<td><code>${escapeHtml(c.model)}</code> · <span class="pill" data-agent="${c.topology === "dual" ? "coder" : "single"}">${escapeHtml(c.topology)}</span></td>` +
+          `<td><code>${escapeHtml(c.model)}</code> · <span class="pill" data-agent="${c.topology === "dual" ? "coder" : "single"}">${escapeHtml(c.topology)}</span>${dryBadge}</td>` +
           `<td class="num-col">${c.total}</td>` +
           `<td class="num-col"><strong>${fmtPct(c.pass_rate)}</strong></td>` +
           `<td class="num-col">${fmtPct(c.pass_hat_k)}</td>` +
@@ -1939,13 +1943,19 @@ function renderExplorerRunsTable() {
   tbody.innerHTML = filtered
     .map((run, idx) => {
       const globalIdx = runs.indexOf(run);
-      const shortModel = String(run.model || "").split("/").pop() || run.model;
+      const rawModel = String(run.model || "");
+      const isDryRun = rawModel.startsWith("dry-run:");
+      const strippedModel = rawModel.replace(/^dry-run:/, "");
+      const shortModel = strippedModel.split("/").pop() || strippedModel;
+      const dryRunBadge = isDryRun
+        ? ` <span class="pill" data-status="Staging">DRY-RUN</span>`
+        : "";
       return (
         `<tr data-run-idx="${globalIdx}">` +
           `<td><code>${escapeHtml(run.key)}</code></td>` +
           `<td><span class="pill" data-kind="${escapeHtml(run.kind)}">${escapeHtml(run.kind)}</span></td>` +
           `<td><div class="task-ellipsis" title="${escapeHtml(run.task)}">${escapeHtml(run.task)}</div></td>` +
-          `<td><span class="mono-chip mono-chip--compact">${escapeHtml(run.topology)} · ${escapeHtml(shortModel)}</span></td>` +
+          `<td><span class="mono-chip mono-chip--compact">${escapeHtml(run.topology)} · ${escapeHtml(shortModel)}</span>${dryRunBadge}</td>` +
           `<td><span class="pill" data-outcome="${escapeHtml(run.outcome)}"><span class="pill__dot"></span><span>${escapeHtml(run.outcome)}</span></span></td>` +
           `<td><code>${escapeHtml(run.stop_reason)}</code></td>` +
           `<td>${run.state_ok ? `<span class="step-glyph--ok">✓</span>` : `<span class="step-glyph--err">✗</span>`}</td>` +

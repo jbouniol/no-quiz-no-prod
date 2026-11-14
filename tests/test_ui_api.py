@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,7 +50,7 @@ from no_quiz_no_prod.contracts import (
     Topology,
     compute_tree_sha256,
 )
-from no_quiz_no_prod.ui.server import STATIC_DIR, create_app
+from no_quiz_no_prod.ui.server import STATIC_DIR, _load_notion_rules, create_app
 
 
 # ---- deterministic in-memory test doubles implementing #14 §4 & §5 --------------------------------------------------
@@ -79,9 +80,6 @@ class StubSandboxWorkspace:
         self.fault: FaultKind | None = None
         self.reset()
 
-    def set_fault(self, fault: FaultKind | None) -> None:
-        self.fault = fault
-
     def reset(
         self,
         seed: str = "fintech",
@@ -97,6 +95,29 @@ class StubSandboxWorkspace:
             for child in d.glob("*.py"):
                 child.unlink()
             (d / "orders.py").write_text("def calc(x):\n    return round(x * 1.2, 2)\n", encoding="utf-8")
+
+        sqlite_path = self.settings.workspace_dir / "state.sqlite"
+        with sqlite3.connect(sqlite_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS notion_rules ("
+                "rule_code TEXT PRIMARY KEY, title TEXT, domain TEXT, severity TEXT, "
+                "status TEXT, body_markdown TEXT, skill_tags TEXT, notion_page_id TEXT, notion_url TEXT)"
+            )
+            conn.execute("DELETE FROM notion_rules")
+            conn.execute(
+                "INSERT INTO notion_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "RULE-001",
+                    "Monetary Decimal Precision & Half-Up Rounding",
+                    "Monetary & Rounding",
+                    "Critical",
+                    "Active",
+                    "Always use `Decimal('0.01')` with `ROUND_HALF_UP`.",
+                    json.dumps(["decimal_rounding"]),
+                    None,
+                    None,
+                ),
+            )
 
         if self.settings.gate_ledger_path.is_file():
             self.settings.gate_ledger_path.unlink()
@@ -338,18 +359,6 @@ class StubSandboxWorkspace:
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int:
         return len(self.skills.pop(user_id, {}))
 
-    def list_rules(self) -> list[NotionRule]:
-        return [
-            NotionRule(
-                rule_code="RULE-001",
-                title="Monetary Decimal Precision & Half-Up Rounding",
-                domain="Monetary & Rounding",
-                severity="Critical",
-                body_markdown="Always use `Decimal('0.01')` with `ROUND_HALF_UP`.",
-                skill_tags=["decimal_rounding"],
-            )
-        ]
-
     def snapshot_final_state(self, thread_id: str | None = None) -> RunFinalState:
         diff = self.get_diff_report()
         log = self.get_latest_ship_log(thread_id)
@@ -514,6 +523,8 @@ class StubWorkflow:
         on_event: Callable[[RunEvent], None] | None = None,
     ) -> StubWorkflowOutcome:
         _ = (user_id, on_event)
+        if thread_id not in self.workspace.ship_logs:
+            raise KeyError(f"Unknown thread '{thread_id}' in workflow checkpoint store")
         locks = self.workspace.apply_deploy_decision(decision, thread_id=thread_id)
         if decision.approved and locks.can_deploy and decision.expected_diff_sha256:
             self.workspace.promote_to_prod(thread_id, decision.expected_diff_sha256)
@@ -994,3 +1005,140 @@ def test_cli_subcommands_and_interactive_hitl_loop(
     assert "Remediation v2" in transcript
     assert "PASSED ✓" in transcript
     assert "deployed=True" in transcript
+
+
+# ---- 6. Contract-Only Restart Resume, Anti-Fake-Deploy & Eval Deduplication (#33) -----------------------------------
+def test_contract_only_stub_restart_resume_and_no_fake_deploy(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    client, stub_ws, _ = studio_env
+
+    # 1. Start a valid run so Locks 1-3 can be satisfied on thread 'thr_persist'
+    client.post("/api/runs/stream", json={"prompt": "Stage fix", "thread_id": "thr_persist"})
+    diff_sha = client.get("/api/state?thread_id=thr_persist").json()["workspace"]["diff"]["diff_sha256"]
+
+    # 2. Simulate a server restart / --reload by wiping in-memory StudioManager sessions!
+    client.app.state.studio.sessions.clear()
+
+    # 3. Unknown thread MUST return 409 gate_locked on both quiz and deploy — NEVER fake deployed: True!
+    bad_quiz = client.post("/api/runs/unknown_thr_999/quiz", json={"selected_option": "A"})
+    assert bad_quiz.status_code == 409
+    assert bad_quiz.json()["code"] == "gate_locked"
+
+    # Even after passing quiz on 'thr_persist' (so workspace Locks 1-3 hold), 'unknown_thr_999' MUST NOT fake deploy!
+    resumed_quiz = client.post("/api/runs/thr_persist/quiz", json={"selected_option": "A"})
+    assert resumed_quiz.status_code == 200
+    assert resumed_quiz.json()["grade"]["passed"] is True
+
+    client.app.state.studio.sessions.clear()
+    fake_deploy = client.post(
+        "/api/runs/unknown_thr_999/deploy",
+        json={"action": "approve", "expected_diff_sha256": diff_sha},
+    )
+    assert fake_deploy.status_code == 409
+    assert fake_deploy.json()["deployed"] is False
+    assert fake_deploy.json()["code"] == "gate_locked"
+    assert not stub_ws.get_diff_report().trees_identical  # prod/ remained untouched!
+
+    # 4. Resuming the real persisted thread after restart routes through workflow_factory and genuinely deploys
+    real_deploy = client.post(
+        "/api/runs/thr_persist/deploy",
+        json={"action": "approve", "expected_diff_sha256": diff_sha},
+    )
+    assert real_deploy.status_code == 200
+    assert real_deploy.json()["deployed"] is True
+    assert stub_ws.get_diff_report().trees_identical
+
+
+def test_eval_deduplication_and_seed_rules_body_file(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+    tmp_path: Path,
+) -> None:
+    client, stub_ws, eval_dir = studio_env
+
+    # 1. Companion file duplicating the primary cohort (--compare-topologies) must NOT double-count runs!
+    sha = "c" * 64
+    scen = ScenarioSpec(id="n01", kind="normal", task="VAT fix", expect_state=ExpectedState(deployed=True))
+    run_dual = EvalRunResult.from_run(
+        scenario=scen,
+        repeat=0,
+        final_state=RunFinalState(
+            prod_tree_sha256=sha,
+            staging_tree_sha256=sha,
+            prod_changed=True,
+            tests_passed=True,
+            ship_log_status="Deployed to Prod",
+            doc_version="v1",
+            quiz_attempts=1,
+            quiz_passed=True,
+            deployed=True,
+        ),
+        trace=[],
+        stop_reason="completed",
+        final_answer="ok",
+        model="dry-run:~deepseek/deepseek-v4-flash-latest",
+        topology="dual",
+    )
+    run_single = EvalRunResult.from_run(
+        scenario=scen,
+        repeat=0,
+        final_state=RunFinalState(
+            prod_tree_sha256=sha,
+            staging_tree_sha256=sha,
+            prod_changed=True,
+            tests_passed=True,
+            ship_log_status="Deployed to Prod",
+            doc_version="v1",
+            quiz_attempts=1,
+            quiz_passed=True,
+            deployed=True,
+        ),
+        trace=[],
+        stop_reason="completed",
+        final_answer="ok",
+        model="dry-run:~deepseek/deepseek-v4-flash-latest",
+        topology="single",
+    )
+
+    # Write primary cohort to BOTH results.jsonl AND results_dual.jsonl, plus single cohort to results_single.jsonl
+    (eval_dir / "results.jsonl").write_text(f"{run_dual.model_dump_json()}\n", encoding="utf-8")
+    (eval_dir / "results_dual.jsonl").write_text(f"{run_dual.model_dump_json()}\n", encoding="utf-8")
+    (eval_dir / "results_single.jsonl").write_text(f"{run_single.model_dump_json()}\n", encoding="utf-8")
+
+    res = client.get("/api/eval/results").json()
+    assert res["summary"]["total_runs"] == 2
+    assert res["summary"]["k_repeats"] == 1
+    dual_cohort = next(c for c in res["summary"]["cohorts"] if c["topology"] == "dual")
+    assert dual_cohort["total"] == 1
+
+    # 2. Seed rules index.json with 'body_file' resolves markdown and ignores extra keys cleanly
+    rules_dir = tmp_path / "seed_rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    (rules_dir / "rule_001.md").write_text("# Monetary Rule\nUse Decimal.", encoding="utf-8")
+    idx_path = rules_dir / "index.json"
+    idx_path.write_text(
+        json.dumps(
+            [
+                {
+                    "rule_code": "RULE-001",
+                    "title": "Monetary Precision",
+                    "domain": "Monetary & Rounding",
+                    "severity": "Critical",
+                    "status": "Active",
+                    "skill_tags": ["decimal_rounding"],
+                    "body_file": "rule_001.md",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    empty_ws_settings = RuntimeSettings.from_env(
+        environ={"NO_QUIZ_WORKSPACE_DIR": str(tmp_path / "empty_ws")},
+        load_env_file=False,
+        notion_ids_file=None,
+    )
+    loaded_rules = _load_notion_rules(empty_ws_settings, seed_index_override=idx_path)
+    assert len(loaded_rules) == 1
+    assert isinstance(loaded_rules[0], NotionRule)
+    assert "Use Decimal." in loaded_rules[0].body_markdown
+    _ = stub_ws
