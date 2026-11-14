@@ -1,7 +1,10 @@
 """The Pedagogical Examiner: documents the staged change and writes the comprehension quiz, in a fresh context.
 
 The harness hands it ``(task, diff_report, applied_rules_text, memory_profile_block, attempt, prior_failed_grade)``
-and nothing else: no Coder transcript (context isolation, the point of the dual topology). Attempt 1 publishes doc
+and nothing else: no Coder transcript (context isolation, the point of the dual topology). The brief carries the
+WHOLE diff: a change too large for it raises ``DiffTooLargeError`` and the run stops (fail closed) rather than quizzing
+the developer on a part of what would ship. Everything a model or a file author wrote (task, diff, rules, profile,
+grader explanation) sits inside the ``untrusted()`` envelope. Attempt 1 publishes doc
 v1 + quiz 1. Attempt 2 (remediation) publishes doc v2 with the ``### Why Option X Was a Trap (Remediation v2)``
 callout and a quiz asked from a fresh angle.
 
@@ -14,7 +17,7 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
-from no_quiz_no_prod.agents.prompts import EXAMINER_SYSTEM_PROMPT
+from no_quiz_no_prod.agents.prompts import EXAMINER_SYSTEM_PROMPT, untrusted
 from no_quiz_no_prod.agents.tools import AGENT_MAX_OUTPUT_TOKENS, RULE_CODE_PATTERN, THREAD_ARG, TOOLS, AgentSpec
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
@@ -29,8 +32,9 @@ from no_quiz_no_prod.contracts import (
 
 EXAMINER_TOOLS: Final = ("search_notion_rules", "read_notion_rule", "upsert_ship_log_doc", "create_comprehension_quiz")
 EXAMINER_MAX_TOKENS: Final = AGENT_MAX_OUTPUT_TOKENS  # the whole Markdown doc travels inside one tool call
-DIFF_CHARS_FOR_EXAMINER: Final = 12_000  # the brief stays small even for a multi-file change
+DIFF_CHARS_FOR_EXAMINER: Final = 60_000  # the whole diff or nothing: beyond this the run fails closed
 RULE_CHARS_FOR_EXAMINER: Final = 3_000
+GRADER_EXPLANATION_SOURCE: Final = "quiz_grader_explanation"
 REMEDIATION_HEADING: Final = "### Why Option {option} Was a Trap (Remediation v2)"
 _REMEDIATION_HEADING_RE: Final = re.compile(r"^###\s+Why Option [A-D] Was a Trap \(Remediation v2\)", re.M)
 _RULE_CODE_RE: Final = re.compile(RULE_CODE_PATTERN)
@@ -40,8 +44,12 @@ EXAMINER: Final = AgentSpec(
 )
 
 
-def _untrusted(source: str, body: str) -> str:
-    return f'<untrusted_data source="{source}">\n{body.strip() or "(empty)"}\n</untrusted_data>'
+class DiffTooLargeError(ValueError):
+    """The staged diff does not fit the Examiner brief: it must not be documented or quizzed from a truncated view."""
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(f"the staged diff is {size} characters, above the {limit} the Examiner can review in full")
+        self.size, self.limit = size, limit
 
 
 def _unique[T](items: Iterable[T]) -> list[T]:
@@ -56,11 +64,11 @@ def _as_list(value: Any) -> list[Any]:
 
 # ---- the brief (the Examiner's whole context) ----------------------------------------------------------------------
 def render_diff(diff: DiffReport, *, limit: int = DIFF_CHARS_FOR_EXAMINER) -> str:
-    """Changed files with +/- counts and the unified diffs, truncated to ``limit`` characters."""
+    """Changed files with +/- counts and the complete unified diffs (``DiffTooLargeError`` above ``limit``)."""
     header = ", ".join(f"{file.path} (+{file.additions} -{file.deletions})" for file in diff.files) or "(none)"
     body = "\n".join(file.unified_diff for file in diff.files)
     if len(body) > limit:
-        body = f"{body[:limit]}\n... [diff truncated at {limit} characters]"
+        raise DiffTooLargeError(len(body), limit)
     return f"Changed files: {header}\n```diff\n{body}\n```"
 
 
@@ -75,16 +83,21 @@ def render_applied_rules(rules: Mapping[str, Mapping[str, str]], *, limit: int =
     return "\n\n".join(sections)
 
 
-def remediation_brief(grade: QuizGradeResult) -> str:
-    """What went wrong at the previous attempt, and the exact v2 deliverables (shared by both topologies)."""
+def remediation_order(grade: QuizGradeResult) -> str:
+    """The v2 deliverables after a wrong answer (shared by both topologies): harness-written sentences only."""
     heading = REMEDIATION_HEADING.format(option=grade.selected_option)
     return (
         f"Quiz attempt {grade.attempt} of {grade.max_attempts} was answered WRONG: the developer picked option "
-        f"{grade.selected_option} (skill `{grade.skill_tag}`).\n"
-        f"The grader's explanation of that option, i.e. the misconception: {grade.explanation}\n"
+        f"{grade.selected_option} (skill `{grade.skill_tag}`). The grader's explanation of that option, i.e. the "
+        f"misconception, follows as data.\n"
         f"Publish doc v2 with the exact heading `{heading}`, then create a NEW question for attempt "
         f"{grade.attempt + 1}: a fresh angle on the same or a sibling edge case (different stem, values and letter)."
     )
+
+
+def grader_explanation(grade: QuizGradeResult) -> str:
+    """The explanation of the option the developer picked: written by the quiz author (a model), so untrusted."""
+    return untrusted(GRADER_EXPLANATION_SOURCE, grade.explanation)
 
 
 def build_examiner_brief(
@@ -105,18 +118,18 @@ def build_examiner_brief(
             f"create the attempt-{attempt} question with `create_comprehension_quiz`."
         )
     else:
-        assignment = remediation_brief(prior_failed_grade)
+        assignment = f"{remediation_order(prior_failed_grade)}\n{grader_explanation(prior_failed_grade)}"
     return "\n\n".join(
         [
             "# Developer task (verbatim)",
-            _untrusted("developer_task", task),
+            untrusted("developer_task", task),
             f"# Staged change under review\ndiff_sha256: {diff_report.diff_sha256} (bound by the harness)",
-            _untrusted("staged_diff", render_diff(diff_report)),
+            untrusted("staged_diff", render_diff(diff_report)),
             f"# Staging tests\n{tests}",
             "# Engineering rules applied",
-            _untrusted("notion_rules", applied_rules_text),
+            untrusted("notion_rules", applied_rules_text),
             "# Developer profile (Layer 4 long-term memory)",
-            memory_profile_block.strip(),
+            untrusted("developer_profile", memory_profile_block),
             f"# Your assignment\n{assignment}",
         ]
     )
@@ -196,9 +209,11 @@ def missing_deliverables(
 
 __all__ = [
     "DIFF_CHARS_FOR_EXAMINER",
+    "DiffTooLargeError",
     "EXAMINER",
     "EXAMINER_MAX_TOKENS",
     "EXAMINER_TOOLS",
+    "GRADER_EXPLANATION_SOURCE",
     "REMEDIATION_HEADING",
     "RULE_CHARS_FOR_EXAMINER",
     "bind_quiz_args",
@@ -207,8 +222,9 @@ __all__ = [
     "build_examiner_messages",
     "has_remediation_callout",
     "missing_deliverables",
-    "remediation_brief",
+    "grader_explanation",
     "remediation_callout",
+    "remediation_order",
     "render_applied_rules",
     "render_diff",
 ]

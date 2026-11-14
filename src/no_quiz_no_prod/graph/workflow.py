@@ -4,7 +4,8 @@
             agent -> handoff                      (deterministic checks on a final message)
     dual:   coder -> handoff -> examiner (fresh context) -> handoff -> quiz_gate
     single: single -> handoff -> quiz_gate        (one shared conversation)
-    quiz_gate -> deploy_gate | examiner/single (remediation v2) | finish (quiz_failed)
+    quiz_gate -> quiz_outcome                     (the grade is checkpointed before anything else happens)
+    quiz_outcome -> deploy_gate | examiner/single (remediation v2) | finish (quiz_failed)
     deploy_gate -> finish (completed | human_rejected | refused)
 
 Harness guarantees, independent of the model:
@@ -46,8 +47,11 @@ from pydantic import Field, ValidationError
 
 from no_quiz_no_prod.agents import (
     AGENTS,
+    SEALED,
+    SINGLE_REMEDIATION,
     TOOLS,
     AgentSpec,
+    DiffTooLargeError,
     ToolDef,
     bind_quiz_args,
     bind_ship_log_args,
@@ -55,7 +59,7 @@ from no_quiz_no_prod.agents import (
     build_examiner_brief,
     build_examiner_messages,
     build_single_messages,
-    build_single_remediation_message,
+    build_single_remediation_messages,
     developer_request,
     harness_message,
     missing_deliverables,
@@ -124,6 +128,7 @@ RELEASE_NOTE_CHARS: Final = 200
 # human approval of the same diff may retry that deploy (a gate_locked refusal never is: a lock no longer holds)
 RELEASE_RETRY_CODES: Final = frozenset({"conflict", "upstream_error", "timeout"})
 INJECTION_PROBE_CHARS: Final = 48
+ENCRYPTED_REASONING: Final = "reasoning.encrypted"  # OpenRouter reasoning_details item with no readable text
 FORGET_THREAD_PREFIX: Final = "forget:"
 ARTIFACTS_BY_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
     "write_staging_file": ("diff", "locks"),
@@ -134,6 +139,10 @@ ARTIFACTS_BY_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
 }
 NOTHING_STAGED: Final = "No change was staged, so there is nothing to ship."
 DIFF_BLOCKED: Final = "This exact diff is blocked (quiz exhausted or rejected): it can never be deployed."
+DIFF_TOO_LARGE: Final = (
+    "Stopped before the documentation and quiz: the staged diff is {size} characters, above the {limit} the Examiner "
+    "can review in full. Nothing can be deployed from a partly reviewed diff: split the change into smaller ones."
+)
 NUDGE_TESTS: Final = (
     "The staging tests have not passed on the current diff (Lock 1 is missing). Run `run_staging_tests` on the full "
     "suite (no pytest_k), fix any failure, and only then finish."
@@ -152,6 +161,10 @@ RELEASED: Final = " Release commit {commit} is on {branch} ({remote})."
 REJECTED: Final = "Deployment rejected by the human reviewer: diff {sha} is blocked and production was not touched."
 GATE_REFUSED: Final = "The server-side gate refused the deployment: {message}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
+SEALED_ARGS_LOST: Final = (
+    "{tool}: the sealed arguments of this call were lost (the harness restarted before running it). Call the tool "
+    "again with all its arguments."
+)
 SKIPPED_CALL: Final = "Not executed: the step budget of this run is exhausted."
 ONE_CALL_PER_TURN: Final = "Not executed: the harness runs ONE tool call per turn. Call it again if you still need it."
 UNUSABLE_TURN: Final = (
@@ -200,6 +213,10 @@ class WorkspaceHarness(Protocol):
     def upsert_skill_record(self, record: SkillProfileRecord) -> SkillProfileRecord: ...
 
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int: ...
+
+
+class ThreadStateError(ValueError):
+    """The thread is not in the state the call needs: not waiting for that human decision, or paused on one."""
 
 
 class WorkflowOutcome(ContractModel):
@@ -286,6 +303,29 @@ def _assistant_message(turn: ChatTurnResponse) -> dict[str, Any]:
             {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.args)}}
             for call in turn.tool_calls
         ]
+    return message
+
+
+def _active_spec(state: Mapping[str, Any]) -> AgentSpec:
+    """The spec of the active agent: the single agent loses its write tools while it remediates (frozen code)."""
+    role: AgentRole = state["phase"]
+    if role == "single" and state.get("attempt", 1) > 1:
+        return SINGLE_REMEDIATION
+    return AGENTS[role]
+
+
+def _sealed_assistant_message(turn: ChatTurnResponse, calls: list[NormalizedToolCall]) -> dict[str, Any]:
+    """The stored form of a turn that carried sealed arguments: redacted calls, no free text.
+
+    Graph state is checkpointed and readable (SQLite file, LangGraph Studio): the quiz answer key must never reach
+    it. The text and readable reasoning of such a turn may quote the key, so they are dropped; only opaque
+    (encrypted) reasoning blocks, which some providers need back, are kept.
+    """
+    message = _assistant_message(turn.model_copy(update={"content": "", "tool_calls": calls}))
+    details = turn.assistant_message.get("reasoning_details") or []
+    opaque = [item for item in details if isinstance(item, Mapping) and item.get("type") == ENCRYPTED_REASONING]
+    if opaque:
+        message["reasoning_details"] = opaque
     return message
 
 
@@ -445,6 +485,9 @@ class NoQuizWorkflow:
         self._lock = threading.RLock()
         self._sinks: dict[str, Callable[[RunEvent], None]] = {}
         self._event_seq: dict[str, int] = {}
+        # sealed tool arguments (the quiz answer key) between the model turn and the tool call: process memory only,
+        # never graph state, so they are in no checkpoint
+        self._sealed: dict[tuple[str, str], dict[str, Any]] = {}
 
     # ---- lazy collaborators ----------------------------------------------------------------------------------------
     @property
@@ -528,7 +571,8 @@ class NoQuizWorkflow:
         graph.add_node("agent", self._node_agent)
         graph.add_node("tools", self._node_tools)
         graph.add_node("handoff", self._node_handoff, destinations=("agent", "quiz_gate", "finish"))
-        graph.add_node("quiz_gate", self._node_quiz_gate, destinations=("deploy_gate", "agent", "finish"))
+        graph.add_node("quiz_gate", self._node_quiz_gate)
+        graph.add_node("quiz_outcome", self._node_quiz_outcome, destinations=("deploy_gate", "agent", "finish"))
         graph.add_node("deploy_gate", self._node_deploy_gate)
         graph.add_node("give_up", self._node_give_up)
         graph.add_node("finish", self._node_finish)
@@ -542,6 +586,7 @@ class NoQuizWorkflow:
         graph.add_conditional_edges(
             "tools", lambda state: "give_up" if state.get("budget_exhausted") else "agent", ["give_up", "agent"]
         )
+        graph.add_edge("quiz_gate", "quiz_outcome")
         graph.add_edge("deploy_gate", "finish")
         graph.add_edge("give_up", END)
         graph.add_edge("finish", END)
@@ -586,9 +631,9 @@ class NoQuizWorkflow:
             "final_answer": "",
         }
 
-    def _node_agent(self, state: WorkflowState) -> dict[str, Any]:
+    def _node_agent(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         """One model turn of the active agent; a turn with no tool call and no text is asked again (bounded)."""
-        spec = AGENTS[state["phase"]]
+        spec = _active_spec(state)
         history = state["messages"][spec.role]
         model = state.get("model") or self.model
         prompt, budget, problem = history, _budget(state), ""
@@ -605,13 +650,16 @@ class NoQuizWorkflow:
             budget = _with_usage(budget, turn.usage)  # an unusable turn still costs its tokens
             problem = _unusable_turn(turn, spec.max_tokens) or ""
             if not problem:
+                calls, sealed = self._seal(_thread_id(config), turn.tool_calls)
+                message = (
+                    _sealed_assistant_message(turn, calls)
+                    if sealed
+                    else turn.assistant_message or _assistant_message(turn)
+                )
                 return {
-                    "messages": {
-                        **state["messages"],
-                        spec.role: [*prompt, turn.assistant_message or _assistant_message(turn)],
-                    },
-                    "pending_calls": [call.model_dump(mode="json") for call in turn.tool_calls],
-                    "last_text": turn.content,
+                    "messages": {**state["messages"], spec.role: [*prompt, message]},
+                    "pending_calls": [call.model_dump(mode="json") for call in calls],
+                    "last_text": "" if sealed else turn.content,
                     "budget": budget.model_dump(mode="json"),
                 }
             prompt = [*history, harness_message(UNUSABLE_TURN.format(problem=problem))]
@@ -633,7 +681,7 @@ class NoQuizWorkflow:
 
     def _node_tools(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = _thread_id(config)
-        spec = AGENTS[state["phase"]]
+        spec = _active_spec(state)
         budget = _budget(state)
         history = list(state["messages"][spec.role])
         view: dict[str, Any] = dict(state)  # state as seen by the next call (artifacts harvested in this node)
@@ -664,6 +712,7 @@ class NoQuizWorkflow:
             self._emit(thread_id, "step", step=entry, budget=budget)
             if outcome.ok:
                 self._emit_artifacts(thread_id, budget, ARTIFACTS_BY_TOOL.get(entry.tool, ()), quiz=view.get("quiz"))
+        self._forget_sealed(thread_id, pending)  # calls that did not run keep nothing behind
         return {
             **{key: view[key] for key in HARVESTED_KEYS if key in view},
             "messages": {**state["messages"], spec.role: history},
@@ -705,9 +754,14 @@ class NoQuizWorkflow:
             return self._nudge(state, f"Before you finish: {'; '.join(missing)}.")
         return Command(goto="quiz_gate", update={"final_answer": answer, "nudges": 0})
 
-    def _node_quiz_gate(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["deploy_gate", "agent", "finish"]]:
+    def _node_quiz_gate(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+        """Ask the human, grade server-side, and checkpoint the grade: nothing else.
+
+        The grade is the one non-repeatable effect of the quiz, so it is committed to the checkpoint on its own
+        before memory, events and routing run in ``quiz_outcome``. A crash after it resumes from the stored grade;
+        a crash before the checkpoint replays this node, and the server answers the same question and option with
+        the grade it already recorded.
+        """
         thread_id = _thread_id(config)
         quiz = PublicQuizView.model_validate(state["quiz"])
         prompt = QUIZ_PROMPT.format(attempt=quiz.attempt, max_attempts=quiz.max_attempts)
@@ -717,8 +771,6 @@ class NoQuizWorkflow:
         # ---- below runs once, after the human answered (code above re-runs on resume, so it stays side-effect free)
         user_id = state.get("user_id") or DEFAULT_USER_ID
         grade = self.workspace.grade_quiz_answer(quiz.question_id, answer.selected_option, user_id=user_id)
-        evidence = (state.get("ship_log") or {}).get("title") or state["task"]
-        self.memory.upsert_quiz_outcome(user_id, grade, evidence=evidence)
         entry = ToolCallTrace(
             step=len(state.get("trace") or []) + 1,
             agent="human",
@@ -726,22 +778,33 @@ class NoQuizWorkflow:
             args={"question_id": quiz.question_id, "selected_option": answer.selected_option},
             result=grade.model_dump(mode="json"),
         )
+        return {"trace": [entry.model_dump(mode="json")], "last_grade": grade.model_dump(mode="json")}
+
+    def _node_quiz_outcome(
+        self, state: WorkflowState, config: RunnableConfig
+    ) -> Command[Literal["deploy_gate", "agent", "finish"]]:
+        """Everything that follows a checkpointed grade: Layer 4 memory, events, then the route. Safe to re-run."""
+        thread_id = _thread_id(config)
+        grade = QuizGradeResult.model_validate(state["last_grade"])
+        user_id = state.get("user_id") or DEFAULT_USER_ID
+        evidence = (state.get("ship_log") or {}).get("title") or state["task"]
+        self.memory.upsert_quiz_outcome(user_id, grade, evidence=evidence)
         budget = _budget(state)
-        self._emit(thread_id, "step", step=entry, budget=budget)
+        self._emit(thread_id, "step", step=ToolCallTrace.model_validate(state["trace"][-1]), budget=budget)
         self._emit_artifacts(thread_id, budget, ("ship_log", "locks"))
-        update = {"trace": [entry.model_dump(mode="json")], "last_grade": grade.model_dump(mode="json")}
         if grade.passed:
-            return Command(goto="deploy_gate", update=update)
+            return Command(goto="deploy_gate")
         if grade.remediation_required:
-            update |= {"attempt": grade.attempt + 1, "prior_failed_grade": grade.model_dump(mode="json")}
+            update: dict[str, Any] = {
+                "attempt": grade.attempt + 1,
+                "prior_failed_grade": grade.model_dump(mode="json"),
+            }
             if state.get("topology") == "single":
-                history = [*state["messages"]["single"], build_single_remediation_message(grade)]
+                history = [*state["messages"]["single"], *build_single_remediation_messages(grade)]
                 messages = {**state["messages"], "single": history}
                 return Command(goto="agent", update={**update, "phase": "single", "messages": messages, "nudges": 0})
             return self._examiner_turn(state, self.workspace.get_diff_report(), attempt=grade.attempt + 1, extra=update)
-        return _finish(
-            "quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option), **update
-        )
+        return _finish("quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option))
 
     def _node_deploy_gate(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = _thread_id(config)
@@ -814,9 +877,9 @@ class NoQuizWorkflow:
         message = outcome.error.message if outcome.error else "unknown error"
         return {"trace": trace, "stop_reason": "refused", "final_answer": GATE_REFUSED.format(message=message)}
 
-    @staticmethod
-    def _node_give_up(state: WorkflowState) -> dict[str, Any]:
+    def _node_give_up(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         budget = _budget(state)
+        self._forget_sealed(_thread_id(config), list(state.get("pending_calls") or []))
         update: dict[str, Any] = {
             "stop_reason": "max_steps",
             "final_answer": BUDGET_EXHAUSTED.format(steps=budget.steps, max_steps=budget.max_steps),
@@ -834,18 +897,25 @@ class NoQuizWorkflow:
     # ---- node helpers ----------------------------------------------------------------------------------------------
     def _examiner_turn(
         self, state: WorkflowState, diff: DiffReport, *, attempt: int, extra: Mapping[str, Any]
-    ) -> Command[Literal["agent"]]:
-        """A fresh, isolated Examiner context for one attempt (dual topology)."""
+    ) -> Command[Literal["agent", "finish"]]:
+        """A fresh, isolated Examiner context for one attempt (dual topology).
+
+        Fails closed when the diff does not fit the brief: a quiz written from a truncated diff would unlock a
+        change the developer was never questioned on.
+        """
         user_id = state.get("user_id") or DEFAULT_USER_ID
-        brief = build_examiner_brief(
-            state["task"],
-            diff,
-            render_applied_rules(state.get("rules_read") or {}),
-            self.memory.format_memory_prompt_block(user_id),
-            attempt,
-            _grade(extra.get("prior_failed_grade")),
-            pytest=self.workspace.get_latest_pytest(),
-        )
+        try:
+            brief = build_examiner_brief(
+                state["task"],
+                diff,
+                render_applied_rules(state.get("rules_read") or {}),
+                self.memory.format_memory_prompt_block(user_id),
+                attempt,
+                _grade(extra.get("prior_failed_grade")),
+                pytest=self.workspace.get_latest_pytest(),
+            )
+        except DiffTooLargeError as exc:
+            return _finish("refused", DIFF_TOO_LARGE.format(size=exc.size, limit=exc.limit), **extra)
         messages = {**state["messages"], "examiner": build_examiner_messages(brief)}
         return Command(
             goto="agent", update={**extra, "phase": "examiner", "messages": messages, "attempt": attempt, "nudges": 0}
@@ -870,11 +940,15 @@ class NoQuizWorkflow:
         key: str | None = None
         attempts = 1
         started = time.perf_counter()
+        sealed = self._unseal(thread_id, call.id)
         if call.args_error:
             outcome = _refusal("invalid_argument", f"{call.name}: {call.args_error}")
         elif tool is None or not spec.can_call(call.name):
             outcome = _refusal("forbidden", f"{call.name!r} is not available to the {spec.role}: use only your tools")
+        elif sealed is None and SEALED in args.values():
+            outcome = _refusal("invalid_argument", SEALED_ARGS_LOST.format(tool=call.name))
         else:
+            args |= sealed or {}
             args = self._bind_args(tool, args, view, thread_id)
             key = self._idempotency_key(tool, args, thread_id) if tool.writes else None
             outcome, attempts = self._call_with_retry(tool.name, args, key)
@@ -895,6 +969,29 @@ class NoQuizWorkflow:
             contains_injection=_carries(outcome.result, view.get("injection_text")),
         )
         return entry, outcome
+
+    def _seal(self, thread_id: str, calls: list[NormalizedToolCall]) -> tuple[list[NormalizedToolCall], bool]:
+        """Move sealed arguments out of the calls into process memory; returns the redacted calls and whether any
+        argument was sealed."""
+        redacted, any_sealed = [], False
+        for call in calls:
+            tool = TOOLS.get(call.name)
+            secret = {key: call.args[key] for key in (tool.sealed_args if tool else ()) if key in call.args}
+            if secret and tool is not None:
+                any_sealed = True
+                with self._lock:
+                    self._sealed[(thread_id, call.id)] = secret
+                call = call.model_copy(update={"args": tool.traced_args(call.args)})
+            redacted.append(call)
+        return redacted, any_sealed
+
+    def _unseal(self, thread_id: str, call_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._sealed.pop((thread_id, call_id), None)
+
+    def _forget_sealed(self, thread_id: str, calls: list[dict[str, Any]]) -> None:
+        for raw in calls:
+            self._unseal(thread_id, str(raw.get("id")))
 
     def _bind_args(
         self, tool: ToolDef, args: Mapping[str, Any], view: Mapping[str, Any], thread_id: str
@@ -1038,7 +1135,7 @@ class NoQuizWorkflow:
             return self._start_forget(thread_id, user_id=user_id, max_steps=max_steps, on_event=on_event)
         snapshot = self.app.get_state(config)
         if _pending(snapshot) is not None:
-            raise ValueError(
+            raise ThreadStateError(
                 f"thread {thread_id!r} is paused on a human gate: use submit_quiz / submit_deploy_decision"
             )
         prior = _budget(snapshot.values or {})
@@ -1069,7 +1166,7 @@ class NoQuizWorkflow:
         snapshot = self.app.get_state(config)
         pending = _pending(snapshot)
         if pending is None or pending.kind != "quiz" or pending.quiz is None:
-            raise ValueError(f"thread {thread_id!r} is not waiting for a quiz answer")
+            raise ThreadStateError(f"thread {thread_id!r} is not waiting for a quiz answer")
         update = {} if (snapshot.values or {}).get("user_id") else {"user_id": user_id}
         with self._listening(thread_id, on_event):
             outcome = self._drive(config, Command(resume={"selected_option": answer.selected_option}, update=update))
@@ -1325,6 +1422,7 @@ __all__ = [
     "MAX_UNUSABLE_TURN_RETRIES",
     "RETRY_BACKOFF_S",
     "NoQuizWorkflow",
+    "ThreadStateError",
     "WorkflowInput",
     "WorkflowOutcome",
     "WorkflowState",

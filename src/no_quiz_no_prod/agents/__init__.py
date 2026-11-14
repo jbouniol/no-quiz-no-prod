@@ -10,6 +10,7 @@ from typing import Final
 from no_quiz_no_prod.agents.coder import CODER, CODER_TOOLS, build_coder_messages, developer_request
 from no_quiz_no_prod.agents.examiner import (
     EXAMINER,
+    DiffTooLargeError,
     EXAMINER_TOOLS,
     bind_quiz_args,
     bind_ship_log_args,
@@ -25,13 +26,27 @@ from no_quiz_no_prod.agents.prompts import (
     render_tool_result,
     strip_status_line,
 )
-from no_quiz_no_prod.agents.single import SINGLE, SINGLE_TOOLS, build_single_messages, build_single_remediation_message
-from no_quiz_no_prod.agents.tools import HARNESS_ONLY_TOOLS, TOOLS, AgentSpec, ToolDef, check_toolsets, server_for
+from no_quiz_no_prod.agents.single import (
+    SINGLE,
+    SINGLE_REMEDIATION,
+    SINGLE_TOOLS,
+    build_single_messages,
+    build_single_remediation_messages,
+)
+from no_quiz_no_prod.agents.tools import (
+    HARNESS_ONLY_TOOLS,
+    SEALED,
+    TOOLS,
+    AgentSpec,
+    ToolDef,
+    check_toolsets,
+    server_for,
+)
 from no_quiz_no_prod.contracts import AgentRole
 
 AGENTS: Final[Mapping[AgentRole, AgentSpec]] = {spec.role: spec for spec in (CODER, EXAMINER, SINGLE)}
 
-check_toolsets(tuple(AGENTS.values()))
+check_toolsets((*AGENTS.values(), SINGLE_REMEDIATION))
 
 __all__ = [
     "AGENTS",
@@ -40,11 +55,14 @@ __all__ = [
     "EXAMINER",
     "EXAMINER_TOOLS",
     "HARNESS_ONLY_TOOLS",
+    "SEALED",
     "SINGLE",
+    "SINGLE_REMEDIATION",
     "SINGLE_TOOLS",
     "TOOLS",
     "AgentSpec",
     "AgentStatus",
+    "DiffTooLargeError",
     "ToolDef",
     "bind_quiz_args",
     "bind_ship_log_args",
@@ -52,7 +70,7 @@ __all__ = [
     "build_examiner_brief",
     "build_examiner_messages",
     "build_single_messages",
-    "build_single_remediation_message",
+    "build_single_remediation_messages",
     "developer_request",
     "harness_message",
     "missing_deliverables",
