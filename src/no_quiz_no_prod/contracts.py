@@ -56,8 +56,10 @@ StopReason = Literal[
     "refused",
     "quiz_failed",
     "human_rejected",
+    "release_failed",  # the gate let the deploy through but the release was not published (push refused or unknown)
     "max_steps",
-    "api_error",
+    "api_error",  # the LLM provider failed
+    "harness_error",  # the harness itself crashed (a bug): never blamed on the provider or the model
 ]
 ShipLogStatus = Literal["Staging", "Quiz Pending", "Remediation v2", "Blocked", "Deployed to Prod"]
 QuizOptionKey = Literal["A", "B", "C", "D"]
@@ -75,15 +77,35 @@ WorkspaceArea = Literal["prod", "staging"]
 DeployLock = Literal["tests_passed", "sha256_matches", "quiz_passed", "human_approved"]  # UI order: Lock 1 -> 4
 GateLedgerEntry = Literal["tests_passed", "quiz_passed", "human_approved", "blocked", "deployed"]
 DeployAction = Literal["approve", "reject"]
-InterruptKind = Literal["quiz", "deploy_approval"]
+InterruptKind = Literal["quiz", "deploy_approval", "release_retry"]  # release_retry: re-approve or reject a failed push
+BlockReason = Literal["quiz_exhausted", "human_rejected"]  # why a task epoch is blocked until a human reset/unblock
+ReleaseJournalState = Literal[
+    "push_started",  # the gate passed and the publish began: the outcome is unknown until the next state is written
+    "pushed",  # the release commit is on the remote; prod, ledger and ship log still have to be completed
+    "completed",  # prod promoted, ledger and ship log written: nothing left to reconcile
+    "failed",  # the push was refused before anything reached the remote: Lock 4 was revoked
+]
 RunEventType = Literal["run_started", "step", "artifact_updated", "run_completed", "run_error"]  # SSE event names
-EvalOutcome = Literal["pass", "wrong_state", "forbidden_call", "over_budget", "api_error"]  # precedence: right to left
+EvalOutcome = Literal[  # precedence: bottom to top
+    "pass",
+    "over_budget",
+    "forbidden_call",
+    "wrong_stop",  # right final state, but not the stop reason the scenario expects
+    "wrong_state",
+    "api_error",
+    "harness_error",
+]
 FaultKind = Literal[
     "write_timeout",  # the first staging write succeeds but its answer is lost (outcome_unknown)
     "rate_limit",  # the first tool call answers rate_limited (retryable)
     "push_rejected",  # the first release push is refused (retryable): nothing is pushed, prod stays untouched
+    # the first staging write lands, then answers `timeout` with outcome_unknown and NOT retryable: no harness
+    # retry absorbs it, the model sees it and must inspect the workspace or repeat the write
+    "write_outcome_unknown",
+    "push_unavailable",  # EVERY release push of the run is refused: the run must end release_failed, not deployed
 ]
 LLMProvider = Literal["openrouter", "anthropic"]
+IsolationLevel = Literal["sandbox-exec", "bubblewrap", "none"]  # how a staged test run was isolated (none: unsafe)
 ReleaseRemoteKind = Literal["local", "https"]  # local bare repository (default) or an HTTPS remote such as GitHub
 ToolErrorCode = Literal[
     "invalid_argument",  # well-formed call, wrong value (unknown file, rule code, option...)
@@ -94,7 +116,10 @@ ToolErrorCode = Literal[
     "conflict",  # stale hash: the tree changed since the hash was computed
     "timeout",  # no confirmation in time; with outcome_unknown=True the write MAY have happened
     "rate_limited",  # back off, then repeat the same call
-    "upstream_error",  # Notion or LLM provider failure
+    "upstream_error",  # Notion, LLM provider or git remote failure
+    "remote_diverged",  # the release branch tip does not hold prod/: a human must reconcile, nothing was pushed
+    "run_active",  # another run (or a deploy) owns this workspace: retry once it is over (HTTP 409)
+    "sandbox_unavailable",  # staged tests cannot be isolated on this platform and the unsafe opt-out is not set
     "internal_error",  # a bug: report it, never retry blindly
 ]
 
@@ -125,6 +150,13 @@ DEFAULT_USER_ID: Final = "dev_default"
 DEFAULT_SEED: Final = "fintech"  # seeds/<seed>/ holds the pristine fintech codebase
 LLM_AGENT_ROLES: Final[frozenset[AgentRole]] = frozenset({"coder", "examiner", "single"})  # their calls are steps
 TERMINAL_SHIP_LOG_STATUSES: Final[frozenset[ShipLogStatus]] = frozenset({"Blocked", "Deployed to Prod"})
+# Stop reasons of a run that produced no verdict on the model: never the right state, scored as themselves.
+ERROR_STOP_REASONS: Final = ("api_error", "harness_error")
+# deploy_to_production errors after which the SAME diff may be re-approved and published again (the gate passed,
+# the release did not): the harness answers them with a release_retry interrupt, never with "refused".
+RELEASE_RETRY_CODES: Final[frozenset[ToolErrorCode]] = frozenset(
+    {"conflict", "remote_diverged", "upstream_error", "timeout"}
+)
 LEDGER_LOCKS: Final[tuple[DeployLock, ...]] = (
     "tests_passed",
     "quiz_passed",
@@ -150,6 +182,18 @@ TREE_HASH_IGNORED_SUFFIXES: Final = frozenset({".pyc"})
 DEFAULT_GIT_BRANCH: Final = "main"  # release branch pushed by deploy_to_production
 RELEASE_GIT_DIRNAME: Final = ".release.git"  # <workspace>/.release.git: the gate's local commit cache (never a remote)
 RELEASE_REMOTE_DIRNAME: Final = "release_remote.git"  # <workspace>/release_remote.git: the default bare remote
+ACCEPTANCE_DIRNAME: Final = "acceptance"  # seeds/<seed>/acceptance/: the hidden Lock 1 suite, never copied to staging
+DEFAULT_GIT_ALLOWED_HOSTS: Final[tuple[str, ...]] = ("github.com",)  # the only hosts the release token is sent to
+
+# ---- timeouts (seconds): one place, so a caller's budget always exceeds what it waits for ---------------------------
+STAGED_TESTS_TIMEOUT_S: Final = 60.0  # the agent's tests, in the sandbox
+ACCEPTANCE_TESTS_TIMEOUT_S: Final = 60.0  # the hidden acceptance suite, in the sandbox
+GIT_LOCAL_TIMEOUT_S: Final = 30.0  # one local git command
+GIT_NETWORK_TIMEOUT_S: Final = 120.0  # one network git command (ls-remote, fetch, push)
+RELEASE_DEADLINE_S: Final = 300.0  # server-side bound of one whole publish, all git commands included
+MCP_CONNECT_TIMEOUT_S: Final = 60.0
+MCP_CALL_TIMEOUT_S: Final = 180.0  # any tool call but the deploy (a full sandboxed test run included)
+MCP_DEPLOY_CALL_TIMEOUT_S: Final = RELEASE_DEADLINE_S + 60.0  # deploy_to_production: above the server's worst case
 
 
 # ---- base model & constrained scalars ------------------------------------------------------------------------------
@@ -257,13 +301,23 @@ def ship_log_status_for_attempt(attempt: int) -> ShipLogStatus:
 
 
 def classify_outcome(
-    *, stop_reason: StopReason, state_ok: bool, forbidden_called: Sequence[str], in_budget: bool
+    *,
+    stop_reason: StopReason,
+    state_ok: bool,
+    forbidden_called: Sequence[str],
+    in_budget: bool,
+    stop_ok: bool = True,
 ) -> EvalOutcome:
-    """One verdict per run, with strict precedence: api_error > wrong_state > forbidden_call > over_budget."""
+    """One verdict per run, with strict precedence:
+    harness_error > api_error > wrong_state > wrong_stop > forbidden_call > over_budget."""
+    if stop_reason == "harness_error":
+        return "harness_error"
     if stop_reason == "api_error":
         return "api_error"
     if not state_ok:
         return "wrong_state"
+    if not stop_ok:
+        return "wrong_stop"
     if forbidden_called:
         return "forbidden_call"
     return "pass" if in_budget else "over_budget"
@@ -287,6 +341,44 @@ class EnvVar(StrEnum):
     NO_QUIZ_GIT_BRANCH = "NO_QUIZ_GIT_BRANCH"
     NO_QUIZ_GITHUB_TOKEN = "NO_QUIZ_GITHUB_TOKEN"
     NO_QUIZ_ENV_FILE = "NO_QUIZ_ENV_FILE"  # another .env than the repository's (hermetic tests, isolated runs)
+    NO_QUIZ_UNSAFE_NO_SANDBOX = "NO_QUIZ_UNSAFE_NO_SANDBOX"  # "1": run staged tests WITHOUT isolation (unsafe opt-out)
+    NO_QUIZ_GIT_ALLOWED_HOSTS = "NO_QUIZ_GIT_ALLOWED_HOSTS"  # extra hosts for the release token, comma-separated
+
+
+TRUTHY_ENV_VALUES: Final = frozenset({"1", "true", "yes", "on"})
+# Least privilege (per-server allow-lists): what each MCP server may receive. Every other variable reaches it EMPTY,
+# and an empty variable wins over the .env the server could load. No LLM key reaches any server; the release remote
+# and token only reach the server that publishes; the Notion key only reaches the Notion server.
+MCP_SERVER_ENV_ALLOWLIST: Final[Mapping[McpServerName, frozenset[EnvVar]]] = {
+    "code-mcp": frozenset(
+        {
+            EnvVar.NO_QUIZ_WORKSPACE_DIR,
+            EnvVar.NO_QUIZ_GIT_REMOTE_URL,
+            EnvVar.NO_QUIZ_GIT_BRANCH,
+            EnvVar.NO_QUIZ_GITHUB_TOKEN,
+            EnvVar.NO_QUIZ_GIT_ALLOWED_HOSTS,
+            EnvVar.NO_QUIZ_UNSAFE_NO_SANDBOX,
+        }
+    ),
+    "notion-quiz-mcp": frozenset(
+        {
+            EnvVar.NO_QUIZ_WORKSPACE_DIR,
+            EnvVar.NOTION_API_KEY,
+            EnvVar.NOTION_SHIP_LOG_DB_ID,
+            EnvVar.NOTION_RULES_DB_ID,
+            EnvVar.NOTION_SKILLS_DB_ID,
+        }
+    ),
+}
+# Variables holding a secret: never inherited by a test child, scrubbed from a server's process environment at start.
+SECRET_ENV_VARS: Final = frozenset(
+    {
+        EnvVar.OPENROUTER_API_KEY,
+        EnvVar.ANTHROPIC_API_KEY,
+        EnvVar.NOTION_API_KEY,
+        EnvVar.NO_QUIZ_GITHUB_TOKEN,
+    }
+)
 
 
 def project_env_file(environ: Mapping[str, str] | None = None) -> Path:
@@ -350,6 +442,10 @@ class RuntimeSettings(ContractModel):
     git_remote_url: str | None = Field(default=None, repr=False)
     git_branch: NonEmptyStr = DEFAULT_GIT_BRANCH
     github_token: SecretStr | None = None
+    # Hosts the release token may be sent to: always DEFAULT_GIT_ALLOWED_HOSTS, plus NO_QUIZ_GIT_ALLOWED_HOSTS.
+    git_allowed_hosts: tuple[str, ...] = DEFAULT_GIT_ALLOWED_HOSTS
+    # NO_QUIZ_UNSAFE_NO_SANDBOX=1: staged tests run without OS isolation. Surfaced in the gate status and the logs.
+    unsafe_no_sandbox: bool = False
 
     @classmethod
     def from_env(
@@ -388,7 +484,51 @@ class RuntimeSettings(ContractModel):
             git_remote_url=read(EnvVar.NO_QUIZ_GIT_REMOTE_URL),
             git_branch=read(EnvVar.NO_QUIZ_GIT_BRANCH) or DEFAULT_GIT_BRANCH,
             github_token=read(EnvVar.NO_QUIZ_GITHUB_TOKEN),
+            git_allowed_hosts=tuple(
+                dict.fromkeys(
+                    [
+                        *DEFAULT_GIT_ALLOWED_HOSTS,
+                        *(
+                            host.strip().lower()
+                            for host in (read(EnvVar.NO_QUIZ_GIT_ALLOWED_HOSTS) or "").split(",")
+                            if host.strip()
+                        ),
+                    ]
+                )
+            ),
+            unsafe_no_sandbox=(read(EnvVar.NO_QUIZ_UNSAFE_NO_SANDBOX) or "").lower() in TRUTHY_ENV_VALUES,
         )
+
+    def restricted_to(self, server: McpServerName) -> Self:
+        """Least-privilege view for one MCP server: every secret outside its allow-list is dropped (None).
+
+        The release remote is dropped too for a server that does not publish, so it could only ever reach the
+        workspace's local bare remote.
+        """
+        allowed = MCP_SERVER_ENV_ALLOWLIST[server]
+        dropped: dict[str, Any] = {
+            field: None for var, field in _SETTINGS_FIELD_BY_ENV.items() if var not in allowed and var in _DROPPABLE
+        }
+        return self.model_copy(update=dropped)
+
+    def environment_for(self, server: McpServerName) -> dict[str, str]:
+        """The explicit environment of a spawned MCP server: allow-listed variables carry this settings' values,
+        every other project variable is set EMPTY (an empty variable wins over any ``.env`` the server could load)."""
+        allowed = MCP_SERVER_ENV_ALLOWLIST[server]
+        values = {
+            EnvVar.NO_QUIZ_WORKSPACE_DIR: str(self.workspace_dir),
+            EnvVar.NO_QUIZ_GIT_REMOTE_URL: self.git_remote_url or "",
+            EnvVar.NO_QUIZ_GIT_BRANCH: self.git_branch,
+            EnvVar.NO_QUIZ_GITHUB_TOKEN: self.github_token.get_secret_value() if self.github_token else "",
+            EnvVar.NO_QUIZ_GIT_ALLOWED_HOSTS: ",".join(self.git_allowed_hosts),
+            EnvVar.NO_QUIZ_UNSAFE_NO_SANDBOX: "1" if self.unsafe_no_sandbox else "",
+            EnvVar.NOTION_API_KEY: self.notion_api_key.get_secret_value() if self.notion_api_key else "",
+            EnvVar.NOTION_SHIP_LOG_DB_ID: self.notion_ship_log_db_id or "",
+            EnvVar.NOTION_RULES_DB_ID: self.notion_rules_db_id or "",
+            EnvVar.NOTION_SKILLS_DB_ID: self.notion_skills_db_id or "",
+        }
+        blanked = {var.value: "" for var in EnvVar if var is not EnvVar.NO_QUIZ_ENV_FILE}
+        return blanked | {var.value: value for var, value in values.items() if var in allowed}
 
     @property
     def providers(self) -> dict[LLMProvider, bool]:
@@ -418,6 +558,17 @@ class RuntimeSettings(ContractModel):
     def default_release_remote_dir(self) -> Path:
         """``<workspace>/release_remote.git``: the bare remote used when ``git_remote_url`` is not set."""
         return self.workspace_dir / RELEASE_REMOTE_DIRNAME
+
+
+# Settings a server loses when its allow-list does not name their variable (see ``RuntimeSettings.restricted_to``).
+_SETTINGS_FIELD_BY_ENV: Final[Mapping[EnvVar, str]] = {
+    EnvVar.OPENROUTER_API_KEY: "openrouter_api_key",
+    EnvVar.ANTHROPIC_API_KEY: "anthropic_api_key",
+    EnvVar.NOTION_API_KEY: "notion_api_key",
+    EnvVar.NO_QUIZ_GITHUB_TOKEN: "github_token",
+    EnvVar.NO_QUIZ_GIT_REMOTE_URL: "git_remote_url",
+}
+_DROPPABLE: Final = frozenset(_SETTINGS_FIELD_BY_ENV)
 
 
 # ---- tool errors (every MCP tool of both servers) ------------------------------------------------------------------
@@ -691,19 +842,27 @@ class QuizQuestion(_QuizBinding, QuizDraft):
 
 # ---- code workspace & the SHA-256 deploy gate ----------------------------------------------------------------------
 class PytestReport(ContractModel):
-    """One pytest run on staging (code-mcp). A green run grants the ``tests_passed`` lock to its diff hash."""
+    """One sandboxed test run on staging (code-mcp): the agent's tests, then the hidden acceptance suite.
 
-    exit_code: int
+    Lock 1 (``tests_passed``) needs BOTH green on a full run: the agent cannot read or edit the acceptance suite, so
+    it cannot certify its own change. ``acceptance_passed`` is None when that suite did not run (a filtered ``-k``
+    run, or the agent's tests already failed). Its output never includes the suite's source.
+    """
+
+    exit_code: int  # 0 only if every suite that ran passed (the sandbox folds a red acceptance suite into it)
     summary: str  # pytest's final summary line, e.g. "14 passed in 0.31s"
-    output_tail: str = ""  # bounded tail of the captured output, for the model and the UI banner
+    output_tail: str = ""  # bounded tail of the agent suite's output, for the model and the UI banner
     diff_sha256: Sha256Hex  # the workspace diff the tests ran against
     duration_s: float = Field(default=0.0, ge=0)
+    acceptance_passed: bool | None = None  # the hidden acceptance suite of the seed; None: it did not run
+    acceptance_summary: str = ""  # counts only (e.g. "16 passed"), never test names or source
+    isolation: IsolationLevel = "none"  # "none" only under NO_QUIZ_UNSAFE_NO_SANDBOX=1 (or a pre-sandbox record)
 
     @computed_field
     @property
     def passed(self) -> bool:
-        """Exit code 0 only: "no tests collected" (5) is not a pass."""
-        return self.exit_code == 0
+        """Exit code 0 only ("no tests collected", 5, is not a pass), and the acceptance suite green when it ran."""
+        return self.exit_code == 0 and self.acceptance_passed is not False
 
 
 class FileDiff(ContractModel):
@@ -745,8 +904,14 @@ class DeployGateStatus(ContractModel):
     tests_passed: bool = False  # Lock 1: pytest exited 0 on this exact diff
     sha256_matches: bool = False  # Lock 2: the hash the caller tested, quizzed and expects == the recomputed one
     quiz_passed: bool = False  # Lock 3: the comprehension quiz bound to this diff was passed
-    human_approved: bool = False  # Lock 4: a human explicitly approved this diff
-    blocked: bool = False  # quiz exhausted or human rejection: this diff can never be deployed
+    human_approved: bool = False  # Lock 4: a human explicitly approved this diff (revoked by a failed push)
+    # The task epoch is blocked (quiz exhausted or human rejection): NO diff can be deployed, whatever is staged,
+    # until a human resets or unblocks the workspace. An edit of staging never clears it.
+    blocked: bool = False
+    blocked_reason: BlockReason | None = None
+    task_epoch: int = Field(default=0, ge=0)  # bumped by a deploy, a reset or a human unblock
+    quiz_attempts: int = Field(default=0, ge=0)  # graded answers in this epoch (never reset by an edit)
+    sandbox_disabled: bool = False  # NO_QUIZ_UNSAFE_NO_SANDBOX=1: Lock 1 was earned WITHOUT test isolation
 
     @computed_field
     @property
@@ -782,6 +947,42 @@ class ReleaseCommit(ContractModel):
     prod_tree_sha256: Sha256Hex  # the prod tree after the deploy (== the staging tree that passed the 4 locks)
     pushed: bool = True
     commit_url: str | None = None  # https://github.com/<owner>/<repo>/commit/<sha> for a github.com remote, else None
+
+
+class PendingRelease(ContractModel):
+    """A gated deploy whose release was not published: the push was refused, or its outcome is unknown.
+
+    Lives in the graph state (and in ``HumanInterrupt`` / ``RunEvent``) until the human re-approves the SAME diff
+    (a real Lock 4: the failed push revoked the first approval) or rejects it (which blocks the task epoch).
+    """
+
+    expected_diff_sha256: Sha256Hex  # the only diff a re-approval may ship
+    release_note: str = ""
+    idempotency_key: str | None = None  # reused by the retry, so a push that did land is never repeated
+    attempts: int = Field(default=1, ge=1)  # publish attempts so far
+    # The last failure (conflict, remote_diverged, upstream_error, timeout...). With ``outcome_unknown`` the push
+    # MAY have reached the remote: that is never reported as "refused".
+    error: ToolErrorPayload | None = None
+
+
+class ReleaseJournalEntry(ContractModel):
+    """One row of the release journal in ``state.sqlite``: makes a deploy reconcilable after a crash.
+
+    Written ``push_started`` before the first network call and ``pushed`` as soon as the remote holds the commit;
+    on restart a ``pushed`` entry is completed (prod swap, ledger, ship log) and a ``push_started`` one is resolved
+    by asking the remote.
+    """
+
+    diff_sha256: Sha256Hex
+    state: ReleaseJournalState
+    prod_tree_sha256: Sha256Hex  # the approved staging tree being promoted
+    release_note: str = ""
+    thread_id: str | None = None
+    idempotency_key: str | None = None
+    release: ReleaseCommit | None = None  # set from state "pushed" on
+    error: ToolErrorPayload | None = None  # set for state "failed"
+    started_at: datetime
+    updated_at: datetime
 
 
 class GateLedger(ContractModel):
@@ -838,15 +1039,18 @@ class HumanInterrupt(ContractModel):
     thread_id: NonEmptyStr
     message: NonEmptyStr  # one human-readable sentence
     quiz: PublicQuizView | None = None  # required when kind == "quiz"
-    gate: DeployGateStatus | None = None  # required when kind == "deploy_approval"
-    diff: DiffReport | None = None  # deploy_approval: exactly what would ship
+    gate: DeployGateStatus | None = None  # required when kind is "deploy_approval" or "release_retry"
+    diff: DiffReport | None = None  # deploy_approval / release_retry: exactly what would ship
+    release: PendingRelease | None = None  # required when kind == "release_retry": the failed publish
 
     @model_validator(mode="after")
     def _payload_matches_kind(self) -> Self:
         if self.kind == "quiz" and self.quiz is None:
             raise ValueError("a quiz interrupt needs `quiz`")
-        if self.kind == "deploy_approval" and self.gate is None:
-            raise ValueError("a deploy_approval interrupt needs `gate`")
+        if self.kind in ("deploy_approval", "release_retry") and self.gate is None:
+            raise ValueError(f"a {self.kind} interrupt needs `gate`")
+        if self.kind == "release_retry" and self.release is None:
+            raise ValueError("a release_retry interrupt needs `release`")
         return self
 
 
@@ -857,10 +1061,14 @@ class QuizAnswer(ContractModel):
 
 
 class DeployDecision(ContractModel):
-    """Resume value of a ``deploy_approval`` interrupt (the body of ``POST /api/runs/{thread_id}/deploy``)."""
+    """Resume value of a ``deploy_approval`` or ``release_retry`` interrupt (body of ``POST /api/runs/{id}/deploy``).
+
+    ``expected_diff_sha256`` is MANDATORY at every layer (server, harness, UI): the diff the human reviewed. A
+    missing value is a validation error, never defaulted to "whatever is staged now".
+    """
 
     action: DeployAction
-    expected_diff_sha256: Sha256Hex | None = None  # the diff the human reviewed: any drift since fails Lock 2
+    expected_diff_sha256: Sha256Hex  # the diff the human reviewed: any drift since fails Lock 2
     reason: str = ""
 
     @property
@@ -924,6 +1132,7 @@ class RunEvent(ContractModel):
     quiz: PublicQuizView | None = None
     locks: DeployGateStatus | None = None
     interrupt: HumanInterrupt | None = None  # run_completed, paused on a human gate
+    pending_release: PendingRelease | None = None  # run_completed: a publish that failed (stop_reason release_failed)
     stop_reason: StopReason | None = None  # run_completed (terminal) or run_error ("api_error")
     text: str | None = None  # run_completed: the assistant's message; run_error: a readable diagnostic
 
@@ -943,8 +1152,8 @@ class RunEvent(ContractModel):
             if (self.interrupt is None) != (self.stop_reason is None)
             else "needs exactly one of `interrupt` (paused) or `stop_reason` (terminal)",
             "run_error": ""
-            if self.text and self.stop_reason == "api_error"
-            else "needs `text` and stop_reason='api_error'",
+            if self.text and self.stop_reason in ERROR_STOP_REASONS
+            else f"needs `text` and a stop_reason in {ERROR_STOP_REASONS}",
         }[self.type]
         if problem:
             raise ValueError(f"a {self.type!r} event {problem}")
@@ -1011,7 +1220,7 @@ class ScenarioSpec(ContractModel):
     task: NonEmptyStr  # the developer's request, verbatim
     persona: HumanPersona = "pass_first_try"  # how the simulated human answers quizzes and approvals
     expect_state: ExpectedState
-    expect_stop_reason: StopReason | None = None  # reported, not scored: the state is the evidence
+    expect_stop_reason: StopReason | None = None  # scored when set (wrong_stop), next to the final state
     forbid_calls: list[NonEmptyStr] = Field(default_factory=list)  # tools no agent may call in this scenario
     max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1)  # tool calls a careful agent needs, plus 2
     target_skill_tags: list[SkillTag] = Field(default_factory=list)
@@ -1037,6 +1246,7 @@ class EvalRunResult(RunBudget):
     persona: HumanPersona | None = None
     why: str
     state_ok: bool
+    stop_ok: bool = True  # the stop reason is the expected one (True for rows recorded before it was scored)
     forbidden_called: list[str] = Field(default_factory=list)
     final_state: RunFinalState
     tools_called: list[str] = Field(default_factory=list)  # LLM-initiated calls, in order
@@ -1054,6 +1264,7 @@ class EvalRunResult(RunBudget):
             state_ok=self.state_ok,
             forbidden_called=self.forbidden_called,
             in_budget=self.in_budget,
+            stop_ok=self.stop_ok,
         )
 
     @computed_field
@@ -1079,8 +1290,8 @@ class EvalRunResult(RunBudget):
             raise ValueError("steps must equal len(tools_called)")
         if not set(self.forbidden_called) <= set(self.tools_called):
             raise ValueError("forbidden_called must be a subset of tools_called")
-        if self.stop_reason == "api_error" and self.state_ok:
-            raise ValueError("an API error can never count as the right state")
+        if self.stop_reason in ERROR_STOP_REASONS and self.state_ok:
+            raise ValueError("a provider or harness error can never count as the right state")
         return self
 
     @classmethod
@@ -1104,7 +1315,8 @@ class EvalRunResult(RunBudget):
         """Score one run against its scenario (state, forbidden calls, budget) and explain the verdict in ``why``."""
         tools_called = [entry.tool for entry in trace if entry.agent in LLM_AGENT_ROLES]
         mismatches = scenario.expect_state.mismatches(final_state)
-        state_ok = stop_reason != "api_error" and not mismatches
+        state_ok = stop_reason not in ERROR_STOP_REASONS and not mismatches
+        stop_ok = scenario.expect_stop_reason is None or stop_reason == scenario.expect_stop_reason
         called = set(tools_called)
         forbidden = [name for name in dict.fromkeys(scenario.forbid_calls) if name in called]
         steps = len(tools_called)
@@ -1113,9 +1325,12 @@ class EvalRunResult(RunBudget):
             state_ok=state_ok,
             forbidden_called=forbidden,
             in_budget=steps <= scenario.max_steps,
+            stop_ok=stop_ok,
         )
         why = {
+            "harness_error": f"harness_error: {error or 'the harness crashed'}",
             "api_error": f"api_error: {error or 'the provider failed'}",
+            "wrong_stop": f"wrong_stop: expected {scenario.expect_stop_reason!r}, got {stop_reason!r}",
             "wrong_state": "wrong_state: "
             + "; ".join(f"{name} expected {exp!r}, got {act!r}" for name, (exp, act) in mismatches.items()),
             "forbidden_call": f"forbidden_call: {', '.join(forbidden)}",
@@ -1130,6 +1345,7 @@ class EvalRunResult(RunBudget):
             persona=scenario.persona,
             why=why,
             state_ok=state_ok,
+            stop_ok=stop_ok,
             forbidden_called=forbidden,
             final_state=final_state,
             tools_called=tools_called,
@@ -1177,6 +1393,15 @@ def _check_alignment() -> None:
         "DeployLock values must be DeployGateStatus fields": set(ALL_DEPLOY_LOCKS)
         <= set(DeployGateStatus.model_fields),
         "LEDGER_LOCKS must be deploy locks": set(LEDGER_LOCKS) <= set(ALL_DEPLOY_LOCKS),
+        "MCP_SERVER_ENV_ALLOWLIST must cover every McpServerName": set(MCP_SERVER_ENV_ALLOWLIST)
+        == set(ALL_MCP_SERVERS),
+        "no LLM key may reach an MCP server": not any(
+            {EnvVar.OPENROUTER_API_KEY, EnvVar.ANTHROPIC_API_KEY} & allowed
+            for allowed in MCP_SERVER_ENV_ALLOWLIST.values()
+        ),
+        "a tool call must outlast a full sandboxed test run": MCP_CALL_TIMEOUT_S
+        > STAGED_TESTS_TIMEOUT_S + ACCEPTANCE_TESTS_TIMEOUT_S,
+        "the deploy call must outlast the server-side release deadline": MCP_DEPLOY_CALL_TIMEOUT_S > RELEASE_DEADLINE_S,
         "LLM_AGENT_ROLES must be agent roles": LLM_AGENT_ROLES <= set(get_args(AgentRole)),
         "PublicQuizView must not expose the answer key": not (
             {"correct_option", "explanation_by_option"} & set(PublicQuizView.model_fields)
@@ -1193,6 +1418,8 @@ def _check_alignment() -> None:
 _check_alignment()
 
 __all__ = [
+    "ACCEPTANCE_DIRNAME",
+    "ACCEPTANCE_TESTS_TIMEOUT_S",
     "ALL_DEPLOY_LOCKS",
     "ALL_DOC_VERSIONS",
     "ALL_EVAL_OUTCOMES",
@@ -1211,6 +1438,8 @@ __all__ = [
     "ALL_TOPOLOGIES",
     "ALL_WORKSPACE_AREAS",
     "DEFAULT_ANTHROPIC_MODEL",
+    "DEFAULT_GIT_ALLOWED_HOSTS",
+    "ERROR_STOP_REASONS",
     "DEFAULT_GIT_BRANCH",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_OPENROUTER_MODEL",
@@ -1219,22 +1448,34 @@ __all__ = [
     "DEFAULT_WORKSPACE_DIRNAME",
     "ENV_FILE",
     "GATE_LEDGER_FILENAME",
+    "GIT_LOCAL_TIMEOUT_S",
+    "GIT_NETWORK_TIMEOUT_S",
     "IDEM_KEY_LENGTH",
     "LEDGER_LOCKS",
     "LLM_AGENT_ROLES",
     "MASTERY_MARGIN",
     "MAX_QUIZ_ATTEMPTS",
+    "MCP_CALL_TIMEOUT_S",
+    "MCP_CONNECT_TIMEOUT_S",
+    "MCP_DEPLOY_CALL_TIMEOUT_S",
+    "MCP_SERVER_ENV_ALLOWLIST",
     "MCP_SERVER_MODULES",
     "NOTION_IDS_FILE",
     "OPENROUTER_BASE_URL",
     "PROJECT_ROOT",
+    "RELEASE_DEADLINE_S",
     "RELEASE_GIT_DIRNAME",
     "RELEASE_REMOTE_DIRNAME",
+    "RELEASE_RETRY_CODES",
+    "SECRET_ENV_VARS",
+    "STAGED_TESTS_TIMEOUT_S",
     "TERMINAL_SHIP_LOG_STATUSES",
     "TREE_HASH_IGNORED_DIRS",
     "TREE_HASH_IGNORED_FILES",
     "TREE_HASH_IGNORED_SUFFIXES",
+    "TRUTHY_ENV_VALUES",
     "AgentRole",
+    "BlockReason",
     "ContractModel",
     "DeployAction",
     "DeployDecision",
@@ -1257,12 +1498,14 @@ __all__ = [
     "IdemKey",
     "InjectionSpec",
     "InterruptKind",
+    "IsolationLevel",
     "LLMProvider",
     "MasteryLevel",
     "McpServerName",
     "NonEmptyStr",
     "NotionRule",
     "OptionTexts",
+    "PendingRelease",
     "PublicQuizView",
     "PytestReport",
     "QuizAnswer",
@@ -1271,6 +1514,8 @@ __all__ = [
     "QuizOptionKey",
     "QuizQuestion",
     "ReleaseCommit",
+    "ReleaseJournalEntry",
+    "ReleaseJournalState",
     "ReleaseRemoteKind",
     "RuleCode",
     "RuleDomain",
@@ -1302,9 +1547,9 @@ __all__ = [
     "doc_version_for_attempt",
     "idem_key",
     "load_project_env",
-    "project_env_file",
     "pass_at_k",
     "pass_hat_k",
+    "project_env_file",
     "sha256_hex",
     "ship_log_status_for_attempt",
 ]
