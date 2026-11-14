@@ -18,30 +18,39 @@
   --bg-terminal: #0B1120;
   --bg-terminal-elevated: #111B30;
   --bg-glass: rgba(248, 250, 252, 0.82);
-  --bg-glass-card: rgba(255, 255, 255, 0.90);
+  --bg-glass-card: rgba(255, 255, 255, 0.86);
+  --bg-glass-pane: rgba(255, 255, 255, 0.80);
+  --bg-glass-seg: rgba(255, 255, 255, 0.62);
   --bg-glass-popover: rgba(255, 255, 255, 0.96);
 
   /* Interactive Surface Overlays */
   --bg-hover: rgba(15, 23, 42, 0.04);
+  --bg-hover-glass: rgba(255, 255, 255, 0.78);
   --bg-active: rgba(15, 23, 42, 0.075);
   --bg-selected: #EFF6FF;
-  --bg-backdrop: rgba(15, 23, 42, 0.38);
+  --bg-backdrop: rgba(15, 23, 42, 0.34);
 
   /* ------------------------------------------------------------------------
-     2. french-data-rag Reactive Ambient Aura & 24px Engineering Dot-Grid
+     2. french-data-rag Living Colorful Radial Aura + Subtle Dev Grid
      ------------------------------------------------------------------------ */
-  --grid-dot-pattern: radial-gradient(circle, rgba(15, 23, 42, 0.068) 1px, transparent 1px);
-  --grid-dot-size: 24px 24px;
+  --grid-dot-pattern: radial-gradient(circle, rgba(15, 23, 42, 0.038) 1px, transparent 1px);
+  --grid-dot-size: 26px 26px;
   --aura-idle:
-    radial-gradient(ellipse 68% 52% at 50% -6%, rgba(26, 115, 232, 0.125) 0%, rgba(79, 70, 229, 0.06) 46%, transparent 76%),
-    radial-gradient(ellipse 46% 36% at 86% 18%, rgba(14, 165, 233, 0.07) 0%, transparent 70%);
+    radial-gradient(circle 580px at 50% 54%, rgba(147, 197, 253, 0.78) 0%, rgba(196, 181, 253, 0.38) 44%, rgba(248, 250, 252, 0) 76%),
+    radial-gradient(circle 450px at 40% 42%, rgba(125, 211, 252, 0.62) 0%, rgba(248, 250, 252, 0) 72%),
+    radial-gradient(circle 400px at 62% 48%, rgba(165, 180, 252, 0.50) 0%, rgba(248, 250, 252, 0) 70%);
+  --aura-halo-idle:
+    radial-gradient(circle 420px at 50% 42%, rgba(26, 115, 232, 0.44) 0%, rgba(14, 165, 233, 0.30) 36%, rgba(99, 102, 241, 0.18) 58%, rgba(248, 250, 252, 0) 76%);
   --aura-thinking:
-    radial-gradient(ellipse 74% 58% at 50% -4%, rgba(79, 70, 229, 0.21) 0%, rgba(26, 115, 232, 0.13) 48%, transparent 78%),
-    radial-gradient(ellipse 52% 42% at 16% 22%, rgba(99, 102, 241, 0.12) 0%, transparent 72%);
+    radial-gradient(circle 600px at 50% 52%, rgba(99, 102, 241, 0.60) 0%, rgba(168, 85, 247, 0.36) 46%, rgba(248, 250, 252, 0) 76%),
+    radial-gradient(circle 460px at 42% 44%, rgba(59, 130, 246, 0.54) 0%, rgba(248, 250, 252, 0) 70%),
+    radial-gradient(circle 400px at 58% 50%, rgba(139, 92, 246, 0.40) 0%, rgba(248, 250, 252, 0) 68%);
   --aura-verified:
-    radial-gradient(ellipse 74% 56% at 50% -4%, rgba(5, 150, 105, 0.19) 0%, rgba(26, 115, 232, 0.085) 48%, transparent 78%);
+    radial-gradient(circle 560px at 50% 48%, rgba(16, 185, 129, 0.48) 0%, rgba(14, 165, 233, 0.30) 44%, rgba(248, 250, 252, 0) 76%),
+    radial-gradient(circle 420px at 44% 44%, rgba(52, 211, 153, 0.36) 0%, rgba(248, 250, 252, 0) 70%);
   --aura-shield:
-    radial-gradient(ellipse 74% 56% at 50% -4%, rgba(225, 29, 72, 0.17) 0%, rgba(234, 88, 12, 0.115) 46%, transparent 78%);
+    radial-gradient(circle 560px at 50% 48%, rgba(245, 158, 11, 0.48) 0%, rgba(225, 29, 72, 0.30) 44%, rgba(248, 250, 252, 0) 76%),
+    radial-gradient(circle 420px at 56% 44%, rgba(251, 146, 60, 0.36) 0%, rgba(248, 250, 252, 0) 70%);
 
   /* ------------------------------------------------------------------------
      3. Crisp Slate Ink & Terminal Typography Palette (WCAG AA/AAA)
@@ -64,13 +73,15 @@
   --border-subtle: #EDF2F7;
   --border-strong: #CBD5E1;
   --border-emphasis: #94A3B8;
+  --border-glass: rgba(255, 255, 255, 0.92);
+  --border-glass-subtle: rgba(226, 232, 240, 0.68);
   --border-terminal: rgba(148, 163, 184, 0.18);
   --border-focus: #1A73E8;
   --focus-ring: 0 0 0 3px rgba(26, 115, 232, 0.16);
   --focus-ring-hero:
-    0 0 0 1px rgba(26, 115, 232, 0.36),
-    0 0 0 4px rgba(26, 115, 232, 0.10),
-    0 20px 44px -12px rgba(15, 23, 42, 0.12);
+    0 20px 48px rgba(26, 115, 232, 0.14),
+    0 0 0 3px rgba(26, 115, 232, 0.08),
+    0 3px 12px rgba(15, 23, 42, 0.05);
   --focus-ring-danger: 0 0 0 3px rgba(220, 38, 38, 0.16);
   --focus-ring-success: 0 0 0 3px rgba(5, 150, 105, 0.18);
 
@@ -83,7 +94,9 @@
   --accent-primary-subtle: #EFF6FF;
   --accent-primary-border: #BFDBFE;
   --accent-indigo: #4F46E5;
-  --accent-gradient: linear-gradient(115deg, #1A73E8 0%, #4F46E5 58%, #0284C7 100%);
+  --accent-gradient: linear-gradient(110deg, #1A73E8 0%, #0EA5E9 28%, #4F46E5 58%, #6366F1 82%, #1A73E8 100%);
+  --send-soft-bg: #8EC5FC;
+  --send-soft-fg: #0B396F;
 
   /* Critical Production Action Accents */
   --action-deploy-bg: #059669;
@@ -267,19 +280,21 @@
   --space-10: 2.5rem;      /* 40px */
   --space-12: 3rem;        /* 48px */
 
-  --header-height: 56px;
-  --pane-left-width: 368px;
-  --pane-center-min: 480px;
-  --pane-right-width: 392px;
+  --header-height: 64px;
+  --pane-left-width: 356px;
+  --pane-center-min: 440px;
+  --pane-right-width: 360px;
   --studio-grid-columns: var(--pane-left-width) minmax(var(--pane-center-min), 1fr) var(--pane-right-width);
 
-  /* Border Radii: 5-6px Technical Badges, 9999px Top-Bar Capsules ONLY */
+  /* Border Radii */
   --radius-xs: 4px;
   --radius-badge: 5px;
   --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-card: 22px;
+  --radius-prompt: 26px;
   --radius-pill: 9999px;
 
   --z-aura: 0;
@@ -291,22 +306,25 @@
   --z-toast: 100;
 
   /* ------------------------------------------------------------------------
-     10. Cool-Slate Architectural Shadows
+     10. Cool-Slate Architectural & Glass Shadows
      ------------------------------------------------------------------------ */
   --shadow-none: none;
   --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
-  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.03);
-  --shadow-md: 0 6px 16px -4px rgba(15, 23, 42, 0.08), 0 2px 6px -1px rgba(15, 23, 42, 0.04);
+  --shadow-sm: 0 2px 10px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 8px 24px -4px rgba(15, 23, 42, 0.07), 0 2px 6px -1px rgba(15, 23, 42, 0.04);
   --shadow-lg: 0 16px 36px -8px rgba(15, 23, 42, 0.12), 0 4px 12px -2px rgba(15, 23, 42, 0.05);
   --shadow-hero-card:
-    0 1px 2px rgba(15, 23, 42, 0.04),
-    0 14px 36px -10px rgba(15, 23, 42, 0.09);
+    0 12px 36px rgba(26, 115, 232, 0.08),
+    0 2px 10px rgba(15, 23, 42, 0.04);
+  --shadow-glass-pane:
+    0 10px 32px rgba(26, 115, 232, 0.06),
+    0 2px 8px rgba(15, 23, 42, 0.03);
   --shadow-popover:
-    0 20px 48px -12px rgba(15, 23, 42, 0.18),
-    0 4px 12px -2px rgba(15, 23, 42, 0.06);
+    0 20px 48px -12px rgba(15, 23, 42, 0.16),
+    0 4px 12px -2px rgba(15, 23, 42, 0.05);
   --shadow-glider:
-    0 1px 3px rgba(15, 23, 42, 0.10),
-    0 1px 2px rgba(15, 23, 42, 0.05);
+    0 2px 8px rgba(26, 115, 232, 0.12),
+    0 1px 3px rgba(15, 23, 42, 0.06);
   --shadow-deploy-ready:
     0 0 0 1px rgba(5, 150, 105, 0.30),
     0 6px 18px -4px rgba(5, 150, 105, 0.22);
@@ -367,13 +385,23 @@
 }
 
 @keyframes nq-aura-breathe {
-  0%, 100% {
-    opacity: 0.88;
-    transform: scale(1);
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
   }
   50% {
-    opacity: 1;
-    transform: scale(1.03);
+    transform: translate3d(14px, -10px, 0) scale(1.045);
+  }
+  100% {
+    transform: translate3d(-12px, 8px, 0) scale(0.985);
+  }
+}
+
+@keyframes nq-gradient-flow {
+  0%, 100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
   }
 }
 
