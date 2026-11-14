@@ -9,6 +9,8 @@ import base64
 import io
 import os
 import subprocess
+import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Final
@@ -31,6 +33,8 @@ from no_quiz_no_prod.contracts import (
     ReleaseCommit,
     RuntimeSettings,
     ToolErrorPayload,
+    compute_tree_sha256,
+    diff_sha256_from_trees,
 )
 from no_quiz_no_prod.graph import workflow as workflow_module
 from no_quiz_no_prod.graph.mcp_bridge import StdioMCPBridge
@@ -53,6 +57,7 @@ QUIZ: Final = QuizDraft(
     explanation_by_option=OptionTexts(A="Right", B="Trap B", C="Trap C", D="Trap D"),
 )
 SECOND_FIX: Final = FIXED_FINTECH_ORDERS + "\n\n# Release 2: no behaviour change, documentation only.\n"
+OTHER_HOST_URL: Final = "https://git.attacker.example/example-owner/example-release.git"
 
 
 # ---- helpers ---------------------------------------------------------------------------------------------------------
@@ -114,6 +119,36 @@ def workspace_for(tmp_path: Path, **settings: Any) -> SandboxWorkspace:
     return sandbox
 
 
+def prepared_release(sandbox: SandboxWorkspace, **overrides: Any) -> release_module.PreparedRelease:
+    """``prepare`` for what is staged now, as the gate calls it."""
+    prod, staging = compute_tree_sha256(sandbox.prod_dir), compute_tree_sha256(sandbox.staging_dir)
+    arguments: dict[str, Any] = {
+        "source_dir": sandbox.staging_dir,
+        "baseline_dir": sandbox.prod_dir,
+        "diff_sha256": diff_sha256_from_trees(prod, staging),
+        "approved_tree_sha256": staging,
+        "baseline_tree_sha256": prod,
+        "release_note": "Fix VAT",
+    }
+    return sandbox.release.prepare(**(arguments | overrides))
+
+
+def remote_files(remote: Path, commit: str) -> list[str]:
+    return git("--git-dir", str(remote), "ls-tree", "-r", "--name-only", commit).splitlines()
+
+
+def teammate_pushes(remote: Path, clone: Path, name: str = "HOTFIX.md") -> str:
+    """Someone else commits one more file on top of the release branch; returns the new tip."""
+    git("clone", "--quiet", "--branch", DEFAULT_GIT_BRANCH, str(remote), str(clone))
+    (clone / name).write_text("pushed by someone else\n")
+    git("add", name, cwd=clone)
+    git("commit", "--quiet", "-m", "hotfix", cwd=clone)
+    git("push", "--quiet", str(remote), f"HEAD:refs/heads/{DEFAULT_GIT_BRANCH}", cwd=clone)
+    theirs = tip(remote)
+    assert theirs is not None
+    return theirs
+
+
 # ---- default: a local bare remote ------------------------------------------------------------------------------------
 def test_deploy_commits_the_approved_tree_and_pushes_it_to_the_local_bare_remote(tmp_path: Path) -> None:
     sandbox = workspace_for(tmp_path)
@@ -132,7 +167,9 @@ def test_deploy_commits_the_approved_tree_and_pushes_it_to_the_local_bare_remote
     assert git("--git-dir", str(remote), "rev-list", "--count", release.commit_sha) == "2"
     files = git("--git-dir", str(remote), "ls-tree", "-r", "--name-only", release.commit_sha).splitlines()
     assert sorted(files) == sorted(sandbox.list_files("prod"))  # no __pycache__ / .pyc from the pytest run
-    assert git("--git-dir", str(remote), "diff", "--name-only", release.parent_sha, release.commit_sha) == "orders.py"
+    assert (
+        git("--git-dir", str(remote), "diff", "--name-only", str(release.parent_sha), release.commit_sha) == "orders.py"
+    )
     message = git("--git-dir", str(remote), "log", "-1", "--format=%an%n%B", release.commit_sha)
     assert message.startswith("No-Quiz-No-Prod Gate\ndeploy: Fix VAT float drift") and f"Diff-SHA256: {diff}" in message
     # the release is recorded everywhere the deploy is
@@ -147,20 +184,28 @@ def test_deploy_commits_the_approved_tree_and_pushes_it_to_the_local_bare_remote
     assert "remote" not in (sandbox.settings.release_git_dir / "config").read_text()
 
 
-def test_successive_deploys_fast_forward_and_a_reset_adds_a_baseline_commit(tmp_path: Path) -> None:
+def test_successive_deploys_fast_forward_and_a_reset_starts_the_default_remote_again(tmp_path: Path) -> None:
     sandbox = workspace_for(tmp_path)
     remote = sandbox.settings.default_release_remote_dir
     first = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Release 1")["release"])
     second = ReleaseCommit.model_validate(
         sandbox.deploy_to_production(ship(sandbox, SECOND_FIX), "Release 2")["release"]
     )
-    assert second.parent_sha == first.commit_sha  # prod == remote tip: no baseline in between
-    sandbox.reset()  # prod is back to the seed, the remote keeps its history
+    assert second.parent_sha == first.commit_sha  # prod == remote tip: nothing in between
+    assert git("--git-dir", str(remote), "rev-list", "--count", second.commit_sha) == "3"
+    sandbox.reset()  # prod is back to the seed
+    sandbox.release.discard_default_remote()  # what a reset does with the workspace's own remote
     third = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Release 3")["release"])
-    assert git("--git-dir", str(remote), "rev-parse", f"{third.parent_sha}^") == second.commit_sha
-    assert git("--git-dir", str(remote), "merge-base", "--is-ancestor", first.commit_sha, third.commit_sha) == ""
-    assert git("--git-dir", str(remote), "rev-list", "--count", third.commit_sha) == "5"  # linear, nothing rewritten
-    assert git("--git-dir", str(remote), "diff", "--name-only", third.parent_sha, third.commit_sha) == "orders.py"
+    assert git("--git-dir", str(remote), "rev-list", "--count", third.commit_sha) == "2"  # baseline + release
+    assert git("--git-dir", str(remote), "diff", "--name-only", str(third.parent_sha), third.commit_sha) == "orders.py"
+
+
+def test_a_configured_remote_is_never_discarded(tmp_path: Path) -> None:
+    remote = bare_repo(tmp_path / "team_release.git")
+    sandbox = workspace_for(tmp_path, git_remote_url=str(remote))
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Release 1")["release"])
+    sandbox.release.discard_default_remote()
+    assert tip(remote) == release.commit_sha
 
 
 def test_a_locked_or_rejected_deploy_pushes_nothing(tmp_path: Path) -> None:
@@ -176,48 +221,184 @@ def test_a_locked_or_rejected_deploy_pushes_nothing(tmp_path: Path) -> None:
 
 def test_a_retried_release_is_never_committed_or_pushed_twice(tmp_path: Path) -> None:
     sandbox = workspace_for(tmp_path)
-    diff = ship(sandbox)
-    publish = {
-        "source_dir": sandbox.staging_dir,
-        "baseline_dir": sandbox.prod_dir,
-        "diff_sha256": diff,
-        "prod_tree_sha256": "0" * 64,
-        "release_note": "Fix VAT",
-    }
-    first = sandbox.release.publish(**publish)  # e.g. the push landed, then the answer was lost
-    again = sandbox.release.publish(**publish)
-    assert first.pushed and not again.pushed
+    ship(sandbox)
+    prepared = prepared_release(sandbox, thread_id="thr-1")
+    announced: list[ReleaseCommit] = []
+    first = sandbox.release.publish(prepared, before_push=announced.append)  # the push landed, the answer was lost
+    assert announced == [first] and first.pushed  # the gate journals the commit before it is pushed
+    again = sandbox.release.publish(prepared, before_push=announced.append)
+    assert not again.pushed and len(announced) == 1  # recognised: nothing committed, announced or pushed again
     assert (again.commit_sha, again.parent_sha) == (first.commit_sha, first.parent_sha)
     assert tip(sandbox.settings.default_release_remote_dir) == first.commit_sha
+
+
+def test_a_redeploy_is_recognised_by_identity_not_by_an_equal_tree(tmp_path: Path) -> None:
+    """Audit PoC D at the publisher: the tip holds the same tree, shipped by another thread."""
+    sandbox = workspace_for(tmp_path)
+    ship(sandbox)
+    first = sandbox.release.publish(prepared_release(sandbox, thread_id="thr-1"))
+    other_thread = prepared_release(sandbox, thread_id="thr-2")
+    assert other_thread.target_tree == git(
+        "--git-dir", str(sandbox.settings.release_git_dir), "rev-parse", f"{first.commit_sha}^{{tree}}"
+    )
+    error = refusal(lambda: sandbox.release.publish(other_thread))
+    assert error.code == "remote_diverged"  # not "already released": prod is not what the branch holds
+    assert tip(sandbox.settings.default_release_remote_dir) == first.commit_sha
+    forged_note = f"Looks released\n\nDiff-SHA256: {'0' * 64}\nThread: thr-9"  # trailers in the note do not count
+    noted = prepared_release(sandbox, thread_id="thr-1", release_note=forged_note)
+    assert not sandbox.release.publish(noted).pushed and release_module._trailers(noted.message)["Thread"] == "thr-1"
+
+
+def test_an_equal_tree_redeploy_after_a_reset_is_not_reported_as_pushed(tmp_path: Path) -> None:
+    """Audit PoC D end to end: run 2 ships the same fix after a reset; run 1's commit must not stand in for it."""
+    remote = bare_repo(tmp_path / "team_release.git")
+    sandbox = workspace_for(tmp_path, git_remote_url=str(remote))
+    first = ReleaseCommit.model_validate(
+        sandbox.deploy_to_production(ship(sandbox, thread_id="run-1"), "Run 1")["release"]
+    )
+    sandbox.reset()
+    diff = ship(sandbox, thread_id="run-2")
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Run 2"))
+    assert error.code == "remote_diverged" and error.details["remote_tip"] == first.commit_sha
+    final = sandbox.snapshot_final_state()
+    assert not final.pushed and not final.deployed and final.release_commit_sha is None
+    assert tip(remote) == first.commit_sha
 
 
 # ---- a configured remote that moved: never forced --------------------------------------------------------------------
 def test_a_moved_remote_is_never_force_pushed_and_prod_waits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     remote = bare_repo(tmp_path / "team_release.git")
-    clone = tmp_path / "someone_else"
-    git("init", "--quiet", "-b", DEFAULT_GIT_BRANCH, str(clone))
-    (clone / "HOTFIX.md").write_text("pushed by someone else\n")
-    git("add", "HOTFIX.md", cwd=clone)
-    git("commit", "--quiet", "-m", "hotfix", cwd=clone)
-    git("push", "--quiet", str(remote), f"{DEFAULT_GIT_BRANCH}:refs/heads/{DEFAULT_GIT_BRANCH}", cwd=clone)
-    theirs = tip(remote)
-
     sandbox = workspace_for(tmp_path, git_remote_url=f"file://{remote}")
-    diff = ship(sandbox)
-    # the gate reads a stale view of the branch (it moved between the read and the push): the push must be refused
-    monkeypatch.setattr(release_module.GitReleasePublisher, "_remote_tip", lambda self, remote, branch: None)
-    error = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT"))
+    first = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Release 1")["release"])
+    diff = ship(sandbox, SECOND_FIX)
+    # the gate reads the branch, then someone else pushes before the gate does: the push must be refused
+    real_remote_tip = release_module.GitReleasePublisher._remote_tip
+
+    def read_then_race(self: Any, *args: Any) -> str | None:
+        seen = real_remote_tip(self, *args)
+        teammate_pushes(remote, tmp_path / "someone_else")
+        return seen
+
+    monkeypatch.setattr(release_module.GitReleasePublisher, "_remote_tip", read_then_race)
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Release 2"))
     assert error.code == "conflict" and error.retryable
-    assert tip(remote) == theirs  # nothing overwritten
+    theirs = tip(remote)
+    assert theirs != first.commit_sha and "HOTFIX.md" in remote_files(remote, str(theirs))  # nothing overwritten
     final = sandbox.snapshot_final_state()
-    assert not final.prod_changed and not final.deployed and final.release_commit_sha is None
+    assert not final.prod_changed or final.prod_tree_sha256 == first.prod_tree_sha256  # release 2 never promoted
     assert sandbox.get_gate_status(diff).can_deploy  # the locks still hold: a retry is allowed
 
-    monkeypatch.undo()
-    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(diff, "Fix VAT")["release"])
-    assert release.remote == str(remote) and tip(remote) == release.commit_sha
-    assert git("--git-dir", str(remote), "merge-base", "--is-ancestor", theirs, release.commit_sha) == ""
-    assert sandbox.snapshot_final_state().deployed
+    monkeypatch.undo()  # the retry now sees their commit: the branch no longer holds prod, a human must reconcile
+    assert refusal(lambda: sandbox.deploy_to_production(diff, "Release 2")).code == "remote_diverged"
+    assert tip(remote) == theirs
+
+
+def test_a_diverged_remote_is_refused_and_no_sync_commit_reverts_a_teammate(tmp_path: Path) -> None:
+    """Audit PoC C: release 1, a teammate's hotfix, a reset, then release 2 on another file."""
+    remote = bare_repo(tmp_path / "team_release.git")
+    sandbox = workspace_for(tmp_path, git_remote_url=str(remote))
+    sandbox.deploy_to_production(ship(sandbox), "Release 1: fix orders.py")
+    theirs = teammate_pushes(remote, tmp_path / "teammate")
+    sandbox.reset()
+    discounts = sandbox.read_file("discounts.py") + "\n# reviewed\n"
+    diff = sandbox.write_staging_file("discounts.py", discounts)["diff_sha256"]
+    assert sandbox.run_staging_tests().passed
+    question = sandbox.create_quiz(QUIZ, diff_sha256=diff)
+    assert sandbox.grade_quiz_answer(question.question_id, "A").passed
+    sandbox.apply_deploy_decision(DeployDecision(action="approve", expected_diff_sha256=diff))
+
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Release 2: discounts only"))
+    assert error.code == "remote_diverged" and not error.retryable
+    assert error.details == {"branch": DEFAULT_GIT_BRANCH, "remote": str(remote), "remote_tip": theirs}
+    assert tip(remote) == theirs  # not one commit was added: no "sync with production", no release
+    assert "HOTFIX.md" in remote_files(remote, theirs)
+    assert git("--git-dir", str(remote), "show", f"{theirs}:orders.py") == FIXED_FINTECH_ORDERS.strip()
+    subjects = git("--git-dir", str(remote), "log", "--format=%s", theirs)
+    assert "sync the release branch" not in subjects
+    assert not sandbox.snapshot_final_state().prod_changed
+
+
+# ---- the pushed tree is exactly the approved tree ---------------------------------------------------------------------
+def test_a_global_ignore_file_cannot_change_the_pushed_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Audit PoC E: ``auth.py`` in the user's global git ignore used to vanish from the release."""
+    home = tmp_path / "home"
+    (home / ".config" / "git").mkdir(parents=True)
+    (home / ".config" / "git" / "ignore").write_text("auth.py\n")
+    (home / ".config" / "git" / "attributes").write_text("*.py text eol=crlf\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    sandbox = workspace_for(tmp_path)
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Fix VAT")["release"])
+    remote = sandbox.settings.default_release_remote_dir
+    assert sorted(remote_files(remote, release.commit_sha)) == sorted(sandbox.list_files("prod"))
+    exported = tmp_path / "exported"
+    exported.mkdir()
+    sandbox.release.export_tree(release.commit_sha, exported)
+    assert compute_tree_sha256(exported) == release.prod_tree_sha256 == compute_tree_sha256(sandbox.prod_dir)
+
+
+def test_ignore_and_attributes_files_inside_the_tree_are_committed_not_obeyed(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    ship(sandbox)
+    (sandbox.staging_dir / ".gitignore").write_text("*.py\n")
+    (sandbox.staging_dir / ".gitattributes").write_text("*.py text eol=crlf\n* export-ignore\n")
+    approved = compute_tree_sha256(sandbox.staging_dir)
+    release = sandbox.release.publish(prepared_release(sandbox))
+    remote = sandbox.settings.default_release_remote_dir
+    assert sorted(remote_files(remote, release.commit_sha)) == sorted(sandbox.list_files("staging"))
+    exported = tmp_path / "exported"
+    exported.mkdir()
+    sandbox.release.export_tree(release.commit_sha, exported)
+    assert compute_tree_sha256(exported) == approved  # byte for byte: no end-of-line rewrite
+
+
+def test_a_tree_that_changed_after_approval_is_never_committed(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    ship(sandbox)
+    approved = compute_tree_sha256(sandbox.staging_dir)
+    (sandbox.staging_dir / "orders.py").write_text("# slipped in after the approval\n")
+    error = refusal(lambda: prepared_release(sandbox, approved_tree_sha256=approved))
+    assert error.code == "invalid_argument"  # the diff hash no longer binds these trees
+    prod = compute_tree_sha256(sandbox.prod_dir)
+    stale = {"approved_tree_sha256": approved, "diff_sha256": diff_sha256_from_trees(prod, approved)}
+    error = refusal(lambda: prepared_release(sandbox, **stale))
+    assert error.code == "conflict" and error.details["tree"] == "staging"
+    assert not sandbox.settings.default_release_remote_dir.exists()  # nothing was even started
+    assert not list(sandbox.settings.release_git_dir.glob("snapshot-*"))  # no private copy is left behind
+
+
+def test_export_tree_and_remote_has_commit_let_the_gate_complete_a_pushed_release(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    ship(sandbox)
+    approved = compute_tree_sha256(sandbox.staging_dir)
+    announced: list[ReleaseCommit] = []
+    refused = refusal(
+        lambda: sandbox.release.publish(
+            prepared_release(sandbox), before_push=announced.append, reject_push=lambda: True
+        )
+    )
+    assert refused.code == "upstream_error" and not sandbox.release.remote_has_commit(announced[0].commit_sha)
+    release = sandbox.release.publish(prepared_release(sandbox))  # the push lands; the process dies before the swap
+    (sandbox.staging_dir / "orders.py").write_text("# staging moved on\n")
+    assert sandbox.release.remote_has_commit(release.commit_sha)
+    assert not sandbox.release.remote_has_commit("f" * 40)
+    promoted = tmp_path / "promoted"
+    promoted.mkdir()
+    sandbox.release.export_tree(release.commit_sha, promoted)  # prod comes from the commit, not from staging
+    assert compute_tree_sha256(promoted) == approved == release.prod_tree_sha256
+
+
+def test_a_git_command_that_outlives_its_budget_is_killed_with_its_children(tmp_path: Path) -> None:
+    marker = tmp_path / "survivor"
+    script = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', \"import time, pathlib; time.sleep(2); pathlib.Path({str(marker)!r}).write_text('x')\"]); time.sleep(30)"
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        release_module._run_process(
+            [sys.executable, "-c", script], stdin=None, timeout=0.5, env=dict(os.environ), cwd=tmp_path
+        )
+    assert time.monotonic() - started < 10
+    time.sleep(2.5)
+    assert not marker.exists()  # the grandchild died with the group
 
 
 @pytest.mark.parametrize("branch", ["-delete", "main..x", "feature/", "a b", "x.lock"])
@@ -236,25 +417,27 @@ class FakeNetworkGit:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.push_stderr = push_stderr
         self.ls_remote = ls_remote  # "" : the branch does not exist yet
-        self._real_run = subprocess.run
+        self._real_run = release_module._run_process
 
-    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if not argv or argv[0] != "git":  # e.g. the staging pytest run: not ours to record
-            return self._real_run(argv, **kwargs)
-        self.calls.append((list(argv), dict(kwargs.get("env") or {})))
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        self.calls.append((list(argv), dict(kwargs["env"])))
         command = next((arg for arg in argv[1:] if not arg.startswith("--")), "")
         if command not in NETWORK_COMMANDS:
             return self._real_run(argv, **kwargs)
         if command == "push" and self.push_stderr is not None:
-            return subprocess.CompletedProcess(argv, 128, stdout="", stderr=self.push_stderr)
+            return subprocess.CompletedProcess(argv, 128, stdout=b"", stderr=self.push_stderr.encode())
         stdout = self.ls_remote if command == "ls-remote" else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout.encode(), stderr=b"")
 
     def network_envs(self) -> list[dict[str, str]]:
         return [env for argv, env in self.calls if any(arg in NETWORK_COMMANDS for arg in argv)]
 
     def local_envs(self) -> list[dict[str, str]]:
         return [env for argv, env in self.calls if not any(arg in NETWORK_COMMANDS for arg in argv)]
+
+
+def git_config(env: dict[str, str]) -> dict[str, str]:
+    return {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
 
 
 def assert_token_absent(*texts: str) -> None:
@@ -267,7 +450,7 @@ def files_text(root: Path) -> str:
 
 
 def github_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake: FakeNetworkGit) -> SandboxWorkspace:
-    monkeypatch.setattr(release_module.subprocess, "run", fake)
+    monkeypatch.setattr(release_module, "_run_process", fake)
     return workspace_for(tmp_path, git_remote_url=GITHUB_URL, github_token=SecretStr(TOKEN))
 
 
@@ -286,13 +469,15 @@ def test_github_push_sends_the_token_only_as_a_scoped_git_env_header(
     assert all(TOKEN not in arg and TOKEN_B64 not in arg for argv, _ in fake.calls for arg in argv)
     header = f"Authorization: Basic {TOKEN_B64}"
     for env in fake.network_envs():
-        keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+        keys = git_config(env)
         assert keys[f"http.{GITHUB_URL}.extraHeader"] == header and keys["credential.helper"] == ""
+        assert keys["http.followRedirects"] == "false"  # the header never follows a redirect to another host
         assert env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
         assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert all(header not in env.values() for env in fake.local_envs())  # commits and trees never see it
-    inherited = {name for _, env in fake.calls for name in env if not name.startswith(("GIT_", "LC_", "LANG"))}
-    assert inherited <= release_module.GIT_ENV_ALLOWLIST  # no API key of this process reaches git
+    names = {name for _, env in fake.calls for name in env if not name.startswith(("GIT_CONFIG_", "GIT_INDEX_FILE"))}
+    assert names <= release_module.GIT_ENV_ALLOWLIST | set(release_module.GIT_FIXED_ENV)  # no API key reaches git
+    assert {env["HOME"] for _, env in fake.calls} == {os.devnull}  # no ~/.netrc, no ~/.config/git
     # nowhere on disk (.release.git/config, ledger, state.sqlite, logs) and nowhere in what the deploy returns
     assert_token_absent(files_text(sandbox.root), repr(payload), repr(sandbox.settings))
     assert_token_absent(repr(sandbox.snapshot_final_state()), repr(sandbox.get_latest_ship_log()))
@@ -314,7 +499,7 @@ def test_a_remote_url_with_embedded_credentials_is_refused_without_echoing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = FakeNetworkGit()
-    monkeypatch.setattr(release_module.subprocess, "run", fake)
+    monkeypatch.setattr(release_module, "_run_process", fake)
     url = f"https://x-access-token:{TOKEN}@github.com/example-owner/example-release.git"
     sandbox = workspace_for(tmp_path, git_remote_url=url)
     diff = ship(sandbox)
@@ -510,7 +695,7 @@ def test_init_github_verify_checks_the_token_and_never_prints_it(
 ) -> None:
     head = "c" * 40
     fake = FakeNetworkGit(ls_remote=f"{head}\trefs/heads/{DEFAULT_GIT_BRANCH}\n")
-    monkeypatch.setattr(release_module.subprocess, "run", fake)
+    monkeypatch.setattr(release_module, "_run_process", fake)
     no_token = RuntimeSettings(workspace_dir=tmp_path / "workspace", git_remote_url=GITHUB_URL)
     code, missing = init_github(no_token, "--verify")
     assert code == 1 and "NO_QUIZ_GITHUB_TOKEN is not set" in missing
@@ -524,3 +709,66 @@ def test_init_github_verify_checks_the_token_and_never_prints_it(
     code, refused = init_github(leaky, "--verify")
     assert code == 1 and "must not embed credentials" in refused
     assert_token_absent(missing, verified, refused)
+
+
+# ---- the token: allow-listed hosts only ---------------------------------------------
+def test_the_token_is_never_sent_to_a_host_outside_the_allow_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeNetworkGit()
+    monkeypatch.setattr(release_module, "_run_process", fake)
+    sandbox = workspace_for(tmp_path, git_remote_url=OTHER_HOST_URL, github_token=SecretStr(TOKEN))
+    diff = ship(sandbox)
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT"))
+    assert error.code == "invalid_argument" and error.details["allowed_hosts"] == ["github.com"]
+    assert "attacker" not in error.model_dump_json()  # the refused URL is never echoed
+    assert_token_absent(error.model_dump_json())
+    assert len(fake.calls) == 0  # git never even started (a count only: never print a recorded environment)
+    assert not sandbox.snapshot_final_state().prod_changed
+    assert refusal(lambda: release_module.validate_release_config(sandbox.settings)).code == "invalid_argument"
+    for url in ("https://github.com:8443/acme/r.git", "https://github.com.attacker.example/acme/r.git"):
+        other = RuntimeSettings(workspace_dir=tmp_path / "w", git_remote_url=url, github_token=SecretStr(TOKEN))
+        assert refusal(release_module.GitReleasePublisher(other).resolve_remote).code == "invalid_argument"
+    # defence in depth: even a remote object built around the check gets no header
+    rogue = release_module.ReleaseRemote(target=OTHER_HOST_URL, display=OTHER_HOST_URL, kind="https")
+    assert refusal(lambda: sandbox.release._environment(rogue, None)).code == "invalid_argument"
+
+
+def test_an_extra_allowed_host_gets_the_token_scoped_to_its_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeNetworkGit()
+    monkeypatch.setattr(release_module, "_run_process", fake)
+    hosts = ("github.com", "git.attacker.example")
+    sandbox = workspace_for(
+        tmp_path, git_remote_url=OTHER_HOST_URL, github_token=SecretStr(TOKEN), git_allowed_hosts=hosts
+    )
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Fix VAT")["release"])
+    assert release.pushed and release.commit_url is None  # not github.com: no web link is invented
+    header = f"Authorization: Basic {TOKEN_B64}"
+    assert all(git_config(env)[f"http.{OTHER_HOST_URL}.extraHeader"] == header for env in fake.network_envs())
+
+
+def test_validate_release_config_reports_each_problem_before_any_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = RuntimeSettings(workspace_dir=tmp_path / "workspace")
+    config = release_module.validate_release_config(base)
+    assert (config.remote.kind, config.remote.create, config.branch) == ("local", True, DEFAULT_GIT_BRANCH)
+    assert tuple(int(part) for part in config.git_version.split(".")[:2]) >= release_module.GIT_MIN_VERSION
+    assert not base.default_release_remote_dir.exists() and not base.release_git_dir.exists()  # nothing was written
+
+    def problem(**settings: Any) -> ToolErrorPayload:
+        return refusal(lambda: release_module.validate_release_config(base.model_copy(update=settings)))
+
+    no_token = problem(git_remote_url=GITHUB_URL)
+    assert no_token.code == "invalid_argument" and "NO_QUIZ_GITHUB_TOKEN" in no_token.message
+    assert problem(git_branch="main..x").code == "invalid_argument"
+    assert problem(git_remote_url="relative/path.git").code == "invalid_argument"
+    assert problem(git_remote_url=OTHER_HOST_URL, github_token=SecretStr(TOKEN)).code == "invalid_argument"
+    ok = release_module.validate_release_config(
+        base.model_copy(update={"git_remote_url": GITHUB_URL, "github_token": SecretStr(TOKEN)})
+    )
+    assert ok.remote.kind == "https"
+    monkeypatch.setattr(release_module, "GIT_MIN_VERSION", (99, 0))
+    assert problem().code == "internal_error"
