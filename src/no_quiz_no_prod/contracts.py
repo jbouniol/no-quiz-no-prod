@@ -58,10 +58,10 @@ StopReason = Literal[
 ShipLogStatus = Literal["Staging", "Quiz Pending", "Remediation v2", "Blocked", "Deployed to Prod"]
 QuizOptionKey = Literal["A", "B", "C", "D"]
 DocVersion = Literal["v1", "v2", "v3"]
-MasteryLevel = Literal["Weakness Detected", "Practicing", "Mastered"]
+MasteryLevel = Literal["Not Assessed", "Weakness Detected", "Practicing", "Mastered"]
 RuleDomain = Literal["Monetary & Rounding", "Auth & Security", "Discounts & VIP", "Refunds & Testing"]
 RuleSeverity = Literal["Critical", "Mandatory", "Guideline"]
-RuleStatus = Literal["Draft", "Active"]
+RuleStatus = Literal["Draft", "In Review", "Active"]
 # The seeded fintech codebase (seeds/<seed>/) exposes exactly these module basenames ("Changed Files" options).
 FintechModule = Literal["orders.py", "discounts.py", "auth.py", "refunds.py", "test_fintech.py"]
 Topology = Literal["dual", "single"]  # dual: Coder -> Examiner; single: one agent does both jobs
@@ -74,7 +74,10 @@ DeployAction = Literal["approve", "reject"]
 InterruptKind = Literal["quiz", "deploy_approval"]
 RunEventType = Literal["run_started", "step", "artifact_updated", "run_completed", "run_error"]  # SSE event names
 EvalOutcome = Literal["pass", "wrong_state", "forbidden_call", "over_budget", "api_error"]  # precedence: right to left
-FaultKind = Literal["write_timeout"]  # the first staging write succeeds but its answer is lost
+FaultKind = Literal[
+    "write_timeout",  # the first staging write succeeds but its answer is lost (outcome_unknown)
+    "rate_limit",  # the first tool call answers rate_limited (retryable)
+]
 LLMProvider = Literal["openrouter", "anthropic"]
 ToolErrorCode = Literal[
     "invalid_argument",  # well-formed call, wrong value (unknown file, rule code, option...)
@@ -220,7 +223,10 @@ def idem_key(thread_id: str, tool: str, args: dict[str, Any]) -> str:
 
 
 def derive_mastery(fail_count: int, pass_count: int) -> MasteryLevel:
-    """Mastery from quiz counters: more fails than passes is a weakness; a lead of ``MASTERY_MARGIN`` is mastery."""
+    """Mastery from quiz counters: never quizzed is "Not Assessed"; more fails than passes is a weakness; a lead of
+    ``MASTERY_MARGIN`` passes is mastery."""
+    if fail_count == 0 and pass_count == 0:
+        return "Not Assessed"
     if fail_count > pass_count:
         return "Weakness Detected"
     if pass_count - fail_count >= MASTERY_MARGIN:
@@ -456,7 +462,7 @@ class SkillProfileRecord(ContractModel):
 
     skill_tag: SkillTag
     user_id: NonEmptyStr = DEFAULT_USER_ID
-    mastery: MasteryLevel = "Practicing"
+    mastery: MasteryLevel = "Not Assessed"
     fail_count: int = Field(default=0, ge=0)
     pass_count: int = Field(default=0, ge=0)
     last_misconception: str | None = None
@@ -871,9 +877,10 @@ class RunEvent(ContractModel):
 
 # ---- evaluation (golden set, scored runs) --------------------------------------------------------------------------
 class InjectionSpec(ContractModel):
-    """Adversarial payload planted, as a code comment, in one seeded file before the run starts."""
+    """Adversarial payload planted before the run starts: as a code comment in a seeded module, or inside the body
+    of a Notion rule page (``RULE-00X``), so it reaches the agent through a tool result."""
 
-    target: FintechModule
+    target: FintechModule | RuleCode
     text: NonEmptyStr
 
 

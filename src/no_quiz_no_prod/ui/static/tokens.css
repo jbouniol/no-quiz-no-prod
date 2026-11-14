@@ -1,0 +1,517 @@
+/* ==========================================================================
+   No-Quiz-No-Prod — Tech Premium Design Tokens (Single Source of Truth)
+   Aesthetic: Google Antigravity / Linear precision × Notion warm editorial
+   Zero-build Vanilla CSS Custom Properties · Light-first High-Contrast Studio
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* ------------------------------------------------------------------------
+     1. Surfaces & Warm Editorial Canvas
+     ------------------------------------------------------------------------ */
+  --bg-canvas: #FBFBFA;              /* Notion warm paper viewport background */
+  --bg-surface: #FFFFFF;             /* Elevated crisp card & pane surface */
+  --bg-subtle: #F7F6F3;              /* Secondary surface: DB headers, toolbars */
+  --bg-muted: #F1F0EC;               /* Segmented track, neutral chip fill */
+  --bg-code: #FAF9F6;                /* Warm off-white code & diff viewport */
+  --bg-terminal: #161615;            /* High-contrast dark command/payload drawer */
+  --bg-glass: rgba(251, 251, 250, 0.88); /* Sticky header translucent backdrop */
+
+  /* Interactive Surface Overlays */
+  --bg-hover: rgba(25, 25, 24, 0.04);
+  --bg-active: rgba(25, 25, 24, 0.075);
+  --bg-selected: #EEF5FD;
+  --bg-backdrop: rgba(25, 25, 24, 0.32);
+
+  /* ------------------------------------------------------------------------
+     2. Crisp Ink & Editorial Typography Palette (WCAG AA/AAA Verified)
+     ------------------------------------------------------------------------ */
+  --ink-primary: #191918;            /* Primary editorial & UI ink (>16:1) */
+  --ink-secondary: #57564F;          /* Secondary prose, metadata values (>7:1) */
+  --ink-muted: #6F6E67;              /* Accessible labels, table headers (5.0:1) */
+  --ink-tertiary: #8A8880;           /* Subtle line numbers, decorative hints */
+  --ink-disabled: #B4B2AA;           /* Disabled controls & locked labels */
+  --ink-on-accent: #FFFFFF;          /* Crisp white text on solid accents */
+  --ink-on-terminal: #F4F3EF;        /* Light ink inside dark payload drawers */
+
+  /* ------------------------------------------------------------------------
+     3. Structural Hairlines, Borders & Focus Rings
+     ------------------------------------------------------------------------ */
+  --border-hairline: #E6E6E4;        /* Canonical 1px structural pane divider */
+  --border-subtle: #EFEFED;          /* Inner row & Notion property dividers */
+  --border-strong: #D4D3CE;          /* Input rest/hover & interactive cards */
+  --border-emphasis: #B8B6AE;        /* Active card frame */
+  --border-focus: #2383E2;           /* Precision cobalt focus outline */
+  --focus-ring: 0 0 0 3px rgba(35, 131, 226, 0.18);
+  --focus-ring-danger: 0 0 0 3px rgba(220, 38, 38, 0.18);
+  --focus-ring-success: 0 0 0 3px rgba(5, 150, 105, 0.20);
+
+  /* ------------------------------------------------------------------------
+     4. Brand, Interactive Accents, Agent & MCP Server Identity
+     ------------------------------------------------------------------------ */
+  --accent-primary: #1F6FEB;         /* Antigravity precision cobalt */
+  --accent-primary-hover: #195BC5;
+  --accent-primary-active: #1449A1;
+  --accent-primary-subtle: #EEF5FD;
+  --accent-primary-border: #BFDBFE;
+
+  /* Critical Production Action Accents */
+  --action-deploy-bg: #059669;       /* Unlocked "Approve & Deploy to Prod" */
+  --action-deploy-hover: #047857;
+  --action-deploy-active: #065F46;
+  --action-locked-bg: #F1F0EC;       /* Locked critical gate background */
+  --action-locked-fg: #6F6E67;
+  --action-locked-border: #DFDDD6;
+
+  /* Agent Role Identity Pills (Dual-Agent Topology: Coder -> Examiner) */
+  --agent-coder-bg: #EFF6FF;
+  --agent-coder-fg: #1D4ED8;
+  --agent-coder-border: #BFDBFE;
+  --agent-coder-dot: #2563EB;
+
+  --agent-examiner-bg: #F5F3FF;
+  --agent-examiner-fg: #5B21B6;
+  --agent-examiner-border: #DDD6FE;
+  --agent-examiner-dot: #7C3AED;
+
+  --agent-single-bg: #F3F4F6;
+  --agent-single-fg: #374151;
+  --agent-single-border: #D1D5DB;
+  --agent-single-dot: #4B5563;
+
+  /* MCP Server Identity Pills (code-mcp vs notion-quiz-mcp) */
+  --mcp-code-bg: #F0FDFA;
+  --mcp-code-fg: #0F766E;
+  --mcp-code-border: #99F6E4;
+  --mcp-code-dot: #0D9488;
+
+  --mcp-notion-bg: #F4F3EF;
+  --mcp-notion-fg: #37352F;
+  --mcp-notion-border: #DFDDD6;
+  --mcp-notion-dot: #191918;
+
+  /* ------------------------------------------------------------------------
+     5. Canonical Semantic Status Pills (ShipLogStatus Contract)
+     ------------------------------------------------------------------------ */
+  /* 5.1 Staging — Warm Amber */
+  --status-staging-bg: #FFFBEB;
+  --status-staging-fg: #92400E;
+  --status-staging-border: #FCD34D;
+  --status-staging-dot: #D97706;
+
+  /* 5.2 Quiz Pending — Indigo Gate + Gold Notion Accent */
+  --status-quiz-bg: #EEF2FF;
+  --status-quiz-fg: #3730A3;
+  --status-quiz-border: #C7D2FE;
+  --status-quiz-dot: #4F46E5;
+
+  --status-quiz-gold-bg: #FEFCE8;
+  --status-quiz-gold-fg: #854D0E;
+  --status-quiz-gold-border: #FDE047;
+  --status-quiz-gold-dot: #CA8A04;
+
+  /* 5.3 Remediation v2 — Warm Coral (Pedagogical Upgrade & Trap Callout) */
+  --status-remediation-bg: #FFF1EC;
+  --status-remediation-fg: #9A3412;
+  --status-remediation-border: #FDBA9C;
+  --status-remediation-dot: #EA580C;
+  --callout-remediation-bg: #FFF6F2;
+  --callout-remediation-border: #FB923C;
+  --callout-remediation-accent: #EA580C;
+  --callout-remediation-glow: rgba(234, 88, 12, 0.16);
+
+  /* 5.4 Deployed to Prod — Crisp Emerald */
+  --status-deployed-bg: #ECFDF5;
+  --status-deployed-fg: #065F46;
+  --status-deployed-border: #A7F3D0;
+  --status-deployed-dot: #059669;
+
+  /* 5.5 Blocked — High-Signal Crimson */
+  --status-blocked-bg: #FEF2F2;
+  --status-blocked-fg: #991B1B;
+  --status-blocked-border: #FECACA;
+  --status-blocked-dot: #DC2626;
+
+  /* 5.6 Layer 4 Developer Skill Mastery Aliases (DRY Mapping) */
+  --mastery-weakness-bg: var(--status-blocked-bg);
+  --mastery-weakness-fg: var(--status-blocked-fg);
+  --mastery-weakness-border: var(--status-blocked-border);
+  --mastery-weakness-dot: var(--status-blocked-dot);
+
+  --mastery-practicing-bg: var(--status-staging-bg);
+  --mastery-practicing-fg: var(--status-staging-fg);
+  --mastery-practicing-border: var(--status-staging-border);
+  --mastery-practicing-dot: var(--status-staging-dot);
+
+  --mastery-mastered-bg: var(--status-deployed-bg);
+  --mastery-mastered-fg: var(--status-deployed-fg);
+  --mastery-mastered-border: var(--status-deployed-border);
+  --mastery-mastered-dot: var(--status-deployed-dot);
+
+  /* 5.7 Golden Set Scenario Kind Badges (normal, ambiguous, impossible, adversarial) */
+  --kind-normal-bg: #EFF6FF;
+  --kind-normal-fg: #1E40AF;
+  --kind-normal-border: #BFDBFE;
+
+  --kind-ambiguous-bg: #FFFBEB;
+  --kind-ambiguous-fg: #92400E;
+  --kind-ambiguous-border: #FCD34D;
+
+  --kind-impossible-bg: #F3F4F6;
+  --kind-impossible-fg: #374151;
+  --kind-impossible-border: #D1D5DB;
+
+  --kind-adversarial-bg: #FDF2F8;
+  --kind-adversarial-fg: #9D174D;
+  --kind-adversarial-border: #FBCFE8;
+
+  /* ------------------------------------------------------------------------
+     6. Monospace Code Diff Tokens (prod <-> staging Inspector)
+     ------------------------------------------------------------------------ */
+  /* Addition (+ lines & inline word diff highlights) */
+  --diff-add-line-bg: #ECFDF3;
+  --diff-add-gutter-bg: #D1FADF;
+  --diff-add-word-bg: #A6F4C5;
+  --diff-add-fg: #084C2E;
+  --diff-add-bar: #16A34A;
+
+  /* Deletion (- lines & inline word diff highlights) */
+  --diff-del-line-bg: #FFF1F2;
+  --diff-del-gutter-bg: #FFE4E6;
+  --diff-del-word-bg: #FECDD3;
+  --diff-del-fg: #881337;
+  --diff-del-bar: #E11D48;
+
+  /* Hunk Header (@@ -a,b +c,d @@) & Context Gutter */
+  --diff-hunk-bg: #EEF4FF;
+  --diff-hunk-fg: #2B4C9B;
+  --diff-hunk-border: #D6E4FF;
+  --diff-gutter-bg: #F5F4F0;
+  --diff-gutter-fg: #8A8880;
+  --diff-context-bg: var(--bg-code);
+
+  /* ------------------------------------------------------------------------
+     7. Typography Scale, Weights & Numeric Precision
+     ------------------------------------------------------------------------ */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Menlo, Monaco,
+    Consolas, 'Liberation Mono', monospace;
+
+  /* Modular Type Scale */
+  --text-2xs: 0.6875rem;   /* 11px — eyebrows, kbd hints, SHA-256 digests */
+  --text-xs: 0.75rem;      /* 12px — pills, DB property labels, telemetry */
+  --text-sm: 0.8125rem;    /* 13px — buttons, inputs, diff code, step cards */
+  --text-base: 0.875rem;   /* 14px — chat messages, quiz options, UI body */
+  --text-md: 0.9375rem;    /* 15px — Notion Ship Log editorial prose */
+  --text-lg: 1.0625rem;    /* 17px — section headers, Notion H3 */
+  --text-xl: 1.25rem;      /* 20px — KPI values, Notion H2 */
+  --text-2xl: 1.5rem;      /* 24px — Notion DB Page Title */
+  --text-3xl: 1.75rem;     /* 28px — Defence Explorer hero metrics */
+
+  /* Line Heights */
+  --leading-none: 1;
+  --leading-tight: 1.25;
+  --leading-snug: 1.375;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.65;
+  --leading-code: 1.55;
+
+  /* Font Weights */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* Letter Spacing */
+  --tracking-tight: -0.02em;
+  --tracking-snug: -0.011em;
+  --tracking-normal: 0em;
+  --tracking-caps: 0.055em;
+
+  /* ------------------------------------------------------------------------
+     8. Spacing Rhythm (4px Base Grid) & Studio Geometry
+     ------------------------------------------------------------------------ */
+  --space-0: 0px;
+  --space-0-5: 0.125rem;   /* 2px */
+  --space-1: 0.25rem;      /* 4px */
+  --space-1-5: 0.375rem;    /* 6px */
+  --space-2: 0.5rem;       /* 8px */
+  --space-2-5: 0.625rem;    /* 10px */
+  --space-3: 0.75rem;      /* 12px */
+  --space-4: 1rem;         /* 16px */
+  --space-5: 1.25rem;      /* 20px */
+  --space-6: 1.5rem;       /* 24px */
+  --space-8: 2rem;         /* 32px */
+  --space-10: 2.5rem;      /* 40px */
+  --space-12: 3rem;        /* 48px */
+
+  /* Canonical Studio Frame Dimensions */
+  --header-height: 52px;
+  --pane-left-width: 360px;
+  --pane-center-min: 460px;
+  --pane-right-width: 380px;
+  --studio-grid-columns: var(--pane-left-width) minmax(var(--pane-center-min), 1fr) var(--pane-right-width);
+
+  /* Border Radii */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-pill: 9999px;
+
+  /* Z-Index Layer Scale */
+  --z-base: 1;
+  --z-sticky: 20;
+  --z-header: 40;
+  --z-popover: 60;
+  --z-modal: 80;
+  --z-toast: 100;
+
+  /* ------------------------------------------------------------------------
+     9. Elevation Shadows (Warm Ink Micro-Elevation)
+     ------------------------------------------------------------------------ */
+  --shadow-none: none;
+  --shadow-xs: 0 1px 2px rgba(25, 25, 24, 0.04);
+  --shadow-sm: 0 1px 3px rgba(25, 25, 24, 0.05), 0 1px 2px rgba(25, 25, 24, 0.03);
+  --shadow-md: 0 4px 12px -2px rgba(25, 25, 24, 0.07), 0 2px 4px -1px rgba(25, 25, 24, 0.04);
+  --shadow-lg: 0 12px 28px -6px rgba(25, 25, 24, 0.10), 0 4px 10px -2px rgba(25, 25, 24, 0.05);
+  --shadow-deploy-ready: 0 0 0 1px rgba(5, 150, 105, 0.28),
+    0 6px 18px -4px rgba(5, 150, 105, 0.22);
+
+  /* ------------------------------------------------------------------------
+     10. Micro-Interaction Motion & Timing Curves
+     ------------------------------------------------------------------------ */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);
+  --duration-fast: 120ms;
+  --duration-base: 160ms;
+  --duration-slow: 260ms;
+  --duration-highlight: 1400ms;
+
+  --transition-fast: var(--duration-fast) var(--ease-standard);
+  --transition-base: 160ms cubic-bezier(0.2, 0, 0, 1);
+  --transition-slow: var(--duration-slow) var(--ease-out-expo);
+}
+
+/* ==========================================================================
+   Canonical Keyframes & Reduced-Motion Guardrails
+   ========================================================================== */
+
+@keyframes nq-slide-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes nq-live-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.42;
+    transform: scale(0.86);
+  }
+}
+
+@keyframes nq-remediation-highlight {
+  0% {
+    box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.38);
+    background-color: #FFE8DC;
+  }
+  45% {
+    box-shadow: 0 0 0 6px rgba(234, 88, 12, 0.12);
+    background-color: #FFF1EC;
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(234, 88, 12, 0);
+    background-color: var(--callout-remediation-bg);
+  }
+}
+
+/* ==========================================================================
+   DRY Token-Bound Data-Attribute Mappings (Zero Magic Colors in JS/CSS)
+   ========================================================================== */
+
+[data-status="Staging"] {
+  --pill-bg: var(--status-staging-bg);
+  --pill-fg: var(--status-staging-fg);
+  --pill-border: var(--status-staging-border);
+  --pill-dot: var(--status-staging-dot);
+}
+
+[data-status="Quiz Pending"] {
+  --pill-bg: var(--status-quiz-bg);
+  --pill-fg: var(--status-quiz-fg);
+  --pill-border: var(--status-quiz-border);
+  --pill-dot: var(--status-quiz-dot);
+}
+
+[data-status="Quiz Pending"][data-tone="gold"] {
+  --pill-bg: var(--status-quiz-gold-bg);
+  --pill-fg: var(--status-quiz-gold-fg);
+  --pill-border: var(--status-quiz-gold-border);
+  --pill-dot: var(--status-quiz-gold-dot);
+}
+
+[data-status="Remediation v2"] {
+  --pill-bg: var(--status-remediation-bg);
+  --pill-fg: var(--status-remediation-fg);
+  --pill-border: var(--status-remediation-border);
+  --pill-dot: var(--status-remediation-dot);
+}
+
+[data-status="Deployed to Prod"] {
+  --pill-bg: var(--status-deployed-bg);
+  --pill-fg: var(--status-deployed-fg);
+  --pill-border: var(--status-deployed-border);
+  --pill-dot: var(--status-deployed-dot);
+}
+
+[data-status="Blocked"] {
+  --pill-bg: var(--status-blocked-bg);
+  --pill-fg: var(--status-blocked-fg);
+  --pill-border: var(--status-blocked-border);
+  --pill-dot: var(--status-blocked-dot);
+}
+
+[data-mastery="Weakness Detected"] {
+  --pill-bg: var(--mastery-weakness-bg);
+  --pill-fg: var(--mastery-weakness-fg);
+  --pill-border: var(--mastery-weakness-border);
+  --pill-dot: var(--mastery-weakness-dot);
+}
+
+[data-mastery="Practicing"] {
+  --pill-bg: var(--mastery-practicing-bg);
+  --pill-fg: var(--mastery-practicing-fg);
+  --pill-border: var(--mastery-practicing-border);
+  --pill-dot: var(--mastery-practicing-dot);
+}
+
+[data-mastery="Mastered"] {
+  --pill-bg: var(--mastery-mastered-bg);
+  --pill-fg: var(--mastery-mastered-fg);
+  --pill-border: var(--mastery-mastered-border);
+  --pill-dot: var(--mastery-mastered-dot);
+}
+
+[data-mastery="Not Assessed"] {
+  --pill-bg: var(--bg-muted);
+  --pill-fg: var(--ink-muted);
+  --pill-border: var(--border-hairline);
+  --pill-dot: var(--ink-tertiary);
+}
+
+[data-agent="coder"] {
+  --pill-bg: var(--agent-coder-bg);
+  --pill-fg: var(--agent-coder-fg);
+  --pill-border: var(--agent-coder-border);
+  --pill-dot: var(--agent-coder-dot);
+}
+
+[data-agent="examiner"] {
+  --pill-bg: var(--agent-examiner-bg);
+  --pill-fg: var(--agent-examiner-fg);
+  --pill-border: var(--agent-examiner-border);
+  --pill-dot: var(--agent-examiner-dot);
+}
+
+[data-agent="single"] {
+  --pill-bg: var(--agent-single-bg);
+  --pill-fg: var(--agent-single-fg);
+  --pill-border: var(--agent-single-border);
+  --pill-dot: var(--agent-single-dot);
+}
+
+[data-agent="human"],
+[data-agent="system"] {
+  --pill-bg: var(--bg-muted);
+  --pill-fg: var(--ink-secondary);
+  --pill-border: var(--border-hairline);
+  --pill-dot: var(--ink-muted);
+}
+
+[data-outcome="pass"] {
+  --pill-bg: var(--status-deployed-bg);
+  --pill-fg: var(--status-deployed-fg);
+  --pill-border: var(--status-deployed-border);
+  --pill-dot: var(--status-deployed-dot);
+}
+
+[data-outcome="wrong_state"],
+[data-outcome="forbidden_call"],
+[data-outcome="api_error"] {
+  --pill-bg: var(--status-blocked-bg);
+  --pill-fg: var(--status-blocked-fg);
+  --pill-border: var(--status-blocked-border);
+  --pill-dot: var(--status-blocked-dot);
+}
+
+[data-outcome="over_budget"] {
+  --pill-bg: var(--status-staging-bg);
+  --pill-fg: var(--status-staging-fg);
+  --pill-border: var(--status-staging-border);
+  --pill-dot: var(--status-staging-dot);
+}
+
+[data-mcp="code-mcp"] {
+  --pill-bg: var(--mcp-code-bg);
+  --pill-fg: var(--mcp-code-fg);
+  --pill-border: var(--mcp-code-border);
+  --pill-dot: var(--mcp-code-dot);
+}
+
+[data-mcp="notion-quiz-mcp"] {
+  --pill-bg: var(--mcp-notion-bg);
+  --pill-fg: var(--mcp-notion-fg);
+  --pill-border: var(--mcp-notion-border);
+  --pill-dot: var(--mcp-notion-dot);
+}
+
+[data-kind="normal"] {
+  --pill-bg: var(--kind-normal-bg);
+  --pill-fg: var(--kind-normal-fg);
+  --pill-border: var(--kind-normal-border);
+}
+
+[data-kind="ambiguous"] {
+  --pill-bg: var(--kind-ambiguous-bg);
+  --pill-fg: var(--kind-ambiguous-fg);
+  --pill-border: var(--kind-ambiguous-border);
+}
+
+[data-kind="impossible"] {
+  --pill-bg: var(--kind-impossible-bg);
+  --pill-fg: var(--kind-impossible-fg);
+  --pill-border: var(--kind-impossible-border);
+}
+
+[data-kind="adversarial"] {
+  --pill-bg: var(--kind-adversarial-bg);
+  --pill-fg: var(--kind-adversarial-fg);
+  --pill-border: var(--kind-adversarial-border);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
