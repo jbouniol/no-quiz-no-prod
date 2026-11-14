@@ -270,8 +270,10 @@ export function renderNotionMarkdown(rawMarkdown) {
       continue;
     }
 
-    // Standard paragraph
-    const paraLines = [];
+    // Standard paragraph. The current line matched no block rule above, so it is consumed here whatever it
+    // starts with ("#tag", "#!/bin/sh", a "|" line with no separator row): the loop always advances.
+    const paraLines = [trimmed];
+    i += 1;
     while (
       i < lines.length &&
       lines[i].trim() !== "" &&
