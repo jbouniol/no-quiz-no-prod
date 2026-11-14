@@ -11,7 +11,7 @@ from pydantic import Field, ValidationError
 
 from no_quiz_no_prod import __version__
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError
-from no_quiz_no_prod.contracts import McpServerName, RuntimeSettings, ToolErrorPayload
+from no_quiz_no_prod.contracts import McpServerName, RuntimeSettings, ToolErrorPayload, project_environment
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ DESTRUCTIVE_WRITE: Final = ToolAnnotations(
 
 # ---- arguments the harness owns (the model should leave them alone) ----------------------------------------------
 HARNESS_ARG_MAX_CHARS: Final = 128
+UNKNOWN_TOOL_PREFIX: Final = "Unknown tool"  # the SDK's message for a tool name no server registered
 IdempotencyKey = Annotated[
     str | None,
     Field(max_length=HARNESS_ARG_MAX_CHARS, description="Set by the harness on writes; never set it yourself."),
@@ -60,10 +61,12 @@ def typed_error(tool: str, error: ToolError) -> ToolErrorPayload:
         return invalid_argument(cause, f"arguments for {tool}").payload
     if (payload := ToolErrorPayload.from_text(str(error))) is not None:
         return payload
-    if isinstance(error, UnexpectedToolError):
-        logger.error("tool %s crashed", tool, exc_info=cause)  # the traceback stays in the server log
-        return ToolErrorPayload(code="internal_error", message=f"{tool} failed unexpectedly: report it, do not retry")
-    return ToolErrorPayload(code="invalid_argument", message=str(error))  # e.g. an unknown tool name
+    if str(error).startswith(UNKNOWN_TOOL_PREFIX):
+        return ToolErrorPayload(code="not_found", message=f"{tool!r} is not a tool of this server")
+    # Anything else is a failure of the server itself (a crash in a tool, or an SDK error that names no argument):
+    # never labelled as the caller's mistake. The traceback stays in the server log.
+    logger.error("tool %s failed without a typed error", tool, exc_info=cause or error)
+    return ToolErrorPayload(code="internal_error", message=f"{tool} failed unexpectedly: report it, do not retry")
 
 
 class NoQuizMCPServer(MCPServer):
@@ -87,18 +90,30 @@ def create_server(name: McpServerName, instructions: str) -> NoQuizMCPServer:
     return NoQuizMCPServer(name, instructions=instructions, version=__version__)
 
 
-class WorkspaceBinding:
-    """The ``SandboxWorkspace`` a server works on: fixed ``settings``, or ``RuntimeSettings.from_env()`` per call.
+def server_settings(server: McpServerName) -> RuntimeSettings:
+    """Settings of a launched server, read at call time and reduced to what that server may hold.
 
-    Resolving per call lets an in-process caller retarget a module-level server by setting ``NO_QUIZ_WORKSPACE_DIR``
-    before a call; a spawned stdio server simply inherits it from its environment.
+    They come from ``project_environment()`` (the project ``.env`` overlaid by the process environment), which
+    exports nothing to ``os.environ``: a secret never enters the environment a test child could inherit or read
+    back. ``restricted_to`` then drops every secret outside the server's allow-list.
+    """
+    return RuntimeSettings.from_env(project_environment()).restricted_to(server)
+
+
+class WorkspaceBinding:
+    """The ``SandboxWorkspace`` one server works on, under that server's least-privilege settings.
+
+    Fixed ``settings`` (an in-process server), or ``server_settings(server)`` per call: resolving per call lets an
+    in-process caller retarget a module-level server by setting ``NO_QUIZ_WORKSPACE_DIR`` before a call, and follows
+    a ``.env`` rewritten while the server runs; a spawned stdio server gets its workspace from its environment.
     """
 
-    def __init__(self, settings: RuntimeSettings | None = None) -> None:
-        self._settings = settings
+    def __init__(self, server: McpServerName, settings: RuntimeSettings | None = None) -> None:
+        self._server = server
+        self._settings = settings.restricted_to(server) if settings is not None else None
 
     def __call__(self) -> SandboxWorkspace:
-        return _workspace_for(self._settings or RuntimeSettings.from_env())
+        return _workspace_for(self._settings or server_settings(self._server))
 
 
 @functools.lru_cache(maxsize=16)

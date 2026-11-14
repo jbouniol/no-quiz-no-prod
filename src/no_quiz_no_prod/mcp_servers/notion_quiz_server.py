@@ -77,7 +77,7 @@ def quiz_tool_arguments(draft: QuizDraft, *, diff_sha256: str) -> dict[str, Any]
 
 def build_server(settings: RuntimeSettings | None = None) -> MCPServer:
     """A notion-quiz-mcp server bound to ``settings`` (default: the environment, resolved at every call)."""
-    workspace = WorkspaceBinding(settings)
+    workspace = WorkspaceBinding(catalog.NOTION_QUIZ_SERVER, settings)
     server = create_server(catalog.NOTION_QUIZ_SERVER, INSTRUCTIONS)
 
     def notion() -> SandboxWorkspace:
@@ -159,7 +159,7 @@ def build_server(settings: RuntimeSettings | None = None) -> MCPServer:
         """Store one 4-option comprehension question grounded in the current diff (diff_sha256 from
         get_staging_diff), with an explanation per option (why it is right, or the misconception behind the trap).
         Returns the public question only: the answer key stays on the server and the human answers it. A new
-        question replaces any open one; at most 2 attempts per diff."""
+        question replaces any open one; at most 2 attempts per task, whatever is edited in between."""
         del attempt  # informational only: the server numbers attempts from the graded answers
         try:
             draft = QuizDraft(
