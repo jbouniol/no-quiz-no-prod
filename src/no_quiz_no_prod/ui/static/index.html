@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>No-Quiz-No-Prod — Agentic Coding &amp; Pedagogy Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/tokens.css" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <!-- =====================================================================
+         Sticky 52px Global Header Bar
+         ===================================================================== -->
+    <header class="app-header">
+      <div class="app-header__left">
+        <div class="brand">
+          <svg
+            class="brand__icon"
+            width="18"
+            height="18"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            <path class="brand__check" d="m9 12 2 2 4-4"></path>
+          </svg>
+          <span class="brand__title">No-Quiz-No-Prod</span>
+          <span class="brand__env">FINTECH SANDBOX</span>
+        </div>
+
+        <div class="mode-switcher" role="tablist" aria-label="Workspace Mode">
+          <button
+            type="button"
+            id="mode-btn-studio"
+            class="mode-switcher__btn is-active"
+            role="tab"
+            aria-selected="true"
+            aria-controls="view-studio"
+            data-mode="studio"
+          >
+            <span>Live Studio</span>
+            <kbd class="kbd-hint">⌘1</kbd>
+          </button>
+          <button
+            type="button"
+            id="mode-btn-explorer"
+            class="mode-switcher__btn"
+            role="tab"
+            aria-selected="false"
+            aria-controls="view-explorer"
+            data-mode="explorer"
+          >
+            <span>Trace &amp; Golden Set Explorer</span>
+            <span id="explorer-count-badge" class="mode-switcher__count tabular-nums">0</span>
+            <kbd class="kbd-hint">⌘2</kbd>
+          </button>
+        </div>
+      </div>
+
+      <div class="app-header__right">
+        <label class="sr-only" for="topology-select">Agent Topology</label>
+        <select id="topology-select" class="header-select" aria-label="Agent Topology">
+          <option value="dual">Dual: Coder → Examiner</option>
+          <option value="single">Single: Unified Agent</option>
+        </select>
+
+        <label class="sr-only" for="model-select">LLM Provider and Model</label>
+        <select id="model-select" class="header-select header-select--model" aria-label="LLM Provider and Model">
+          <option value="~deepseek/deepseek-v4-flash-latest">OpenRouter · ~deepseek/deepseek-v4-flash-latest</option>
+        </select>
+
+        <button
+          type="button"
+          id="btn-reset-seed"
+          class="header-btn"
+          title="Reset workspace to clean Fintech seed (hold Shift to also reset Layer 4 Skill Memory)"
+        >
+          <span aria-hidden="true">↺</span>
+          <span>Reset Seed</span>
+        </button>
+
+        <a
+          id="link-notion-hub"
+          href="#"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="notion-hub-pill"
+          title="Notion Relational 3-Database Hub"
+        >
+          <span id="notion-hub-dot" class="notion-hub-pill__dot" aria-hidden="true"></span>
+          <span id="notion-hub-label">Local Seed Mirror</span>
+        </a>
+      </div>
+    </header>
+
+    <!-- Compact / Mobile Pane Switcher (< 1200px) -->
+    <nav id="mobile-pane-bar" class="mobile-pane-bar" aria-label="Studio Panes">
+      <button type="button" class="mobile-pane-bar__btn is-active" data-pane-target="left">
+        <span>1. Prompt &amp; Stream</span>
+      </button>
+      <button type="button" class="mobile-pane-bar__btn" data-pane-target="center">
+        <span>2. Diff &amp; Notion Doc</span>
+        <span id="mobile-badge-center" class="mobile-pane-bar__dot" hidden></span>
+      </button>
+      <button type="button" class="mobile-pane-bar__btn" data-pane-target="right">
+        <span>3. Quiz &amp; Prod Gate</span>
+        <span id="mobile-badge-right" class="mobile-pane-bar__dot" hidden></span>
+      </button>
+    </nav>
+
+    <!-- =====================================================================
+         MODE 1: Live Studio 3-Pane Conversational Workspace
+         ===================================================================== -->
+    <main id="view-studio" class="studio-grid" role="tabpanel" aria-labelledby="mode-btn-studio">
+      <!-- LEFT PANE (360px): Conversational Prompt & Live LangGraph SSE Stream -->
+      <section class="studio-pane studio-pane--left" data-pane="left" data-mobile-active="true" aria-label="Prompt and Live Step Stream">
+        <div class="telemetry-bar">
+          <div class="telemetry-bar__row">
+            <button
+              type="button"
+              id="thread-chip"
+              class="mono-chip"
+              title="Click to copy active thread_id"
+            >
+              Thread: new
+            </button>
+            <span id="run-status-pill" class="pill" data-agent="system">
+              <span class="pill__dot"></span>
+              <span id="run-status-text">Idle</span>
+            </span>
+          </div>
+
+          <div class="telemetry-bar__budget">
+            <div class="telemetry-bar__labels tabular-nums">
+              <span id="budget-steps-label">Steps: 0 / 16</span>
+              <span id="budget-tokens-label">Tokens: 0 in · 0 out</span>
+            </div>
+            <div class="budget-track" role="progressbar" aria-valuemin="0" aria-valuemax="16" aria-valuenow="0" id="budget-progressbar">
+              <div id="budget-progress-fill" class="budget-track__fill"></div>
+            </div>
+          </div>
+
+          <div class="telemetry-bar__micro tabular-nums">
+            <span id="budget-latency-label">Latency: 0.00s</span>
+            <span aria-hidden="true">·</span>
+            <span id="budget-cost-label">Est. Cost: $0.0000</span>
+          </div>
+        </div>
+
+        <div class="scenarios-drawer" id="scenarios-drawer">
+          <div class="scenarios-drawer__header">
+            <button type="button" id="btn-toggle-scenarios" class="scenarios-toggle" aria-expanded="true">
+              <span>⚡ Quick-Launch Fintech Scenarios</span>
+              <span id="scenarios-chevron" aria-hidden="true">▾</span>
+            </button>
+          </div>
+          <div id="scenarios-body" class="scenarios-drawer__body">
+            <div id="scenario-chips" class="scenario-grid"></div>
+            <label class="fault-toggle">
+              <input type="checkbox" id="chk-fault-timeout" />
+              <span>Simulate <code>write_timeout</code> fault (live retry + <code>idem_key</code>)</span>
+            </label>
+          </div>
+        </div>
+
+        <div id="stream-feed" class="stream-feed" aria-live="polite">
+          <div class="stream-empty" id="stream-empty-state">
+            <div class="stream-empty__title">Ready for Agentic Task</div>
+            <p class="stream-empty__desc">
+              Select a canonical Fintech scenario above or describe a change below.
+              <code>Coder</code> stages edits &amp; runs <code>pytest</code>;
+              <code>Examiner</code> writes the Notion Ship Log &amp; Comprehension Quiz before unlocking Production.
+            </p>
+          </div>
+        </div>
+
+        <form id="prompt-form" class="composer">
+          <label class="sr-only" for="prompt-input">Developer task or clarification answer</label>
+          <textarea
+            id="prompt-input"
+            class="composer__textarea"
+            rows="2"
+            placeholder="Ask Coder to implement a fix, or answer a clarification…"
+          ></textarea>
+          <div class="composer__footer">
+            <div class="composer__footer-left">
+              <button type="button" id="btn-new-thread" class="ghost-micro-btn" title="Start a fresh conversation thread without resetting files">
+                + New Thread
+              </button>
+              <span class="composer__hint"><kbd class="kbd-hint">⌘↵</kbd> to send</span>
+            </div>
+            <button type="submit" id="btn-run-agent" class="btn-primary-run">
+              Run Agent →
+            </button>
+          </div>
+        </form>
+      </section>
+
+      <!-- CENTER PANE (minmax(460px, 1fr)): Dual-Tab Artifact Inspector -->
+      <section class="studio-pane studio-pane--center" data-pane="center" aria-label="Code Diff and Notion Ship Log Inspector">
+        <div class="center-tabbar" role="tablist" aria-label="Artifact Inspector Tabs">
+          <div class="center-tabbar__tabs">
+            <button
+              type="button"
+              id="tab-diff"
+              class="center-tab is-active"
+              role="tab"
+              aria-selected="true"
+              aria-controls="panel-diff"
+            >
+              <span>Code Diff: prod ↔ staging</span>
+              <span id="tab-diff-badge" class="mono-chip mono-chip--compact tabular-nums">0 files</span>
+            </button>
+            <button
+              type="button"
+              id="tab-notion"
+              class="center-tab"
+              role="tab"
+              aria-selected="false"
+              aria-controls="panel-notion"
+            >
+              <span>Notion Ship Log DB Entry</span>
+              <span id="tab-notion-status" class="pill" hidden></span>
+              <span id="tab-notion-version" class="mono-chip mono-chip--compact" hidden>v1</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- TAB 1: Code Diff (prod <-> staging) -->
+        <div id="panel-diff" class="inspector-panel" role="tabpanel" aria-labelledby="tab-diff">
+          <div class="diff-banner">
+            <div class="diff-banner__left">
+              <span id="pytest-banner-pill" class="pill" data-agent="system">
+                <span class="pill__dot"></span>
+                <span id="pytest-banner-text">pytest not run on current tree</span>
+              </span>
+              <button type="button" id="btn-toggle-pytest-log" class="ghost-micro-btn" hidden>
+                Output ▾
+              </button>
+            </div>
+
+            <div class="diff-banner__hashes">
+              <button type="button" id="sha-prod" class="hash-pill" title="Click to copy full prod_tree_sha256">
+                <span class="hash-pill__label">prod:</span>
+                <code id="sha-prod-val">…</code>
+              </button>
+              <button type="button" id="sha-staging" class="hash-pill" title="Click to copy full staging_tree_sha256">
+                <span class="hash-pill__label">staging:</span>
+                <code id="sha-staging-val">…</code>
+              </button>
+              <button type="button" id="sha-diff" class="hash-pill hash-pill--emphasis" title="Click to copy full diff_sha256 bound to the 4-Lock Production Gate">
+                <span aria-hidden="true">🔐</span>
+                <span class="hash-pill__label">diff SHA-256:</span>
+                <code id="sha-diff-val">…</code>
+              </button>
+            </div>
+
+            <div class="segmented-mini" role="group" aria-label="Diff View Mode">
+              <button type="button" id="diff-mode-unified" class="segmented-mini__btn is-active" data-diff-mode="unified">
+                Unified
+              </button>
+              <button type="button" id="diff-mode-split" class="segmented-mini__btn" data-diff-mode="split">
+                Split
+              </button>
+            </div>
+          </div>
+
+          <pre id="pytest-output-drawer" class="pytest-drawer" hidden></pre>
+          <div id="changed-files-strip" class="changed-files-strip" hidden></div>
+
+          <div id="diff-viewport" class="diff-viewport">
+            <div class="empty-artifact-card">
+              <div class="empty-artifact-card__icon" aria-hidden="true">🛡️</div>
+              <h2 class="empty-artifact-card__title">Zero Cryptographic Delta</h2>
+              <p class="empty-artifact-card__desc">
+                Staging &amp; Production trees are cryptographically identical (<code>SHA-256</code> match).
+                Launch a task in the Left Pane to stage changes.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: Notion Ship Log DB Entry -->
+        <div id="panel-notion" class="inspector-panel inspector-panel--notion" role="tabpanel" aria-labelledby="tab-notion" hidden>
+          <div id="notion-page-container" class="notion-page-wrap"></div>
+        </div>
+      </section>
+
+      <!-- RIGHT PANE (380px): Quiz Gate, 4-Lock Prod Approval & Layer 4 Skill Memory -->
+      <aside class="studio-pane studio-pane--right" data-pane="right" aria-label="Comprehension Quiz, Production Gate and Skill Memory">
+        <div class="right-pane-scroll">
+          <!-- Section A: Comprehension Quiz Gate -->
+          <section id="quiz-panel" class="gate-card" aria-label="Comprehension Quiz Gate"></section>
+
+          <!-- Section B: Critical Production Approval & 4-Lock Gate -->
+          <section id="deploy-panel" class="gate-card gate-card--deploy" aria-label="4-Lock Production Gate"></section>
+
+          <!-- Section C: Developer Skill Profile (Layer 4 Memory) -->
+          <section id="memory-panel" class="gate-card" aria-label="Developer Skill Profile Layer 4 Memory"></section>
+        </div>
+      </aside>
+    </main>
+
+    <!-- =====================================================================
+         MODE 2: Trace & Golden Set Explorer (15-Min MSc Oral Defence View)
+         ===================================================================== -->
+    <main id="view-explorer" class="explorer-shell" role="tabpanel" aria-labelledby="mode-btn-explorer" hidden>
+      <div class="explorer-container">
+        <section class="defence-hero">
+          <div class="defence-hero__copy">
+            <div class="eyebrow">15-MINUTE MSC ORAL DEFENCE HARNESS</div>
+            <h1 class="defence-hero__title">Golden Set &amp; State-Based Evaluation Harness</h1>
+            <p class="defence-hero__subtitle">
+              Scored strictly on backend final state (<code>expect_state</code> vs <code>RunFinalState</code>,
+              <code>SHA-256</code>, <code>forbidden_called</code>, step budget) — never on LLM self-report.
+            </p>
+          </div>
+          <div class="defence-hero__actions">
+            <button type="button" id="btn-showcase-passed" class="showcase-btn showcase-btn--pass">
+              ▶ Inspect Showcase Passed Run
+            </button>
+            <button type="button" id="btn-showcase-failed" class="showcase-btn showcase-btn--fail">
+              ▶ Inspect Showcase Failed / Blocked Run
+            </button>
+          </div>
+        </section>
+
+        <!-- Graceful Empty State Card when eval/results.jsonl has not been generated yet -->
+        <section id="explorer-empty-card" class="explorer-empty-card" hidden>
+          <div class="explorer-empty-card__header">
+            <span class="pill" data-status="Staging">
+              <span class="pill__dot"></span>
+              <span>No eval/results.jsonl found on disk yet</span>
+            </span>
+          </div>
+          <h2 class="explorer-empty-card__title">Run the 30-Scenario Golden Set Evaluation Campaign</h2>
+          <p class="explorer-empty-card__desc">
+            Execute the deterministic evaluation harness below to populate <code>eval/results.jsonl</code>,
+            or load a built-in preview sample to rehearse the Trace Explorer interface.
+          </p>
+          <div class="command-copy-bar">
+            <code id="eval-cli-command">uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/</code>
+            <button type="button" id="btn-copy-eval-cmd" class="header-btn">Copy Command</button>
+          </div>
+          <div class="explorer-empty-card__actions">
+            <button type="button" id="btn-load-demo-eval" class="header-btn">
+              Load Representative Defence Preview Sample
+            </button>
+            <button type="button" id="btn-refresh-eval" class="ghost-micro-btn">
+              ↻ Re-check eval/results.jsonl
+            </button>
+          </div>
+        </section>
+
+        <div id="explorer-dashboard-body">
+          <!-- 5-Card KPI Bento Grid -->
+          <section id="explorer-kpi-grid" class="kpi-bento-grid" aria-label="Evaluation Reliability Metrics"></section>
+
+          <!-- Model & Topology Comparison Matrix -->
+          <section class="explorer-card">
+            <div class="explorer-card__header">
+              <h2 class="explorer-card__title">Model &amp; Topology Cohort Comparison Matrix</h2>
+              <span id="explorer-source-label" class="mono-chip mono-chip--compact">eval/results.jsonl</span>
+            </div>
+            <div id="explorer-cohort-wrap" class="table-scroll"></div>
+          </section>
+
+          <!-- Filterable 30-Run Table -->
+          <section class="explorer-card">
+            <div class="explorer-toolbar">
+              <div class="explorer-toolbar__group" id="explorer-kind-filters" role="group" aria-label="Filter by Scenario Kind"></div>
+              <div class="explorer-toolbar__group" id="explorer-outcome-filters" role="group" aria-label="Filter by Verdict Outcome"></div>
+              <div class="explorer-toolbar__inputs">
+                <label class="sr-only" for="explorer-cohort-select">Cohort Filter</label>
+                <select id="explorer-cohort-select" class="header-select">
+                  <option value="all">All Models / Topologies</option>
+                </select>
+                <label class="sr-only" for="explorer-search-input">Search runs</label>
+                <input
+                  type="search"
+                  id="explorer-search-input"
+                  class="search-input"
+                  placeholder="Filter by key (n01#0), task, tool, outcome, or stop_reason…"
+                />
+              </div>
+            </div>
+
+            <div class="table-scroll">
+              <table class="runs-table">
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>Kind</th>
+                    <th>Task</th>
+                    <th>Cohort</th>
+                    <th>Outcome</th>
+                    <th>Stop Reason</th>
+                    <th>State OK</th>
+                    <th class="num-col">Steps</th>
+                    <th class="num-col">Tokens</th>
+                    <th class="num-col">Latency</th>
+                    <th class="num-col">Cost</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="explorer-runs-tbody"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- =====================================================================
+         Slide-Over Full Trace Replay Drawer (Mode 2)
+         ===================================================================== -->
+    <div id="trace-drawer-backdrop" class="drawer-backdrop" hidden></div>
+    <aside id="trace-drawer" class="trace-drawer" aria-label="Full Trace Replay Inspector" hidden>
+      <header class="trace-drawer__header">
+        <div class="trace-drawer__title-row">
+          <div class="trace-drawer__meta">
+            <code id="drawer-run-key" class="drawer-key">n01#0</code>
+            <span id="drawer-kind-pill" class="pill"></span>
+            <span id="drawer-outcome-pill" class="pill"></span>
+          </div>
+          <div class="trace-drawer__actions">
+            <button type="button" id="btn-load-in-studio" class="header-btn">
+              Load Prompt in Live Studio ↗
+            </button>
+            <button type="button" id="btn-close-drawer" class="ghost-micro-btn" aria-label="Close Trace Drawer">
+              ✕ Close
+            </button>
+          </div>
+        </div>
+        <p id="drawer-task-text" class="trace-drawer__task"></p>
+        <div id="drawer-why-banner" class="drawer-why-banner"></div>
+
+        <div class="drawer-tabs" role="tablist">
+          <button type="button" id="drawer-tab-trace" class="center-tab is-active" role="tab" aria-selected="true">
+            Step-by-Step Tool Call Timeline
+          </button>
+          <button type="button" id="drawer-tab-state" class="center-tab" role="tab" aria-selected="false">
+            Backend Final State Proof (RunFinalState)
+          </button>
+        </div>
+      </header>
+
+      <div id="drawer-panel-trace" class="trace-drawer__body"></div>
+      <div id="drawer-panel-state" class="trace-drawer__body" hidden></div>
+    </aside>
+
+    <!-- Non-blocking Toast Container -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
