@@ -3,15 +3,18 @@
 Layout of ``<workspace_dir>`` (``RuntimeSettings.workspace_dir``, one per parallel eval run):
 
 - ``prod/`` and ``staging/``: the seeded fintech modules. Agents edit staging only; a deploy copies it to prod.
-- ``gate_ledger.json``: the shared ``GateLedger`` (tests_passed, quiz_passed, human_approved, blocked, deployed).
-- ``state.sqlite`` (WAL): rule mirror, ship log, private quizzes, pytest runs, skill memory, idempotency store, events.
+- ``state.sqlite`` (WAL): the gate ledger (tests_passed, quiz_passed, human_approved, blocked, deployed), the
+  release journal, rule mirror, ship log, private quizzes, pytest runs, skill memory, idempotency store, events.
 - ``.release.git``: the gate's git commit cache, and ``release_remote.git``: the default bare release remote (used
   when ``NO_QUIZ_GIT_REMOTE_URL`` is not set). A reset keeps both: a remote's history only ever moves forward.
 
 Any other file in the directory (LangGraph checkpoints, server logs...) belongs to another domain: never touched.
 
 The deploy gate is enforced here, server-side: every lock is bound to a ``diff_sha256`` recomputed under the
-workspace lock at decision time, so a lock earned on one diff never unlocks another (TOCTOU guard). A deploy is a
+workspace lock at decision time, so a lock earned on one diff never unlocks another (TOCTOU guard), and it is written
+in the same SQLite transaction as the fact that earns it. Quiz attempts and blocks belong to the TASK EPOCH, not to a
+diff: an edit of staging never gives a new attempt or lifts a block; only a deploy, a reset or a human ``unblock``
+starts a new epoch. A deploy is a
 git release (``GitReleasePublisher``): the approved staging tree is committed and pushed first, and prod is promoted
 only once that push succeeded, so a failed push leaves prod, the ledger and the ship log untouched.
 """
@@ -36,8 +39,12 @@ from no_quiz_no_prod.backend.seeds import load_seed_rules, plant_rule_injection,
 from no_quiz_no_prod.backend.store import (
     STATE_DB_FILENAME,
     connect,
+    deploy_slot,
     idempotency_get,
     idempotency_put,
+    ledger_entries,
+    ledger_record,
+    ledger_revoke,
     log_event,
     meta_get,
     meta_set,
@@ -53,8 +60,10 @@ from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
     DEFAULT_SEED,
     DEFAULT_USER_ID,
+    GATE_LEDGER_FILENAME,
     MAX_QUIZ_ATTEMPTS,
     TERMINAL_SHIP_LOG_STATUSES,
+    BlockReason,
     DeployDecision,
     DeployGateStatus,
     DiffReport,
@@ -62,7 +71,6 @@ from no_quiz_no_prod.contracts import (
     FaultKind,
     FintechModule,
     GateLedger,
-    GateLedgerEntry,
     InjectionSpec,
     NotionRule,
     PublicQuizView,
@@ -97,6 +105,13 @@ META_FAULT_CONSUMED: Final = "fault_consumed"
 META_INJECTION: Final = "injection"
 META_RESET_AT: Final = "reset_at"
 META_RELEASE_PREFIX: Final = "release:"  # release:<diff_sha256> -> the ReleaseCommit JSON of that deploy
+META_TASK_EPOCH: Final = "task_epoch"  # bumped by a deploy or a human unblock; a reset starts again at 1
+META_BLOCKED_REASON: Final = "blocked_reason"  # a BlockReason while the epoch is blocked, else ""
+FIRST_TASK_EPOCH: Final = 1
+BLOCK_MESSAGES: Final[dict[BlockReason, str]] = {
+    "quiz_exhausted": "every quiz attempt of this task is used",
+    "human_rejected": "a human rejected this task",
+}
 
 QUIZ_OPEN: Final = "open"
 QUIZ_SUPERSEDED: Final = "superseded"
@@ -128,7 +143,8 @@ _LATEST_QUIZ: Final = (
     "SELECT record FROM quizzes WHERE (:thread IS NULL OR thread_id IN (:thread, :unbound)) "
     "AND (:diff IS NULL OR diff_sha256 = :diff) ORDER BY rowid DESC LIMIT 1"
 )
-_GRADED_COUNT: Final = "SELECT COUNT(*) FROM quizzes WHERE diff_sha256 = ? AND state IN (?, ?)"
+_GRADED_COUNT: Final = "SELECT COUNT(*) FROM quizzes WHERE epoch = ? AND state IN (?, ?)"
+_EPOCH_OF_DIFF: Final = "SELECT epoch FROM quizzes WHERE diff_sha256 = ? ORDER BY rowid DESC LIMIT 1"
 
 
 def _later_status(current: ShipLogStatus, requested: ShipLogStatus) -> ShipLogStatus:
@@ -169,7 +185,6 @@ class SandboxWorkspace:
         self.root: Path = self.settings.workspace_dir
         self.prod_dir = self.settings.area_dir("prod")
         self.staging_dir = self.settings.area_dir("staging")
-        self.ledger_path = self.settings.gate_ledger_path
         self.db_path = self.root / STATE_DB_FILENAME
         self.notion = NotionDatabaseSync(self.settings)
         self.release = GitReleasePublisher(self.settings)
@@ -196,14 +211,14 @@ class SandboxWorkspace:
         text = injection.text if injection else ""
         if target is not None and target not in ALL_FINTECH_MODULES and target not in {r.rule_code for r in rules}:
             raise WorkspaceError("invalid_argument", f"injection target {target!r} is not a seeded module or rule")
-        with self._lock():
-            self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._lock(), deploy_slot(self.root):  # never under a deploy in flight (run_active)
             for area_dir in (self.prod_dir, self.staging_dir):
                 self._swap_tree(
                     area_dir, lambda fresh: populate_area(fresh, source, injection_target=target, injection_text=text)
                 )
             seed_prod_sha256 = compute_tree_sha256(self.prod_dir)
-            GateLedger().save(self.ledger_path)
+            (self.root / GATE_LEDGER_FILENAME).unlink(missing_ok=True)  # the pre-SQLite ledger: never trusted
             shutil.rmtree(self.root / PYTEST_SCRATCH_DIRNAME, ignore_errors=True)
             with self._write() as conn:
                 wipe(conn, keep_memory=preserve_skill_memory)
@@ -220,6 +235,8 @@ class SandboxWorkspace:
                     META_FAULT_CONSUMED: "0",
                     META_INJECTION: injection.model_dump_json() if injection else "",
                     META_RESET_AT: utc_now().isoformat(),
+                    META_TASK_EPOCH: str(FIRST_TASK_EPOCH),
+                    META_BLOCKED_REASON: "",
                 }
                 for key, value in state.items():
                     meta_set(conn, key, value)
@@ -245,16 +262,17 @@ class SandboxWorkspace:
         self.ensure_ready()
         with self._lock():
             prod_tree, staging_tree = self._trees()
-            ledger = self._ledger()
             with self._read() as conn:
+                ledger = self._ledger(conn)
                 seed_prod_sha256 = meta_get(conn, META_SEED_PROD_SHA256)
                 pytest_report = self._latest_pytest(conn)
                 entry = self._latest_ship_log(conn, thread_id)
                 quiz = self._latest_quiz(conn, thread_id, None)
                 run_diff = entry.diff_sha256 if entry else (quiz.diff_sha256 if quiz else None)
-                attempts = entry.quiz_attempts if entry else (self._graded_count(conn, run_diff) if run_diff else 0)
+                attempts = entry.quiz_attempts if entry else self._graded_count_of_diff(conn, run_diff)
                 release = self._release_for_diff(conn, run_diff)
-            pushed = release is not None and self.release.is_released(release, self.prod_dir)
+        # outside the workspace lock: reading the remote runs git and may be slow
+        pushed = release is not None and self.release.is_released(release, self.prod_dir)
         return RunFinalState(
             prod_tree_sha256=prod_tree,
             staging_tree_sha256=staging_tree,
@@ -278,6 +296,12 @@ class SandboxWorkspace:
             meta_set(conn, META_FAULT_CONSUMED, "1")
             log_event(conn, "fault_injected", {"fault": kind})
             return True
+
+    def fault_armed(self, kind: FaultKind) -> bool:
+        """True for the whole run when the reset armed ``fault=kind`` (a persistent fault: never consumed)."""
+        self.ensure_ready()
+        with self._read() as conn:
+            return meta_get(conn, META_FAULT) == kind
 
     # ---- code workspace (code-mcp) ---------------------------------------------------------------------------------
     def list_files(self, area: WorkspaceArea = "staging") -> list[str]:
@@ -340,6 +364,13 @@ class SandboxWorkspace:
                     retryable=True,
                     outcome_unknown=True,
                 )
+            if self.consume_fault("write_outcome_unknown"):
+                raise WorkspaceError(
+                    "timeout",
+                    "The staging write was not confirmed and a blind retry is not safe here. It MAY have been "
+                    "applied: read the file back (or get the staging diff) before deciding to write again.",
+                    outcome_unknown=True,
+                )
             return payload
 
     def run_staging_tests(self, pytest_k: str | None = None, *, idempotency_key: str | None = None) -> PytestReport:
@@ -364,13 +395,13 @@ class SandboxWorkspace:
                 diff_sha256=tested,
                 duration_s=round(outcome.duration_s, 3),
             )
+            unchanged = self._current_diff() == tested
             with self._write() as conn:
                 conn.execute(
                     "INSERT INTO pytest_runs (diff_sha256, record) VALUES (?, ?)", (tested, report.model_dump_json())
                 )
-            unchanged = self._current_diff() == tested
-            if report.passed and pytest_k is None and prod_tree != staging_tree and unchanged:
-                self._record("tests_passed", tested)
+                if report.passed and pytest_k is None and prod_tree != staging_tree and unchanged:
+                    ledger_record(conn, "tests_passed", tested, self._epoch(conn))
             self._remember(catalog.CODE_SERVER, tool, idempotency_key, report.model_dump(mode="json"))
             return report
 
@@ -385,9 +416,10 @@ class SandboxWorkspace:
         """Release staging to prod, only if the 4 locks hold for the diff recomputed now (else ``gate_locked``).
 
         The release is a git commit of the staging tree, pushed fast-forward to the release remote BEFORE prod is
-        promoted: a refused or failed push raises (``conflict``, ``upstream_error``, ``timeout``) and leaves prod, the
-        ledger and the ship log untouched, the locks still holding for a retry. The ``push_rejected`` fault refuses the
-        run's first push that way, as a retryable ``upstream_error``. The payload's ``release`` is the
+        promoted: a refused or failed push raises (``conflict``, ``remote_diverged``, ``upstream_error``,
+        ``timeout``) and leaves prod and the ship log untouched. It REVOKES Lock 4 (``human_approved``): the human
+        must approve the same diff again (or reject it) before another push. The ``push_rejected`` fault refuses the
+        run's first push that way, as a retryable ``upstream_error``; ``push_unavailable`` refuses every push. The payload's ``release`` is the
         ``ReleaseCommit`` (``commit_url`` is repeated at the top level). Its trailers carry the quiz attempts, the
         applied rules and the thread of the change's ship log.
         """
@@ -404,28 +436,33 @@ class SandboxWorkspace:
                 return {**cached, "replayed": True}
             prod_tree, staging_tree = self._trees()
             current = diff_sha256_from_trees(prod_tree, staging_tree)
-            status = self._ledger().status(current, expected_diff_sha256)
+            with self._read() as conn:
+                status = self._gate(conn, current, expected_diff_sha256)
+                documented = self._ship_log_for_diff(conn, current)
+                attempts = self._graded_count(conn)
             if prod_tree == staging_tree or not status.can_deploy:
                 raise self._gate_locked(status, expected_diff_sha256, trees_identical=prod_tree == staging_tree)
-            with self._read() as conn:
-                documented = self._ship_log_for_diff(conn, current)
-                attempts = self._graded_count(conn, current)
             thread = documented.thread_id if documented else None
-            release = self.release.publish(
-                source_dir=self.staging_dir,
-                baseline_dir=self.prod_dir,
-                diff_sha256=current,
-                prod_tree_sha256=staging_tree,
-                release_note=release_note,
-                quiz_attempts=attempts,
-                applied_rules=documented.applied_rules if documented else (),
-                thread_id=None if thread == catalog.DEFAULT_THREAD_ID else thread,
-                reject_push=lambda: self.consume_fault("push_rejected"),
-            )
+            try:
+                release = self.release.publish(
+                    source_dir=self.staging_dir,
+                    baseline_dir=self.prod_dir,
+                    diff_sha256=current,
+                    prod_tree_sha256=staging_tree,
+                    release_note=release_note,
+                    quiz_attempts=attempts,
+                    applied_rules=documented.applied_rules if documented else (),
+                    thread_id=None if thread == catalog.DEFAULT_THREAD_ID else thread,
+                    reject_push=lambda: self.fault_armed("push_unavailable") or self.consume_fault("push_rejected"),
+                )
+            except WorkspaceError as error:
+                self._release_failed(current, error)
+                raise
             self._swap_tree(self.prod_dir, lambda fresh: copy_tree(self.staging_dir, fresh), expected=staging_tree)
-            self._record("deployed", current)
             deployed_at = utc_now()
             with self._write() as conn:
+                ledger_record(conn, "deployed", current, status.task_epoch)
+                self._start_epoch(conn)  # the task shipped: the next change gets fresh quiz attempts
                 meta_set(conn, f"{META_RELEASE_PREFIX}{current}", release.model_dump_json())
                 entry = self._ship_log_for_diff(conn, current)
                 if entry is not None:
@@ -537,13 +574,20 @@ class SandboxWorkspace:
                 existing = self._ship_log_for_diff(conn, diff_sha256)
                 if existing is not None and existing.status in TERMINAL_SHIP_LOG_STATUSES:
                     raise WorkspaceError("forbidden", f"this change is {existing.status!r}: its ship log is frozen")
+                if (reason := self._blocked_reason(conn)) is not None:
+                    raise WorkspaceError(
+                        "forbidden",
+                        f"this task is blocked ({BLOCK_MESSAGES[reason]}): nothing can be documented, quizzed or "
+                        "deployed until a human resets or unblocks the workspace",
+                        details={"blocked_reason": reason},
+                    )
                 entry = ShipLogEntry(
                     title=title,
                     status=_later_status(existing.status, status) if existing else status,
                     doc_version=_later_doc_version(existing.doc_version, doc_version) if existing else doc_version,
                     changed_files=list(dict.fromkeys(changed_files)),
                     targeted_weaknesses=list(dict.fromkeys(targeted_weaknesses)),
-                    quiz_attempts=self._graded_count(conn, diff_sha256),
+                    quiz_attempts=self._graded_count(conn),
                     diff_sha256=diff_sha256,
                     applied_rules=list(dict.fromkeys(applied_rules)),
                     doc_markdown=doc_markdown,
@@ -567,7 +611,8 @@ class SandboxWorkspace:
     ) -> PublicQuizView:
         """Store a comprehension question bound to the current diff; return its public view (no answer key).
 
-        The attempt number is the server's (1 + graded answers on this diff); a new question supersedes any open one.
+        The attempt number is the server's: 1 + the answers graded in this task epoch, whatever diff they were asked
+        on, so editing staging never buys a new attempt. A new question supersedes any open one.
         """
         self.ensure_ready()
         tool = catalog.CREATE_COMPREHENSION_QUIZ
@@ -576,15 +621,20 @@ class SandboxWorkspace:
             if cached is not None:
                 return PublicQuizView.model_validate(cached)
             self._require_current_change(diff_sha256)
-            ledger = self._ledger()
-            if diff_sha256 in ledger.blocked:
-                raise WorkspaceError("quiz_exhausted", "this change is blocked for good: it can never be deployed")
-            if diff_sha256 in ledger.quiz_passed:
-                raise WorkspaceError("conflict", "the quiz of this change is already passed: ask for deploy approval")
             with self._write() as conn:
-                graded = self._graded_count(conn, diff_sha256)
+                self._require_unblocked(conn)
+                if diff_sha256 in self._ledger(conn).quiz_passed:
+                    raise WorkspaceError(
+                        "conflict", "the quiz of this change is already passed: ask for deploy approval"
+                    )
+                epoch = self._epoch(conn)
+                graded = self._graded_count(conn)
                 if graded >= MAX_QUIZ_ATTEMPTS:
-                    raise WorkspaceError("quiz_exhausted", f"all {MAX_QUIZ_ATTEMPTS} quiz attempts are used")
+                    raise WorkspaceError(
+                        "quiz_exhausted",
+                        f"all {MAX_QUIZ_ATTEMPTS} quiz attempts of this task are used: a human must reset or unblock "
+                        "the workspace before another question",
+                    )
                 question = QuizQuestion.from_draft(
                     draft,
                     question_id=f"quiz-{uuid.uuid4().hex[:SHORT_SHA_CHARS]}",
@@ -592,13 +642,10 @@ class SandboxWorkspace:
                     diff_sha256=diff_sha256,
                     attempt=graded + 1,
                 )
+                conn.execute("UPDATE quizzes SET state = ? WHERE state = ?", (QUIZ_SUPERSEDED, QUIZ_OPEN))
                 conn.execute(
-                    "UPDATE quizzes SET state = ? WHERE diff_sha256 = ? AND state = ?",
-                    (QUIZ_SUPERSEDED, diff_sha256, QUIZ_OPEN),
-                )
-                conn.execute(
-                    "INSERT INTO quizzes (question_id, thread_id, diff_sha256, attempt, state, record) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO quizzes (question_id, thread_id, diff_sha256, attempt, state, record, epoch) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         question.question_id,
                         thread_id,
@@ -606,6 +653,7 @@ class SandboxWorkspace:
                         question.attempt,
                         QUIZ_OPEN,
                         question.model_dump_json(),
+                        epoch,
                     ),
                 )
                 touched = self._advance_ship_log(conn, diff_sha256, attempt=question.attempt)
@@ -619,22 +667,37 @@ class SandboxWorkspace:
     def grade_quiz_answer(
         self, question_id: str, selected_option: QuizOptionKey, *, user_id: str = DEFAULT_USER_ID
     ) -> QuizGradeResult:
-        """Grade the human's answer server-side and apply every consequence.
+        """Grade the human's answer server-side and apply every consequence in ONE transaction.
 
-        Ledger (``quiz_passed``, or ``blocked`` on the last wrong attempt), ship log (attempts, status, doc version)
-        and the Layer 4 skill record (``record_quiz``), all written through to Notion when enabled.
+        The quiz row, the ledger (``quiz_passed``, or the block of the task epoch on the last wrong attempt), the ship
+        log (attempts, status, doc version) and the Layer 4 skill record (``record_quiz``) commit together or not at
+        all, then are written through to Notion when enabled. Replay-safe: answering the same question again with the
+        same option returns the stored grade and changes nothing; another option is a ``conflict`` (an answer is
+        final).
         """
         self.ensure_ready()
-        with self._lock():
-            with self._write() as conn:
-                row = conn.execute("SELECT state, record FROM quizzes WHERE question_id = ?", (question_id,)).fetchone()
-                if row is None:
-                    raise WorkspaceError("not_found", f"no quiz question {question_id!r}")
-                if row["state"] != QUIZ_OPEN:
+        with self._lock(), self._write() as conn:
+            row = conn.execute(
+                "SELECT state, record, grade, epoch FROM quizzes WHERE question_id = ?", (question_id,)
+            ).fetchone()
+            if row is None:
+                raise WorkspaceError("not_found", f"no quiz question {question_id!r}")
+            question = QuizQuestion.model_validate_json(row["record"])
+            if row["state"] in (QUIZ_PASSED, QUIZ_FAILED):
+                grade = QuizGradeResult.model_validate_json(row["grade"])
+                if grade.selected_option != selected_option:
+                    raise WorkspaceError(
+                        "conflict",
+                        f"question {question_id!r} was already answered with {grade.selected_option}: an answer is "
+                        "final",
+                    )
+                record = self._skill_record(conn, user_id, grade.skill_tag)
+                ship_log_changed = self._ship_log_for_diff(conn, question.diff_sha256) is not None
+            else:
+                epoch = self._epoch(conn)
+                if row["state"] != QUIZ_OPEN or row["epoch"] != epoch:
                     raise WorkspaceError("conflict", f"question {question_id!r} is {row['state']}, not open")
-                question = QuizQuestion.model_validate_json(row["record"])
-                if question.diff_sha256 in self._ledger().blocked:
-                    raise WorkspaceError("quiz_exhausted", "this change is blocked for good")
+                self._require_unblocked(conn)
                 grade = question.grade(selected_option)
                 conn.execute(
                     "UPDATE quizzes SET state = ?, grade = ? WHERE question_id = ?",
@@ -646,62 +709,98 @@ class SandboxWorkspace:
                     entry = entry.model_validate(
                         {
                             **entry.model_dump(),
-                            "quiz_attempts": self._graded_count(conn, question.diff_sha256),
+                            "quiz_attempts": self._graded_count(conn),
                             "status": grade.ship_log_status,
                             "doc_version": _later_doc_version(entry.doc_version, grade.doc_version),
                         }
                     )
                     self._save_ship_log(conn, entry)
+                if grade.passed:
+                    ledger_record(conn, "quiz_passed", question.diff_sha256, epoch)
+                if grade.deployment_blocked:
+                    self._block(conn, "quiz_exhausted", [question.diff_sha256])
                 evidence = (entry.notion_page_id or entry.title) if entry else None
                 record = self._skill_record(conn, user_id, grade.skill_tag).record_quiz(
                     passed=grade.passed, misconception=grade.misconception, evidence=evidence, at=utc_now()
                 )
                 self._save_skill(conn, record)
-            if grade.passed:
-                self._record("quiz_passed", question.diff_sha256)
-            if grade.deployment_blocked:
-                self._record("blocked", question.diff_sha256)
         if ship_log_changed:
             self._push_ship_log(question.diff_sha256, include_body=False)
         self._push_skill(record)
         return grade
 
     def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus:
-        """Record the human's deploy decision on the diff they reviewed (Lock 2 checked against the current diff).
+        """Record the human's deploy decision on the diff they reviewed (``expected_diff_sha256``, mandatory: Lock 2).
 
-        An approval is recorded only when Locks 1-3 hold for the current diff and it is the reviewed one; a rejection
-        blocks both the reviewed and the current diff for good and marks their ship log ``Blocked``.
+        An approval is recorded only when Locks 1-3 hold for the current diff, it is the reviewed one and the task is
+        not blocked: read the returned status. A rejection is always accepted: it blocks the task epoch whatever is
+        staged later, withdraws the approval of the reviewed and current diffs and marks their ship log ``Blocked``.
         """
         self.ensure_ready()
-        blocked: list[str] = []
+        expected = decision.expected_diff_sha256
+        frozen: list[str] = []
         with self._lock():
             prod_tree, staging_tree = self._trees()
             current = diff_sha256_from_trees(prod_tree, staging_tree)
-            expected = decision.expected_diff_sha256 or current
-            status = self._ledger().status(current, expected)
-            if decision.approved:
-                if status.ready_for_approval and prod_tree != staging_tree:
-                    self._record("human_approved", current)
-            else:
-                blocked = list(dict.fromkeys([expected, current]))
-                for diff_sha256 in blocked:
-                    self._record("blocked", diff_sha256)
             with self._write() as conn:
-                blocked = [diff for diff in blocked if self._block_ship_log(conn, diff)]
+                if decision.approved:
+                    status = self._gate(conn, current, expected)
+                    if status.ready_for_approval and prod_tree != staging_tree:
+                        ledger_record(conn, "human_approved", current, status.task_epoch)
+                else:
+                    frozen = self._block(conn, "human_rejected", list(dict.fromkeys([expected, current])))
                 log_event(
                     conn,
                     "deploy_decision",
                     {"action": decision.action, "reason": decision.reason, "diff_sha256": current, "thread": thread_id},
                 )
-        for diff_sha256 in blocked:
+        for diff_sha256 in frozen:
             self._push_ship_log(diff_sha256, include_body=False)
         return self.get_gate_status(expected)
 
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus:
-        """The 4 locks of the current diff (``expected_diff_sha256`` is the hash the caller reviewed: Lock 2)."""
+    def unblock(self, reason: str) -> DeployGateStatus:
+        """Harness-only, after a real human decision: lift the block of the task and start a new epoch.
+
+        The new epoch has fresh quiz attempts. Nothing is approved by an unblock: every lock stays bound to its diff
+        and Lock 4 must be given again.
+        """
         self.ensure_ready()
         with self._lock():
-            return self._ledger().status(self._current_diff(), expected_diff_sha256)
+            current = self._current_diff()
+            with self._write() as conn:
+                lifted = self._blocked_reason(conn)
+                self._start_epoch(conn)
+                ledger_revoke(conn, "blocked", current)
+                ledger_revoke(conn, "human_approved", current)
+                log_event(conn, "unblock", {"reason": reason, "lifted": lifted, "diff_sha256": current})
+        return self.get_gate_status(current)
+
+    def get_gate_status(self, expected_diff_sha256: str) -> DeployGateStatus:
+        """The 4 locks of the current diff, plus the block and attempts of the task epoch.
+
+        ``expected_diff_sha256`` is mandatory: the hash the caller reviewed (Lock 2). It is never defaulted to
+        "whatever is staged now".
+        """
+        self.ensure_ready()
+        with self._lock(), self._read() as conn:
+            return self._gate(conn, self._current_diff(), expected_diff_sha256)
+
+    def gate_status_of(self, diff_sha256: str) -> DeployGateStatus:
+        """The locks RECORDED for one diff hash, current or past (e.g. the diff a deploy just shipped).
+
+        ``sha256_matches`` holds when it is the current diff or a deployed one.
+        """
+        self.ensure_ready()
+        with self._lock(), self._read() as conn:
+            current = self._current_diff()
+            matches = diff_sha256 == current or diff_sha256 in self._ledger(conn).deployed
+            return self._gate(conn, diff_sha256, diff_sha256 if matches else current)
+
+    def sync_ship_log(self, diff_sha256: str) -> ShipLogEntry | None:
+        """Harness-only: write the ship-log entry of ``diff_sha256`` through to Notion now (None: Notion off or no
+        entry). The code server holds no Notion key, so the harness calls this after a successful deploy."""
+        self.ensure_ready()
+        return self._push_ship_log(diff_sha256, include_body=False)
 
     # ---- harness: getters ------------------------------------------------------------------------------------------
     def get_latest_pytest(self) -> PytestReport | None:
@@ -813,19 +912,70 @@ class SandboxWorkspace:
                 details={"current_diff_sha256": current, "given_diff_sha256": diff_sha256},
             )
 
-    def _ledger(self) -> GateLedger:
-        return GateLedger.load(self.ledger_path)
+    @staticmethod
+    def _ledger(conn: sqlite3.Connection) -> GateLedger:
+        """The gate ledger as stored in ``state.sqlite`` (written in the transaction of the fact that earns a lock)."""
+        return GateLedger.model_validate(ledger_entries(conn))
 
-    def _record(self, entry: GateLedgerEntry, diff_sha256: str) -> None:
-        """Append to the shared ledger: read-modify-write under the workspace lock, so no update is ever lost."""
-        with self._lock():
-            self._ledger().record(entry, diff_sha256).save(self.ledger_path)
+    @staticmethod
+    def _epoch(conn: sqlite3.Connection) -> int:
+        return int(meta_get(conn, META_TASK_EPOCH) or FIRST_TASK_EPOCH)
+
+    @staticmethod
+    def _blocked_reason(conn: sqlite3.Connection) -> BlockReason | None:
+        reason = meta_get(conn, META_BLOCKED_REASON)
+        return next((known for known in BLOCK_MESSAGES if known == reason), None)
+
+    def _require_unblocked(self, conn: sqlite3.Connection) -> None:
+        if (reason := self._blocked_reason(conn)) is not None:
+            raise WorkspaceError(
+                "quiz_exhausted",
+                f"this task is blocked ({BLOCK_MESSAGES[reason]}): nothing can be quizzed or deployed, whatever is "
+                "staged, until a human resets or unblocks the workspace",
+                details={"blocked_reason": reason},
+            )
+
+    def _gate(self, conn: sqlite3.Connection, diff_sha256: str, expected_diff_sha256: str) -> DeployGateStatus:
+        """Locks recorded for ``diff_sha256``, with the block and the attempts of the task epoch."""
+        ledger = self._ledger(conn)
+        reason = self._blocked_reason(conn)
+        return ledger.status(diff_sha256, expected_diff_sha256).model_copy(
+            update={
+                "blocked": reason is not None or diff_sha256 in ledger.blocked,
+                "blocked_reason": reason,
+                "task_epoch": self._epoch(conn),
+                "quiz_attempts": self._graded_count(conn),
+                "sandbox_disabled": self.settings.unsafe_no_sandbox,
+            }
+        )
+
+    def _block(self, conn: sqlite3.Connection, reason: BlockReason, diffs: Sequence[str]) -> list[str]:
+        """Block the task epoch and freeze ``diffs``: no approval survives. Returns the diffs whose ship log moved."""
+        meta_set(conn, META_BLOCKED_REASON, reason)
+        epoch = self._epoch(conn)
+        for diff_sha256 in diffs:
+            ledger_record(conn, "blocked", diff_sha256, epoch)
+            ledger_revoke(conn, "human_approved", diff_sha256)
+        return [diff_sha256 for diff_sha256 in diffs if self._block_ship_log(conn, diff_sha256)]
+
+    def _start_epoch(self, conn: sqlite3.Connection) -> None:
+        """A new task epoch: unblocked, with fresh quiz attempts; any question still open is superseded."""
+        meta_set(conn, META_TASK_EPOCH, str(self._epoch(conn) + 1))
+        meta_set(conn, META_BLOCKED_REASON, "")
+        conn.execute("UPDATE quizzes SET state = ? WHERE state = ?", (QUIZ_SUPERSEDED, QUIZ_OPEN))
+
+    def _release_failed(self, diff_sha256: str, error: WorkspaceError) -> None:
+        """A publish that failed revokes Lock 4: the human approves the same diff again, or rejects it."""
+        with self._lock(), self._write() as conn:
+            ledger_revoke(conn, "human_approved", diff_sha256)
+            log_event(conn, "release_failed", {"diff_sha256": diff_sha256, "error": error.payload.model_dump()})
 
     def _gate_locked(self, status: DeployGateStatus, expected: str, *, trees_identical: bool) -> WorkspaceError:
         if trees_identical:
             reason = "staging is identical to prod: there is nothing to deploy"
         elif status.blocked:
-            reason = "this diff is blocked for good (quiz exhausted or human rejection)"
+            why = BLOCK_MESSAGES[status.blocked_reason] if status.blocked_reason else "this diff was blocked"
+            reason = f"blocked ({why}): only a human reset or unblock lifts it, an edit of staging does not"
         else:
             reason = f"missing locks {', '.join(status.missing_locks)}"
             if not status.sha256_matches:
@@ -837,6 +987,7 @@ class SandboxWorkspace:
             details={
                 "missing_locks": status.missing_locks,
                 "blocked": status.blocked,
+                "blocked_reason": status.blocked_reason,
                 "trees_identical": trees_identical,
                 "diff_sha256": status.diff_sha256,
                 "expected_diff_sha256": expected,
@@ -888,9 +1039,15 @@ class SandboxWorkspace:
         raw = meta_get(conn, f"{META_RELEASE_PREFIX}{diff_sha256}") if diff_sha256 else None
         return ReleaseCommit.model_validate_json(raw) if raw else None
 
-    @staticmethod
-    def _graded_count(conn: sqlite3.Connection, diff_sha256: str) -> int:
-        return int(conn.execute(_GRADED_COUNT, (diff_sha256, QUIZ_PASSED, QUIZ_FAILED)).fetchone()[0])
+    def _graded_count(self, conn: sqlite3.Connection, epoch: int | None = None) -> int:
+        """Answers graded in a task epoch (default: the current one), whatever diff they were asked on."""
+        of_epoch = self._epoch(conn) if epoch is None else epoch
+        return int(conn.execute(_GRADED_COUNT, (of_epoch, QUIZ_PASSED, QUIZ_FAILED)).fetchone()[0])
+
+    def _graded_count_of_diff(self, conn: sqlite3.Connection, diff_sha256: str | None) -> int:
+        """Answers graded in the task epoch that last quizzed ``diff_sha256`` (0 when it never was)."""
+        row = conn.execute(_EPOCH_OF_DIFF, (diff_sha256,)).fetchone() if diff_sha256 else None
+        return 0 if row is None else self._graded_count(conn, int(row["epoch"]))
 
     @staticmethod
     def _ship_log_for_diff(conn: sqlite3.Connection, diff_sha256: str | None) -> ShipLogEntry | None:
