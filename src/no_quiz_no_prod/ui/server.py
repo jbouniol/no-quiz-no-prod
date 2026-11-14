@@ -25,7 +25,7 @@ import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from no_quiz_no_prod import __version__
 from no_quiz_no_prod.backend.errors import WorkspaceError
@@ -40,6 +40,7 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_SEED,
     DEFAULT_USER_ID,
     ENV_FILE,
+    ERROR_STOP_REASONS,
     NOTION_IDS_FILE,
     PROJECT_ROOT,
     RELEASE_RETRY_CODES,
@@ -300,14 +301,6 @@ _PROVIDER_ALIASES: Final[dict[str, ApiKeyProvider]] = {
 }
 
 
-def _check_release_remote_url(url: str) -> None:
-    """Validate a release remote URL before it is written (same rules as the deploy); never echoes the URL."""
-    try:
-        GitReleasePublisher(RuntimeSettings(git_remote_url=url)).resolve_remote()
-    except WorkspaceError as error:
-        raise ValueError(error.payload.message) from None
-
-
 class ApiKeyUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -330,12 +323,6 @@ class ApiKeyUpdateRequest(BaseModel):
         if "\n" in cleaned or "\r" in cleaned or "\x00" in cleaned:
             raise ValueError("API key must be a single-line token.")
         return cleaned
-
-    @model_validator(mode="after")
-    def _validate_release_remote(self) -> ApiKeyUpdateRequest:
-        if self.provider == "git_remote":
-            _check_release_remote_url(self.api_key)
-        return self
 
 
 def _format_env_assignment(var_name: str, secret_value: str) -> str:
@@ -688,7 +675,7 @@ class StudioManager:
         model = model_hint or saved.get("model") or str(catalogue["default_model"])
         saved_topo = saved.get("topology")
         topology: Topology = (
-            topology_hint if topology_hint is not None else (saved_topo if saved_topo in ("dual", "single") else "dual")
+            topology_hint if topology_hint is not None else ("single" if saved_topo == "single" else "dual")
         )
         return model, topology
 
@@ -1011,13 +998,17 @@ def create_app(
         except ValidationError as exc:
             first_msg = exc.errors()[0].get("msg", "Invalid API key update request.") if exc.errors() else "Invalid."
             return _error_response("invalid_argument", str(first_msg))
-        if req.provider == "git_remote" and not req.confirm_remote_change:
-            return _error_response(
-                "invalid_argument",
-                "Changing the release remote redirects every later deploy: "
-                "resend with confirm_remote_change=true to confirm.",
-                confirmation_required=True,
-            )
+        if req.provider == "git_remote":
+            # Validate against the configured allowed hosts (not defaults); WorkspaceError -> 422 invalid_argument.
+            candidate = manager.settings.model_copy(update={"git_remote_url": req.api_key})
+            GitReleasePublisher(candidate).resolve_remote()
+            if not req.confirm_remote_change:
+                return _error_response(
+                    "invalid_argument",
+                    "Changing the release remote redirects every later deploy: "
+                    "resend with confirm_remote_change=true to confirm.",
+                    confirmation_required=True,
+                )
 
         # Settings are never swapped under a run, a quiz answer or a deploy (the remote least of all): 409 run_active.
         with manager.exclusive("settings"):
@@ -1213,14 +1204,14 @@ def create_app(
                 term_event = RunEvent.model_validate(
                     {**deferred_terminal.model_dump(), "seq": seq, "thread_id": thread_id}
                 )
-            elif outcome.stop_reason == "api_error":
+            elif outcome.stop_reason in ERROR_STOP_REASONS:
                 term_event = RunEvent(
                     type="run_error",
                     thread_id=thread_id,
                     seq=seq,
                     budget=outcome.budget,
-                    stop_reason="api_error",
-                    text=outcome.final_answer or "Upstream LLM provider error.",
+                    stop_reason=outcome.stop_reason,
+                    text=outcome.final_answer or "Workflow execution failed.",
                 )
             elif outcome.interrupt is not None:
                 term_event = RunEvent(

@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi import FastAPI
@@ -57,7 +58,13 @@ from no_quiz_no_prod.contracts import (
 )
 from no_quiz_no_prod.graph.workflow import ThreadStateError
 from no_quiz_no_prod.ui.security import SESSION_TOKEN_HEADER, allowed_hosts_from
-from no_quiz_no_prod.ui.server import STATIC_DIR, _load_notion_rules, create_app, same_origin_client_kwargs
+from no_quiz_no_prod.ui.server import (
+    STATIC_DIR,
+    StudioManager,
+    _load_notion_rules,
+    create_app,
+    same_origin_client_kwargs,
+)
 
 
 # ---- deterministic in-memory test doubles implementing #14 §4 & §5 --------------------------------------------------
@@ -541,6 +548,11 @@ class StubWorkflow:
 WorkflowBuilder = Callable[[StubSandboxWorkspace, Topology, str], StubWorkflow]
 
 
+def studio_of(client: TestClient) -> StudioManager:
+    app = cast(FastAPI, client.app)
+    return cast(StudioManager, app.state.studio)
+
+
 def page_client(app: FastAPI, **kwargs: object) -> TestClient:
     """An in-process client that sends what the Studio page sends: allowed Host, same Origin, session token."""
     return TestClient(app, **same_origin_client_kwargs(app), **kwargs)  # type: ignore[arg-type]
@@ -982,7 +994,7 @@ def _eval_run(run_id: str, *, deployed: bool, passed_quiz: bool = True, kind: st
     return EvalRunResult.from_run(
         scenario=ScenarioSpec(
             id=run_id,
-            kind=kind,  # type: ignore[arg-type]
+            kind=kind,
             task=f"task {run_id}",
             expect_state=ExpectedState(deployed=deployed),
         ),
@@ -1106,7 +1118,7 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
     diff_sha = client.get("/api/state?thread_id=thr_persist").json()["workspace"]["diff"]["diff_sha256"]
 
     # 2. Simulate a server restart / --reload by wiping in-memory StudioManager sessions!
-    client.app.state.studio.sessions.clear()
+    studio_of(client).sessions.clear()
 
     # 3. Unknown thread MUST return 409 gate_locked on both quiz and deploy — NEVER fake deployed: True!
     bad_quiz = client.post("/api/runs/unknown_thr_999/quiz", json={"selected_option": "A"})
@@ -1117,9 +1129,9 @@ def test_contract_only_stub_restart_resume_and_no_fake_deploy(
     resumed_quiz = client.post("/api/runs/thr_persist/quiz", json={"selected_option": "A"})
     assert resumed_quiz.status_code == 200
     assert resumed_quiz.json()["grade"]["passed"] is True
-    assert client.app.state.studio.sessions["thr_persist"].topology == "single"
+    assert studio_of(client).sessions["thr_persist"].topology == "single"
 
-    client.app.state.studio.sessions.clear()
+    studio_of(client).sessions.clear()
     fake_deploy = client.post(
         "/api/runs/unknown_thr_999/deploy",
         json={"action": "approve", "expected_diff_sha256": diff_sha},
@@ -1233,7 +1245,7 @@ def test_post_apikey_updates_temp_env_0600_without_leaking_secrets(
     studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
 ) -> None:
     client, _, _ = studio_env
-    env_file: Path = client.app.state.studio.env_file
+    env_file: Path = studio_of(client).env_file
 
     # Seed isolated temp .env with comments & unrelated keys to verify non-destructive upsert
     env_file.write_text(
@@ -1323,7 +1335,7 @@ def test_git_remote_status_and_write_only_github_settings(
     studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
 ) -> None:
     client, _, _ = studio_env
-    studio = client.app.state.studio
+    studio = studio_of(client)
     env_file: Path = studio.env_file
     token = "ghp_TESTONLYstudiotoken0123456789abcdef"
     url = "https://github.com/acme/fintech-release.git"
@@ -1366,7 +1378,11 @@ def test_git_remote_status_and_write_only_github_settings(
     assert (env_file.stat().st_mode & 0o777) == 0o600
     lines = env_file.read_text(encoding="utf-8").splitlines()
     assert f"NO_QUIZ_GITHUB_TOKEN={token}" in lines and f"NO_QUIZ_GIT_REMOTE_URL={url}" in lines
-    assert studio.settings.github_token.get_secret_value() == token and studio.settings.git_remote_url == url
+    assert (
+        studio.settings.github_token is not None
+        and studio.settings.github_token.get_secret_value() == token
+        and studio.settings.git_remote_url == url
+    )
     health, state = client.get("/api/health"), client.get("/api/state")
     assert health.json()["git"] == github_view and state.json()["git"] == github_view
     assert token not in health.text and token not in state.text and url not in health.text
@@ -1471,13 +1487,20 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
             prod_before = compute_tree_sha256(settings.area_dir("prod"))
             approve = {"action": "approve", "expected_diff_sha256": diff_sha, "reason": "ship"}
 
-            # 1. The push fails: typed, retryable 409, prod untouched, all 4 locks still hold, the failed step shown
+            # 1. The push fails (C8): typed, retryable 409; prod untouched; human_approved is REVOKED and the thread
+            # pauses on a release_retry interrupt with pending_release.
             failed = client.post("/api/runs/thr_push/deploy", json=approve)
             responses.append(failed.text)
             assert failed.status_code == 409, failed.text
             body = failed.json()
             assert body["deployed"] is False and body["code"] == "upstream_error" and body["retryable"] is True
-            assert body["locks"]["can_deploy"] is True and body["missing_locks"] == []
+            assert body["stop_reason"] is None
+            assert body["interrupt"]["kind"] == "release_retry"
+            assert body["pending_release"]["expected_diff_sha256"] == diff_sha
+            assert body["locks"]["human_approved"] is False
+            assert body["locks"]["ready_for_approval"] is True
+            assert body["locks"]["can_deploy"] is False
+            assert body["missing_locks"] == ["human_approved"]
             assert [(step["agent"], step["tool"]) for step in body["trace"]] == [
                 ("human", "submit_deploy_decision"),
                 ("system", "deploy_to_production"),
@@ -1486,10 +1509,13 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
             assert compute_tree_sha256(settings.area_dir("prod")) == prod_before
             state = client.get("/api/state", params={"thread_id": "thr_push"})
             responses.append(state.text)
-            assert state.json()["active_run"]["ship_log"]["status"] != "Deployed to Prod"
-            assert state.json()["active_run"]["locks"]["can_deploy"] is True  # the UI keeps "Approve & Deploy"
+            active = state.json()["active_run"]
+            assert active["ship_log"]["status"] != "Deployed to Prod"
+            assert active["locks"]["ready_for_approval"] is True
+            assert active["interrupt"]["kind"] == "release_retry"
+            assert active["pending_release"]["expected_diff_sha256"] == diff_sha
 
-            # 2. The remote comes back: the very same request (endpoint, diff) now deploys and pushes
+            # 2. The remote comes back: a fresh approval of the same diff retries and deploys
             _release_git("init", "--quiet", "--bare", str(remote))
             retried = client.post("/api/runs/thr_push/deploy", json=approve)
             responses.append(retried.text)
@@ -1611,7 +1637,7 @@ class BlockingWorkflow(StubWorkflow):
     started = threading.Event()
     release = threading.Event()
 
-    def start_run(self, task: str, **kwargs: object) -> StubWorkflowOutcome:  # type: ignore[override]
+    def start_run(self, task: str, **kwargs: object) -> StubWorkflowOutcome:
         self.started.set()
         assert self.release.wait(timeout=30), "the test never released the run"
         return super().start_run(task, **kwargs)  # type: ignore[arg-type]
@@ -1716,10 +1742,12 @@ def test_deploy_decision_without_expected_diff_is_refused_and_reaches_no_workflo
 class BrokenWorkflow(StubWorkflow):
     """Infrastructure failures of the harness (not gate refusals)."""
 
-    def submit_quiz(self, thread_id: str, answer: QuizAnswer, **kwargs: object):  # type: ignore[override,no-untyped-def]
+    def submit_quiz(
+        self, thread_id: str, answer: QuizAnswer, **kwargs: object
+    ) -> tuple[QuizGradeResult, StubWorkflowOutcome]:
         raise RuntimeError("checkpoint store unreachable")
 
-    def submit_deploy_decision(self, thread_id: str, decision: DeployDecision, **kwargs: object):  # type: ignore[override,no-untyped-def]
+    def submit_deploy_decision(self, thread_id: str, decision: DeployDecision, **kwargs: object) -> StubWorkflowOutcome:
         raise RuntimeError("checkpoint store unreachable")
 
 
@@ -1748,3 +1776,171 @@ def test_infrastructure_errors_are_not_reported_as_a_locked_gate(tmp_path: Path)
     assert unknown_seed.json()["code"] == "invalid_argument" and "does-not-exist" in unknown_seed.json()["message"]
     traversal = page_client(real).post("/api/reset", json={"seed": "../../etc"})
     assert traversal.status_code == 422 and traversal.json()["code"] == "invalid_argument"
+
+
+def test_reject_after_failed_push_blocks_epoch_and_keeps_prod_untouched(tmp_path: Path) -> None:
+    """UI-38D / C8: after a failed push, the human can reject the retry and permanently block the epoch."""
+    from no_quiz_no_prod.backend import SandboxWorkspace
+    from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
+
+    remote = tmp_path / "missing_remote.git"  # not initialised -> push fails with upstream_error
+    settings = RuntimeSettings(workspace_dir=tmp_path / "workspace", git_remote_url=str(remote))
+    doc = "## Technical Feature Documentation\nDecimal cents (RULE-001).\n\n## Pedagogical Lesson\nHalf-up ties."
+    llm = ScriptedLLM(
+        coder=[
+            turn(call("search_notion_rules", query="VAT rounding Decimal")),
+            turn(call("read_notion_rule", rule_code="RULE-001")),
+            turn(call("read_code_file", path="orders.py")),
+            turn(call("write_staging_file", path="orders.py", content=FIXED_FINTECH_ORDERS)),
+            turn(call("run_staging_tests")),
+            turn(text="STATUS: DONE\nStaging green."),
+        ],
+        examiner=[
+            turn(
+                call(
+                    "upsert_ship_log_doc",
+                    title="Decimal ROUND_HALF_UP totals in orders.py",
+                    doc_markdown=doc,
+                    changed_files=["orders.py"],
+                    applied_rules=["RULE-001"],
+                    targeted_weaknesses=["decimal_rounding"],
+                )
+            ),
+            turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
+            turn(text="STATUS: DONE\nQuiz ready."),
+        ],
+    )
+    workflows: list[NoQuizWorkflow] = []
+
+    def workflow_factory(run_settings: RuntimeSettings, topology: Topology, model: str) -> NoQuizWorkflow:
+        workflow = NoQuizWorkflow(
+            settings=run_settings,
+            llm_client=llm,  # type: ignore[arg-type]
+            topology=topology,
+            model=model,
+            mcp_transport="inprocess",
+            sleep=lambda _seconds: None,
+        )
+        workflows.append(workflow)
+        return workflow
+
+    app = create_app(
+        settings=settings,
+        workspace=SandboxWorkspace(settings),
+        workflow_factory=workflow_factory,
+        eval_dir=tmp_path / "eval",
+        env_file=tmp_path / ".env",
+    )
+    try:
+        with page_client(app) as client:
+            client.post("/api/reset", json={"user_id": DEFAULT_USER_ID, "reset_skill_memory": True})
+            client.post(
+                "/api/runs/stream",
+                json={"prompt": "Fix VAT rounding.", "thread_id": "thr_rej_push", "model": SCRIPTED_MODEL},
+            )
+            quiz = client.post("/api/runs/thr_rej_push/quiz", json={"selected_option": "A"})
+            diff_sha = quiz.json()["locks"]["diff_sha256"]
+            prod_before = compute_tree_sha256(settings.area_dir("prod"))
+
+            failed = client.post(
+                "/api/runs/thr_rej_push/deploy",
+                json={"action": "approve", "expected_diff_sha256": diff_sha, "reason": "ship"},
+            )
+            assert failed.status_code == 409 and failed.json()["interrupt"]["kind"] == "release_retry"
+
+            rejected = client.post(
+                "/api/runs/thr_rej_push/deploy",
+                json={"action": "reject", "expected_diff_sha256": diff_sha, "reason": "abort after push error"},
+            )
+            assert rejected.status_code == 200, rejected.text
+            rej_body = rejected.json()
+            assert rej_body["deployed"] is False
+            assert rej_body["stop_reason"] == "human_rejected"
+            assert rej_body["locks"]["blocked"] is True
+            assert rej_body["locks"]["blocked_reason"] == "human_rejected"
+            assert rej_body["ship_log"]["status"] == "Blocked"
+            assert compute_tree_sha256(settings.area_dir("prod")) == prod_before
+
+            state = client.get("/api/state", params={"thread_id": "thr_rej_push"}).json()
+            assert state["active_run"]["pending_release"] is None
+            assert state["active_run"]["stop_reason"] == "human_rejected"
+
+            # Subsequent approve on the blocked epoch must fail with 409 gate_locked.
+            blocked_approve = client.post(
+                "/api/runs/thr_rej_push/deploy",
+                json={"action": "approve", "expected_diff_sha256": diff_sha},
+            )
+            assert blocked_approve.status_code == 409 and blocked_approve.json()["code"] == "gate_locked"
+    finally:
+        for workflow in workflows:
+            workflow.close()
+
+
+def test_non_github_https_remote_allow_list_and_secret_free_view(tmp_path: Path) -> None:
+    """UI-43D / UI-36D: an allow-listed non-GitHub https remote works and hides URL/token; unallowed hosts fail 422."""
+    env_file = tmp_path / ".env"
+    token = "glpat_TESTONLY_non_github_token_12345"
+    corp_url = "https://git.corp.example/fintech/orders.git"
+    settings = RuntimeSettings(
+        workspace_dir=tmp_path / "ws",
+        git_allowed_hosts=("github.com", "git.corp.example"),
+        github_token=SecretStr(token),
+    )
+    app = create_app(
+        settings=settings,
+        workspace=StubSandboxWorkspace(settings),
+        eval_dir=tmp_path / "eval",
+        env_file=env_file,
+    )
+    client = page_client(app)
+
+    # Disallowed host is still refused with 422 invalid_argument
+    disallowed = client.post(
+        "/api/apikey",
+        json={"provider": "git_remote", "api_key": "https://evil.example/repo.git", "confirm_remote_change": True},
+    )
+    assert disallowed.status_code == 422 and disallowed.json()["code"] == "invalid_argument"
+    assert "evil.example" not in disallowed.text
+
+    # Allow-listed non-GitHub https remote is accepted with confirm_remote_change=True; repo stays None
+    allowed = client.post(
+        "/api/apikey",
+        json={"provider": "git_remote", "api_key": corp_url, "confirm_remote_change": True},
+    )
+    assert allowed.status_code == 200, allowed.text
+    expected_git = {"remote_kind": "https", "repo": None, "branch": "main", "token_set": True}
+    assert allowed.json()["git"] == expected_git
+    assert corp_url not in allowed.text and token not in allowed.text
+
+    for path in ("/api/health", "/api/state"):
+        resp = client.get(path)
+        assert resp.status_code == 200 and resp.json()["git"] == expected_git
+        assert corp_url not in resp.text and token not in resp.text
+
+
+def test_run_stream_validates_release_config_before_starting_workflow(tmp_path: Path) -> None:
+    """Action 23: an invalid release configuration is rejected at run start before any LLM/workflow call."""
+    settings = RuntimeSettings(
+        workspace_dir=tmp_path / "ws",
+        git_remote_url="https://github.com/acme/fintech.git",
+        github_token=None,  # https remote without a token
+    )
+    called: list[str] = []
+
+    def never_called(_cfg: RuntimeSettings, _topo: Topology, _model: str) -> StubWorkflow:
+        called.append("started")
+        return StubWorkflow(StubSandboxWorkspace(settings))
+
+    app = create_app(
+        settings=settings,
+        workspace=StubSandboxWorkspace(settings),
+        workflow_factory=never_called,
+        eval_dir=tmp_path / "eval",
+        env_file=tmp_path / ".env",
+    )
+    client = page_client(app)
+    resp = client.post("/api/runs/stream", json={"prompt": "Fix VAT rounding.", "thread_id": "thr_cfg_err"})
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "invalid_argument"
+    assert called == []
+    assert studio_of(client).busy is None

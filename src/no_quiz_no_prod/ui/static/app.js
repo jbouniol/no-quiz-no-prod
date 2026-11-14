@@ -732,12 +732,14 @@ function renderHeaderControls() {
     hubDot.classList.toggle("is-live", Boolean(store.notion?.notion_enabled));
   }
 
-  // Release remote pill (same component as the Notion Hub pill): GitHub once an https remote and a token are set
-  const isGithubRemote = store.git?.remote_kind === "https" && Boolean(store.git?.token_set);
+  // Release remote pill: GitHub link when a github.com repo is configured, HTTPS label for other allow-listed hosts.
+  const isHttpsRemote = store.git?.remote_kind === "https";
+  const isGithubRepo = isHttpsRemote && Boolean(store.git?.repo);
+  const hasRemoteReady = isHttpsRemote && Boolean(store.git?.token_set);
   const repoLink = $("link-github-repo");
-  repoLink.href = isGithubRemote && store.git.repo ? sanitizeHref(`https://github.com/${store.git.repo}`) || "#" : "#";
-  $("github-repo-label").textContent = isGithubRemote ? "GitHub" : "Local remote";
-  $("github-repo-dot").classList.toggle("is-live", isGithubRemote);
+  repoLink.href = isGithubRepo ? sanitizeHref(`https://github.com/${store.git.repo}`) || "#" : "#";
+  $("github-repo-label").textContent = isGithubRepo ? "GitHub" : isHttpsRemote ? "HTTPS remote" : "Local remote";
+  $("github-repo-dot").classList.toggle("is-live", hasRemoteReady);
 
   renderApiPopoverState();
   window.requestAnimationFrame(updateModeGlider);
@@ -1146,7 +1148,7 @@ function renderQuizPanel() {
 
   const optionKeys = ["A", "B", "C", "D"];
   const optionsDisabled =
-    store.isSubmittingQuiz || isPassed || isBlocked || awaitingProceedV2;
+    store.isSubmittingQuiz || isPassed || isBlocked || awaitingProceedV2 || isWorkspaceBusy();
 
   const optionsHtml = optionKeys
     .map((key, idx) => {
@@ -1228,7 +1230,7 @@ function renderQuizPanel() {
     `<div class="quiz-stem">${renderInlineMarkdown(quiz.stem)}</div>` +
     `<div class="quiz-options">${optionsHtml}</div>` +
     (!submitHidden
-      ? `<button type="button" id="btn-submit-quiz" class="btn-quiz-submit" ${!store.selectedQuizOption || store.isSubmittingQuiz ? "disabled" : ""}>` +
+      ? `<button type="button" id="btn-submit-quiz" class="btn-quiz-submit" ${!store.selectedQuizOption || store.isSubmittingQuiz || isWorkspaceBusy() ? "disabled" : ""}>` +
           `${store.isSubmittingQuiz ? "Verifying server-side…" : "Verify Answer (↵)"}` +
         `</button>`
       : "") +
@@ -1314,11 +1316,11 @@ function renderDeployPanel() {
     footerHtml =
       pendingHtml +
       `<div class="deploy-actions">` +
-        `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
+        `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
           `${svgIcon(pending ? "retry" : "check", 13)}` +
           `<span>${store.isSubmittingDeploy ? "Deploying…" : pending ? "Approve & Retry Push" : "Approve & Deploy"}</span>` +
         `</button>` +
-        `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
+        `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
           `Reject` +
         `</button>` +
       `</div>` +
@@ -1512,9 +1514,11 @@ function appendAgentTurnToFeed({ text, stopReason, interrupt, isError = false })
   if (isClarify) {
     badgeHtml = `<span class="pill" data-status="Staging"><span class="pill__dot"></span><span>clarification_needed · zero mutation</span></span>`;
   } else if (isError) {
-    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>runtime_error</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>${escapeHtml(stopReason || "runtime_error")}</span></span>`;
   } else if (interrupt?.kind === "quiz") {
     badgeHtml = `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>hitl_pause · quiz_gate</span></span>`;
+  } else if (interrupt?.kind === "release_retry") {
+    badgeHtml = `<span class="pill" data-status="Remediation v2"><span class="pill__dot"></span><span>hitl_pause · push_retry</span></span>`;
   } else if (interrupt?.kind === "deploy_approval") {
     badgeHtml = `<span class="pill" data-status="Deployed to Prod"><span class="pill__dot"></span><span>hitl_pause · signoff_ready</span></span>`;
   }
@@ -1615,12 +1619,13 @@ function handleRunEvent(ev) {
   }
 
   if (ev.type === "run_error") {
-    store.stopReason = "api_error";
+    const reason = ev.stop_reason || "api_error";
+    store.stopReason = reason;
     store.interrupt = null;
     triggerAuraWave("shield");
     appendAgentTurnToFeed({
       text: ev.text || "Upstream provider error.",
-      stopReason: "api_error",
+      stopReason: reason,
       interrupt: null,
       isError: true,
     });
@@ -2659,9 +2664,11 @@ function bindEvents() {
   $("link-github-repo").addEventListener("click", (ev) => {
     if ($("link-github-repo").getAttribute("href") === "#") {
       ev.preventDefault();
-      showToast(
-        `Deploys commit + push to ${store.git?.branch || "main"} on the workspace's local bare remote (set NO_QUIZ_GIT_REMOTE_URL and NO_QUIZ_GITHUB_TOKEN to push to GitHub).`
-      );
+      const targetMsg =
+        store.git?.remote_kind === "https"
+          ? `Deploys commit + push to ${store.git?.branch || "main"} on the configured HTTPS release remote.`
+          : `Deploys commit + push to ${store.git?.branch || "main"} on the workspace's local bare remote (set NO_QUIZ_GIT_REMOTE_URL and NO_QUIZ_GITHUB_TOKEN to push to GitHub).`;
+      showToast(targetMsg);
     }
   });
 
