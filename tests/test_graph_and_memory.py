@@ -112,6 +112,7 @@ class FakeBackend:
         self.root = root
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.skills: dict[tuple[str, str], SkillProfileRecord] = {}
+        self.push_failures = 0  # deploy_to_production calls that fail like an unreachable release remote
         self.reset()
 
     # -- SandboxWorkspace harness API (#14 §4) ------------------------------------------------------------------------
@@ -352,6 +353,9 @@ class FakeBackend:
             raise ToolCallError(
                 ToolErrorPayload(code="gate_locked", message=message, details={"missing_locks": status.missing_locks})
             )
+        if self.push_failures > 0:  # the git push of the release fails: nothing is promoted or recorded
+            self.push_failures -= 1
+            raise ToolCallError(ToolErrorPayload(code="upstream_error", message="git push (release remote) failed"))
         shutil.copytree(self.root / "staging", self.root / "prod", dirs_exist_ok=True)
         self.ledger = self.ledger.record("deployed", diff.diff_sha256)
         for thread_id, entry in list(self.ship_logs.items()):
@@ -585,6 +589,38 @@ def test_exhausted_quiz_blocks_and_never_deploys(tmp_path: Path, backend: FakeBa
     assert result.stop_reason == "quiz_failed" and result.final_state.ship_log_status == "Blocked"
     assert "deploy_to_production" not in tools_called(backend)
     assert backend.ledger.blocked and not backend.ledger.deployed
+
+
+def test_a_failed_push_is_retried_by_a_new_approval_of_the_same_diff(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "D")))
+    workflow.start_run(TASK, thread_id="t-push")
+    _grade, gated = workflow.submit_quiz("t-push", QuizAnswer(selected_option="D"))
+    assert gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
+    backend.push_failures = 1
+
+    failed = workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", reason="ship it"))
+    assert failed.stop_reason == "refused" and failed.interrupt is None and not failed.final_state.deployed
+    assert failed.trace[-1].tool == "deploy_to_production" and failed.trace[-1].error is not None
+    assert failed.trace[-1].error.code == "upstream_error" and not backend.ledger.deployed
+    status = backend.get_gate_status()
+    assert status.can_deploy and not status.blocked  # all 4 locks still hold for the same diff
+    with pytest.raises(ValueError, match="only retry the deploy"):  # a retry never ships another diff
+        workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", expected_diff_sha256="f" * 64))
+
+    done = workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", reason="retry"))
+    assert done.stop_reason == "completed" and done.interrupt is None and done.final_state.deployed
+    assert [(entry.agent, entry.tool) for entry in done.trace[-4:]] == [
+        ("human", "submit_deploy_decision"),
+        ("system", "deploy_to_production"),
+        ("human", "submit_deploy_decision"),
+        ("system", "deploy_to_production"),
+    ]
+    first, retry = (entry for entry in done.trace if entry.tool == "deploy_to_production")
+    assert retry.error is None and retry.args == first.args and retry.idempotency_key == first.idempotency_key
+    assert [entry.step for entry in done.trace] == list(range(1, len(done.trace) + 1))
+    assert tools_called(backend).count("deploy_to_production") == 2
+    with pytest.raises(ValueError, match="not waiting for a deploy decision"):  # a deployed thread has nothing left
+        workflow.submit_deploy_decision("t-push", DeployDecision(action="approve"))
 
 
 def test_human_rejection_blocks_and_never_deploys(tmp_path: Path, backend: FakeBackend) -> None:

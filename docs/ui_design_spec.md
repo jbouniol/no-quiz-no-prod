@@ -110,6 +110,10 @@ src/no_quiz_no_prod/ui/
    - `<a href="..." target="_blank" rel="noopener noreferrer" class="notion-hub-pill">Open Notion Hub ↗</a>`
    - Hydrated from `GET /api/state -> notion.hub_url` (loaded server-side from `docs/notion_workspace_ids.json`).
    - Displays subtle live green dot when Notion workspace IDs/sync are active, or warm stone dot (`Local Seed Mirror`) with click modal/link if offline.
+5. **GitHub Release Remote Section** (inside `#api-popover`, modeled exactly on the Notion section, no new component):
+   - A 4th `.api-tab` **`GitHub`** (`data-key-provider="github"`) beside `OpenRouter` / `Anthropic` / `Notion`.
+   - Two write-only `.api-key-form` rows: `NO_QUIZ_GIT_REMOTE_URL` (`#git-remote-form`, `POST /api/apikey` with `provider: "git_remote"`, placeholder = `https://github.com/<git.repo>.git` when known) above `NO_QUIZ_GITHUB_TOKEN` (the shared `#api-key-form`, `provider: "github"`). Inputs are cleared after save and never prefilled.
+   - A second `.notion-hub-pill` (`#link-github-repo`) under the Notion one: live dot + **`GitHub`** (links `https://github.com/<git.repo>`) when `git.remote_kind === "https"` and `git.token_set`, otherwise stone dot + **`Local remote`** (click shows a toast instead of navigating).
 
 ---
 
@@ -191,6 +195,7 @@ Scrollable vertical timeline (`padding: var(--space-3); gap: var(--space-2-5); o
    - **Conditional Sub-Badges Row** (rendered on the card header whenever present):
      - **Retry & Idempotency Badge**: when `step.attempts > 1` or `step.idempotency_key` is set: `↻ Retry ${step.attempts - 1} · idem:${step.idempotency_key}` (+ `replayed` tag when `step.replayed === true`, `--status-staging-bg` amber pill proving idempotent write protection).
      - **Adversarial Containment Badge**: when `step.contains_injection === true`: `🛡️ Injection Contained` (showing untrusted tool result carried planted hostile text that the agent safely ignored).
+     - **Release Badge** (`step.tool === "deploy_to_production"` only): `pushed · <sha7>` from `step.result.release.commit_sha` in the same `.pill[data-status="Staging"]` as the `idem:` badge (`already pushed · <sha7>` when `release.pushed === false`: a retried deploy the remote already held), or the typed push error `step.error.code` (`conflict` / `upstream_error` / `timeout`, or `gate_locked`) in the `.pill[data-status="Blocked"]` error style.
    - **Expanded Drawer (`.step-card__body`)**:
      - Clean `--bg-code` monospace inspector showing formatted JSON `args`, `idempotency_key`, `replayed`, and truncated `result` (with `"Show all"` toggle if `> 600` chars). If `step.error` (`ToolErrorPayload`) is present, highlights `error.code`, `error.message`, `error.retryable`, `error.outcome_unknown`, and `error.details`.
 3. **Agent Final / Clarification Turn Card**:
@@ -256,6 +261,7 @@ Renders the live `ShipLogEntry` synchronized with Notion Database 2 (`Feature Sh
    - **`Applied Rules`**: Relational rule chips (`RULE-001 · Monetary Precision`, `RULE-004 · Staging Pytest`) — hovering or clicking expands a concise inline popover of that rule's invariant from `NotionRule`
    - **`Quiz Attempts`**: `tabular-nums` (`0 / 2`, `1 / 2`, `2 / 2`) + `Diff SHA-256` (`12-char` mono badge)
    - **`Notion URL`**: Clickable truncated link (`notion.so/…`) + sync mode indicator (`Live Notion MCP` vs `Local Seed Fallback`)
+   - **`commit`** (only once `release_commit_sha` is set): `commit:<sha7>` in the same `.mono-chip` as the `sha:` chip, an `<a target="_blank" rel="noopener noreferrer">` to `release_commit_url` when the remote is on GitHub, else click-to-copy.
 4. **Animated v2 Remediation Callout** (`.remediation-callout`):
    - **Visibility**: Rendered prominently above the documentation body whenever `doc_version === "v2"` (or `remediation_callout` field is non-empty).
    - **Visuals & Animation**:
@@ -323,11 +329,13 @@ This panel makes the **irreversible backend promotion** (`staging/ → prod/`) c
   - **When `!locks.ready_for_approval` (Locks 1–3 are NOT all satisfied or `locks.blocked === true`)**:
     - Primary button `<button disabled class="btn-deploy btn-deploy--locked">🔒 Approve & Deploy to Production</button>` (`background: var(--action-locked-bg); color: var(--action-locked-fg); border: 1px solid var(--action-locked-border); cursor: not-allowed`).
     - Helper caption dynamically inspects `locks.missing_locks[0]` (or `locks.blocked`) to name the exact next required step (e.g., `"tests_passed"` → *"Run green staging pytest first"*; `"quiz_passed"` → *"Complete Quiz Gate above to unlock production promotion."*).
-  - **When `locks.ready_for_approval === true` (Locks 1–3 hold, `missing_locks == ["human_approved"]`)**:
+  - **When `locks.ready_for_approval === true` (Locks 1–3 hold, `missing_locks == ["human_approved"]`) — or `locks.can_deploy === true` after a failed push (all 4 locks still hold)**:
     - Primary button `<button class="btn-deploy btn-deploy--ready">✓ Approve & Deploy to Production</button>` (`background: var(--action-deploy-bg); color: var(--ink-on-accent); box-shadow: var(--shadow-deploy-ready); transition: all var(--transition-base)`). Sends `DeployDecision` (`{"action": "approve", "expected_diff_sha256": locks.diff_sha256, "reason": "..."}`).
     - Secondary outline button `<button class="btn-reject">Reject</button>` (sends `{"action": "reject", "expected_diff_sha256": locks.diff_sha256, "reason": "Rejected by reviewer"}` to `POST /api/runs/{thread_id}/deploy`, setting `StopReason = "human_rejected"`, `locks.blocked = true`, and leaving `prod/` untouched!).
+    - Secondary caption under the buttons (`.kpi-card__sub`): `commit + push to <git.branch>` (from `/api/state -> git.branch`). The button label is unchanged.
+  - **When the push fails** (`409` with `code` in `conflict` / `upstream_error` / `timeout` and `retryable: true`): nothing was deployed (`prod/`, ledger and Ship Log untouched) and all 4 locks still hold, so `locks.can_deploy === true` keeps **`Approve & Deploy`** enabled. The response's `trace` (human sign-off + failed `deploy_to_production` row with its error badge) is appended to the step feed and a toast names the error code. Clicking the same button again sends the same request (same endpoint, same `expected_diff_sha256`): the workflow re-runs that very deploy (same arguments, same idempotency key). No new button.
   - **When Deployed (`ship_log.status === "Deployed to Prod"`)**:
-    - Emerald receipt banner showing `deployed_at` ISO timestamp + verified `prod_tree_sha256 === staging_tree_sha256` digest!
+    - Emerald receipt banner (`.deploy-receipt`): `Deployed to prod/`, then the release commit (`<sha7>` in a click-to-copy `.mono-chip`) followed by **`View on GitHub ↗`** (`target="_blank" rel="noopener noreferrer"`, from `ship_log.release_commit_url`) or the text `local remote`, then the verified `prod_tree_sha256` digest.
 
 #### Section C: Developer Skill Profile — Layer 4 Long-Term Memory (`#memory-panel`)
 
@@ -408,7 +416,7 @@ Compact editorial card comparing `(model, topology)` cohorts aggregated across `
 - **Full Trace Replay Inspector (Right Slide-Over Drawer `width: min(680px, 92vw)` or Split View)**:
   - Header: `run.key` (`id#repeat`), `kind` pill, `outcome` pill (`[data-outcome]`), `why` diagnostic summary banner, and `[ Load Prompt in Live Studio ↗ ]` button.
   - **Tab A — Step-by-Step Tool Call Timeline (`trace: list[ToolCallTrace]`)**: Renders the exact same `.step-card` component used in Mode 1 (DRY reuse!) showing `agent`, `server`, `tool`, `args`, `result`, `error`, `latency_s`, `attempts`, `idempotency_key`, `replayed`, `contains_injection`, and `forbidden_called` highlight!
-  - **Tab B — Backend Final State Proof (`final_state: RunFinalState`)**: Structured inspector showing `prod_tree_sha256`, `staging_tree_sha256`, `prod_changed`, `tests_passed`, `ship_log_created`, `ship_log_status`, `doc_version`, `quiz_attempts`, `quiz_passed`, `deployed`, `forbidden_called`, `hidden_failure`, and `final_answer`.
+  - **Tab B — Backend Final State Proof (`final_state: RunFinalState`)**: Structured inspector showing `prod_tree_sha256`, `staging_tree_sha256`, `prod_changed`, `tests_passed`, `ship_log_created`, `ship_log_status`, `doc_version`, `quiz_attempts`, `quiz_passed`, `deployed`, `pushed`, `release_commit_sha`, `forbidden_called`, `hidden_failure`, and `final_answer`.
 
 ---
 
@@ -429,9 +437,11 @@ Lightweight readiness probe for CLI, browser tests, and smoke verification (`Run
   "providers": {
     "openrouter": true,
     "anthropic": false
-  }
+  },
+  "git": { "remote_kind": "local", "repo": null, "branch": "main", "token_set": false }
 }
 ```
+*(`git` is the secret-free release remote view, also in `/api/state` and `/api/apikey`: `remote_kind` is `"https"` or `"local"`, `repo` is `<owner>/<repo>` for a github.com URL. The URL itself and the token are never returned.)*
 
 ### 5.2 `GET /api/state`
 Hydrates the entire Studio on initial page load and after any reset/deploy/quiz action. Workspace artifacts serialize `DiffReport` and `PytestReport | None` verbatim; gate locks serialize `DeployGateStatus` verbatim.
@@ -499,7 +509,8 @@ Hydrates the entire Studio on initial page load and after any reset/deploy/quiz 
       "can_deploy": false
     }
   },
-  "skill_profile": []
+  "skill_profile": [],
+  "git": { "remote_kind": "local", "repo": null, "branch": "main", "token_set": false }
 }
 ```
 *(Note: `diff.js` renders **both** `Unified` and `Split` views directly from `FileDiff.unified_diff` per `contracts.py` line 646! `notion.rules` serializes `list[NotionRule]`; `active_run.ship_log` serializes `ShipLogEntry | None`; `active_run.quiz` serializes `PublicQuizView | None` **strictly omitting `correct_option` and `explanation_by_option`**; `skill_profile` serializes all 6 `SkillProfileRecord` items.)*
@@ -712,9 +723,24 @@ Resumes the `deploy_approval` `HumanInterrupt` with `DeployDecision` (`action`, 
     "missing_locks": [],
     "ready_for_approval": false,
     "can_deploy": true
-  }
+  },
+  "trace": [ "...this decision's ToolCallTrace steps: human submit_deploy_decision, system deploy_to_production (result.release, commit_url)..." ]
 }
 ```
+*(`ship_log.release_commit_sha` / `ship_log.release_commit_url` name the pushed release commit; `release_commit_url` is `null` for a local remote.)*
+- **Response `409 Conflict` after a failed push** (the git push was refused or did not answer; nothing deployed, the 4 locks still hold):
+```json
+{
+  "deployed": false,
+  "code": "upstream_error",
+  "retryable": true,
+  "missing_locks": [],
+  "locks": { "...DeployGateStatus with can_deploy: true..." },
+  "trace": [ "...human sign-off + the failed deploy_to_production step (error.code)..." ],
+  "message": "The server-side gate refused the deployment: git ls-remote (...) failed with exit code 128."
+}
+```
+*(`code` is `conflict`, `upstream_error` or `timeout`. Posting the same approval again retries that deploy; a thread with no failed push to retry answers `409 gate_locked`.)*
 - **Response `409 Conflict` / `403 Forbidden` (if any server-side lock fails — e.g. drifted diff hash, unpassed quiz, or failed tests; mirrors `ToolErrorPayload` with `code="gate_locked"`)**:
 ```json
 {
@@ -815,7 +841,7 @@ Loads `eval/results.jsonl` (plus any companion comparison `.jsonl` files in `eva
 *(Graceful Empty State: If `eval/results.jsonl` has not been generated yet, return `"available": false, "runs": []` with HTTP `200 OK` — never `500` — and Mode 2 renders a clean command card showing `uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/` with a click-to-copy button.)*
 
 ### 5.9 `POST /api/apikey` (Write-Only `.env` Provider & Notion Key Configuration)
-Persists a runtime API key (`openrouter`, `anthropic`, or `notion`) atomically into `.env` with strict `0o600` permissions (preserving all comments and unrelated `.env` entries), refreshes `StudioManager.settings` in memory, and returns updated boolean availability flags. **Secrets are write-only and NEVER returned, logged, or echoed in error payloads.**
+Persists a runtime API key (`openrouter`, `anthropic`, `notion`, `github` = `NO_QUIZ_GITHUB_TOKEN`) or the release remote URL (`git_remote` = `NO_QUIZ_GIT_REMOTE_URL`, refused with `422` when it embeds credentials or is not `https://` / an absolute local path) atomically into `.env` with strict `0o600` permissions (preserving all comments and unrelated `.env` entries), refreshes `StudioManager.settings` in memory, and returns updated boolean availability flags. **Secrets are write-only and NEVER returned, logged, or echoed in error payloads.**
 
 - **Request Body**:
 ```json
@@ -835,7 +861,8 @@ Persists a runtime API key (`openrouter`, `anthropic`, or `notion`) atomically i
     "notion": false
   },
   "notion_enabled": false,
-  "models": { "...refreshed _build_models_catalogue(settings)..." }
+  "models": { "...refreshed _build_models_catalogue(settings)..." },
+  "git": { "remote_kind": "https", "repo": "owner/repo", "branch": "main", "token_set": true }
 }
 ```
 

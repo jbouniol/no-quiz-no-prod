@@ -325,6 +325,8 @@ _API_KEY_ENV_MAP: Final[dict[ApiKeyProvider, tuple[EnvVar, str]]] = {
     "git_remote": (EnvVar.NO_QUIZ_GIT_REMOTE_URL, "git_remote_url"),  # not a secret, but handled write-only too
 }
 _PLAIN_SETTINGS: Final = frozenset({"git_remote_url"})  # every other updatable setting is a SecretStr
+# deploy_to_production push errors (mirrors graph.workflow.RELEASE_RETRY_CODES; the UI also runs without the graph)
+_RELEASE_RETRY_CODES: Final = frozenset({"conflict", "upstream_error", "timeout"})
 # The env var names are accepted as provider aliases (e.g. "NO_QUIZ_GITHUB_TOKEN").
 _PROVIDER_ALIASES: Final[dict[str, ApiKeyProvider]] = {
     env_var.value: provider for provider, (env_var, _) in _API_KEY_ENV_MAP.items()
@@ -1427,6 +1429,7 @@ def create_app(
                 user_id=req.user_id,
             )
 
+        deploy_events: list[RunEvent] = []
         try:
             wf = manager.get_workflow_for_session(session)
             outcome = await _invoke_maybe_async(
@@ -1434,6 +1437,7 @@ def create_app(
                 thread_id,
                 decision,
                 user_id=req.user_id,
+                on_event=deploy_events.append,
             )
         except (KeyError, ValueError, RuntimeError) as exc:
             return JSONResponse(
@@ -1458,16 +1462,30 @@ def create_app(
             expected_sha in GateLedger.load(manager.settings.gate_ledger_path).deployed
         )
         deployed_ok = bool(outcome.final_state.deployed or ledger_proved)
+        # the steps of this decision (human sign-off, system deploy_to_production), for the Studio's step feed
+        step_traces = [ev.step.model_dump(mode="json") for ev in deploy_events if ev.type == "step" and ev.step]
 
         if decision.approved and not deployed_ok:
             post_locks = manager.workspace.get_gate_status(expected_diff_sha256=decision.expected_diff_sha256)
+            push_error = next(
+                (
+                    step["error"]
+                    for step in reversed(step_traces)
+                    if step["tool"] == "deploy_to_production" and step.get("error")
+                ),
+                None,
+            )
+            # a failed push leaves every lock in place: approving the same diff again retries that deploy
+            push_failed = push_error is not None and push_error["code"] in _RELEASE_RETRY_CODES
             return JSONResponse(
                 status_code=409,
                 content={
                     "deployed": False,
-                    "code": "gate_locked",
+                    "code": push_error["code"] if push_failed else "gate_locked",
+                    "retryable": push_failed and post_locks.can_deploy,
                     "missing_locks": list(post_locks.missing_locks),
                     "locks": post_locks.model_dump(mode="json"),
+                    "trace": step_traces,
                     "message": outcome.final_answer
                     or f"Server-side production gate rejected deployment for diff {post_locks.diff_sha256[:8]}.",
                 },
@@ -1509,6 +1527,7 @@ def create_app(
                 "deployed_at": deployed_at_iso,
                 "ship_log": ship_log.model_dump(mode="json") if ship_log else None,
                 "locks": final_locks.model_dump(mode="json"),
+                "trace": step_traces,
             },
         )
 

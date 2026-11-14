@@ -132,7 +132,27 @@
               <button type="button" class="api-tab" role="tab" aria-selected="false" data-key-provider="notion">
                 Notion
               </button>
+              <button type="button" class="api-tab" role="tab" aria-selected="false" data-key-provider="github">
+                GitHub
+              </button>
             </div>
+
+            <form id="git-remote-form" class="api-key-form" autocomplete="off" hidden>
+              <label for="git-remote-input" class="api-key-form__label">NO_QUIZ_GIT_REMOTE_URL</label>
+              <div class="api-key-form__row">
+                <input
+                  type="url"
+                  id="git-remote-input"
+                  class="api-key-form__input"
+                  placeholder="https://github.com/owner/repo.git"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button type="submit" id="btn-save-git-remote" class="btn-save-key">
+                  Save
+                </button>
+              </div>
+            </form>
 
             <form id="api-key-form" class="api-key-form" autocomplete="off">
               <label id="api-key-var-label" for="api-key-input" class="api-key-form__label">
@@ -176,6 +196,22 @@
                 <span class="notion-hub-pill__left">
                   <span id="notion-hub-dot" class="notion-hub-pill__dot" aria-hidden="true"></span>
                   <span id="notion-hub-label">Notion Hub</span>
+                </span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M7 17 17 7"></path>
+                  <path d="M7 7h10v10"></path>
+                </svg>
+              </a>
+              <a
+                id="link-github-repo"
+                href="#"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="notion-hub-pill"
+              >
+                <span class="notion-hub-pill__left">
+                  <span id="github-repo-dot" class="notion-hub-pill__dot" aria-hidden="true"></span>
+                  <span id="github-repo-label">Local remote</span>
                 </span>
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M7 17 17 7"></path>

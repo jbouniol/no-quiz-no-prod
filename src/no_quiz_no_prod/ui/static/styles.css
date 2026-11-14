@@ -205,7 +205,12 @@ kbd,
     color var(--transition-base);
 }
 
-button.mono-chip:hover {
+a.mono-chip {
+  text-decoration: none;
+}
+
+button.mono-chip:hover,
+a.mono-chip:hover {
   background: var(--bg-surface);
   border-color: var(--border-strong);
   color: var(--ink-primary);
@@ -529,7 +534,7 @@ button.mono-chip:hover {
 
 .api-popover__tabs {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 3px;
   padding: 3px;
   border-radius: var(--radius-sm);
@@ -629,6 +634,11 @@ button.mono-chip:hover {
   font-weight: var(--weight-medium);
   text-decoration: none;
   transition: background-color var(--transition-base), border-color var(--transition-base);
+}
+
+.notion-hub-pill + .notion-hub-pill,
+.api-key-form:not([hidden]) + .api-key-form {
+  margin-top: var(--space-2);
 }
 
 .notion-hub-pill:hover {
@@ -2594,6 +2604,10 @@ button.mono-chip:hover {
 
 .btn-deploy--ready:hover:not(:disabled) {
   background: var(--action-deploy-hover);
+}
+
+.deploy-actions__sub {
+  margin-top: var(--space-1-5);
 }
 
 .btn-reject {

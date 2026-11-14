@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,7 +14,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from testkit import parse_sse_events
+from pydantic import SecretStr
+from testkit import FIXED_FINTECH_ORDERS, SCRIPTED_MODEL, ScriptedLLM, call, parse_sse_events, turn
 
 from no_quiz_no_prod.cli import _cmd_init_notion, _cmd_reset, _cmd_run, build_parser
 from no_quiz_no_prod.contracts import (
@@ -626,6 +629,15 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     md_js = (STATIC_DIR / "markdown.js").read_text(encoding="utf-8")
     assert "escapeHtml" in diff_js and "&lt;" in diff_js
     assert "sanitizeHref" in md_js and "^https?:\\/\\/" in md_js
+
+    # Git release hooks: GitHub tab (remote URL + write-only token), release pill, receipt, step chip, Final State
+    for hook in ('data-key-provider="github"', 'id="git-remote-form"', 'id="link-github-repo"'):
+        assert hook in html_text, hook
+    assert 'id="git-remote-form" class="api-key-form"' in html_text and 'class="notion-hub-pill"' in html_text
+    for hook in ("commit + push to", "View on GitHub ↗", "local remote", "release_commit_url", '"pushed"'):
+        assert hook in app_js, hook
+    assert '["release_commit_sha", fs.release_commit_sha' in app_js and 'provider: "git_remote"' in app_js
+    assert app_js.count('target="_blank" rel="noopener noreferrer"') >= 3
 
 
 # ---- 2. Health, State Hydration & Workspace Seed Reset --------------------------------------------------------------
@@ -1251,3 +1263,148 @@ def test_git_remote_status_and_write_only_github_settings(
     health, state = client.get("/api/health"), client.get("/api/state")
     assert health.json()["git"] == github_view and state.json()["git"] == github_view
     assert token not in health.text and token not in state.text and url not in health.text
+
+
+# ---- 11. Git Release: a failed push is retried by the same "Approve & Deploy" (real workflow & sandbox) -------------
+RELEASE_TOKEN = "ghp_TESTONLYreleasetoken0123456789abcdef"
+RELEASE_QUIZ = {
+    "skill_tag": "decimal_rounding",
+    "rule_code": "RULE-001",
+    "stem": "What does the fixed calculate_order_total return for one item priced 2.675 at vat_rate 0?",
+    "option_a": "Decimal('2.68')",
+    "option_b": "Decimal('2.67')",
+    "option_c": "Decimal('2.675')",
+    "option_d": "Decimal('2.7')",
+    "correct_option": "A",
+    "explanation_a": "Right: ROUND_HALF_UP rounds the exact Decimal tie 2.675 up to 2.68.",
+    "explanation_b": "Trap: a binary float stores 2.675 just below the tie.",
+    "explanation_c": "Trap: RULE-001 quantizes every amount to the cent.",
+    "explanation_d": "Trap: that rounds to one decimal place.",
+}
+
+
+def _release_git(*args: str) -> str:
+    """git isolated from the developer's config (the release remote of the test)."""
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env |= {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    return subprocess.run(["git", *args], env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp_path: Path) -> None:
+    from no_quiz_no_prod.backend import SandboxWorkspace
+    from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
+
+    remote = tmp_path / "release.git"  # configured, but not created yet: the first push cannot reach it
+    settings = RuntimeSettings(
+        workspace_dir=tmp_path / "workspace",
+        git_remote_url=str(remote),
+        github_token=SecretStr(RELEASE_TOKEN),  # present in the settings, so no response may ever carry it
+    )
+    doc = "## Technical Feature Documentation\nDecimal cents (RULE-001).\n\n## Pedagogical Lesson\nHalf-up ties."
+    llm = ScriptedLLM(
+        coder=[
+            turn(call("search_notion_rules", query="VAT rounding Decimal")),
+            turn(call("read_notion_rule", rule_code="RULE-001")),
+            turn(call("read_code_file", path="orders.py")),
+            turn(call("write_staging_file", path="orders.py", content=FIXED_FINTECH_ORDERS)),
+            turn(call("run_staging_tests")),
+            turn(text="STATUS: DONE\nDecimal totals with ROUND_HALF_UP; the staging suite is green."),
+        ],
+        examiner=[
+            turn(
+                call(
+                    "upsert_ship_log_doc",
+                    title="Decimal ROUND_HALF_UP totals in orders.py",
+                    doc_markdown=doc,
+                    changed_files=["orders.py"],
+                    applied_rules=["RULE-001"],
+                    targeted_weaknesses=["decimal_rounding"],
+                )
+            ),
+            turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
+            turn(text="STATUS: DONE\nDoc v1 and quiz attempt 1 are published."),
+        ],
+    )
+    workflows: list[NoQuizWorkflow] = []
+
+    def workflow_factory(run_settings: RuntimeSettings, topology: Topology, model: str) -> NoQuizWorkflow:
+        workflow = NoQuizWorkflow(
+            settings=run_settings,
+            llm_client=llm,  # type: ignore[arg-type]
+            topology=topology,
+            model=model,
+            mcp_transport="inprocess",
+            sleep=lambda _seconds: None,
+        )
+        workflows.append(workflow)
+        return workflow
+
+    app = create_app(
+        settings=settings,
+        workspace=SandboxWorkspace(settings),
+        workflow_factory=workflow_factory,
+        eval_dir=tmp_path / "eval",
+        env_file=tmp_path / ".env",
+    )
+    responses: list[str] = []
+    try:
+        with TestClient(app) as client:
+            client.post("/api/reset", json={"user_id": DEFAULT_USER_ID, "reset_skill_memory": True})
+            run = {
+                "prompt": "Fix VAT rounding in orders.py per RULE-001.",
+                "thread_id": "thr_push",
+                "model": SCRIPTED_MODEL,
+            }
+            stream = client.post("/api/runs/stream", json=run)
+            responses.append(stream.text)
+            quiz = client.post("/api/runs/thr_push/quiz", json={"selected_option": "A"})
+            responses.append(quiz.text)
+            assert quiz.json()["interrupt"]["kind"] == "deploy_approval", quiz.text
+            diff_sha = quiz.json()["locks"]["diff_sha256"]
+            prod_before = compute_tree_sha256(settings.area_dir("prod"))
+            approve = {"action": "approve", "expected_diff_sha256": diff_sha, "reason": "ship"}
+
+            # 1. The push fails: typed, retryable 409, prod untouched, all 4 locks still hold, the failed step shown
+            failed = client.post("/api/runs/thr_push/deploy", json=approve)
+            responses.append(failed.text)
+            assert failed.status_code == 409, failed.text
+            body = failed.json()
+            assert body["deployed"] is False and body["code"] == "upstream_error" and body["retryable"] is True
+            assert body["locks"]["can_deploy"] is True and body["missing_locks"] == []
+            assert [(step["agent"], step["tool"]) for step in body["trace"]] == [
+                ("human", "submit_deploy_decision"),
+                ("system", "deploy_to_production"),
+            ]
+            assert body["trace"][-1]["error"]["code"] == "upstream_error"
+            assert compute_tree_sha256(settings.area_dir("prod")) == prod_before
+            state = client.get("/api/state", params={"thread_id": "thr_push"})
+            responses.append(state.text)
+            assert state.json()["active_run"]["ship_log"]["status"] != "Deployed to Prod"
+            assert state.json()["active_run"]["locks"]["can_deploy"] is True  # the UI keeps "Approve & Deploy"
+
+            # 2. The remote comes back: the very same request (endpoint, diff) now deploys and pushes
+            _release_git("init", "--quiet", "--bare", str(remote))
+            retried = client.post("/api/runs/thr_push/deploy", json=approve)
+            responses.append(retried.text)
+            assert retried.status_code == 200, retried.text
+            done = retried.json()
+            assert done["deployed"] is True and done["stop_reason"] == "completed"
+            deploy_step = done["trace"][-1]
+            assert deploy_step["tool"] == "deploy_to_production" and deploy_step["error"] is None
+            assert deploy_step["result"]["release"]["pushed"] is True
+            tip = _release_git("--git-dir", str(remote), "rev-parse", "refs/heads/main")
+            assert done["ship_log"]["release_commit_sha"] == tip == deploy_step["result"]["release"]["commit_sha"]
+            assert done["ship_log"]["release_commit_url"] is None  # a local remote has no web page
+            assert deploy_step["idempotency_key"] == body["trace"][-1]["idempotency_key"]  # the same deploy
+
+            # 3. Nothing is left to retry, and nothing is pushed twice
+            again = client.post("/api/runs/thr_push/deploy", json=approve)
+            responses.append(again.text)
+            assert again.status_code == 409 and again.json()["code"] == "gate_locked"
+            assert _release_git("--git-dir", str(remote), "rev-parse", "refs/heads/main") == tip
+            for path in ("/api/health", "/api/state"):
+                responses.append(client.get(path).text)
+    finally:
+        for workflow in workflows:
+            workflow.close()
+    assert all(RELEASE_TOKEN not in text for text in responses)  # never in a stream, a result or an error

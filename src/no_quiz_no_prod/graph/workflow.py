@@ -120,6 +120,9 @@ TREE_BOUND_TOOLS: Final = frozenset({"write_staging_file", "run_staging_tests"})
 TREE_KEY_FIELD: Final = "staging_tree_sha256"  # mixed into the key only, never sent to the server
 HARVESTED_KEYS: Final = ("quiz", "ship_log", "rules_read", "wrote_staging")
 RELEASE_NOTE_CHARS: Final = 200
+# deploy_to_production errors of the git push itself: prod, the ledger and the ship log were left untouched, so a new
+# human approval of the same diff may retry that deploy (a gate_locked refusal never is: a lock no longer holds)
+RELEASE_RETRY_CODES: Final = frozenset({"conflict", "upstream_error", "timeout"})
 INJECTION_PROBE_CHARS: Final = 48
 FORGET_THREAD_PREFIX: Final = "forget:"
 ARTIFACTS_BY_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
@@ -353,6 +356,17 @@ def _release_suffix(result: Any) -> str:
     except ValidationError:
         return ""
     return RELEASED.format(commit=commit.commit_sha[:12], branch=commit.branch, remote=commit.remote)
+
+
+def _failed_release(values: Mapping[str, Any]) -> ToolCallTrace | None:
+    """The thread's last step when it is a ``deploy_to_production`` whose push failed (retryable by a new approval)."""
+    trace = values.get("trace") or []
+    if values.get("stop_reason") != "refused" or not trace:
+        return None
+    last = ToolCallTrace.model_validate(trace[-1])
+    if last.tool != "deploy_to_production" or last.error is None or last.error.code not in RELEASE_RETRY_CODES:
+        return None
+    return last
 
 
 def _parse_deploy_decision(value: Any) -> DeployDecision:
@@ -764,14 +778,26 @@ class NoQuizWorkflow:
         note = str((state.get("ship_log") or {}).get("title") or state["task"])[:RELEASE_NOTE_CHARS]
         args = {"expected_diff_sha256": decision.expected_diff_sha256, "release_note": note}
         key = idem_key(thread_id, "deploy_to_production", args)
+        return self._deploy(thread_id, human, args, key, locks, budget)
+
+    def _deploy(
+        self,
+        thread_id: str,
+        human: ToolCallTrace,
+        args: Mapping[str, Any],
+        key: str,
+        locks: DeployGateStatus,
+        budget: RunBudget,
+    ) -> dict[str, Any]:
+        """The system's ``deploy_to_production`` call after a human approval: its trace entries and the stop reason."""
         started = time.perf_counter()
         outcome, attempts = self._call_with_retry("deploy_to_production", args, key)
         system = ToolCallTrace(
-            step=step + 2,
+            step=human.step + 1,
             agent="system",
             server=TOOLS["deploy_to_production"].server,
             tool="deploy_to_production",
-            args=args,
+            args=dict(args),
             result=outcome.result,
             error=outcome.error,
             latency_s=time.perf_counter() - started,
@@ -783,7 +809,7 @@ class NoQuizWorkflow:
         self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=locks)
         trace = [human.model_dump(mode="json"), system.model_dump(mode="json")]
         if outcome.ok:
-            answer = DEPLOYED.format(sha=sha) + _release_suffix(outcome.result)
+            answer = DEPLOYED.format(sha=str(args["expected_diff_sha256"])[:12]) + _release_suffix(outcome.result)
             return {"trace": trace, "stop_reason": "completed", "final_answer": answer}
         message = outcome.error.message if outcome.error else "unknown error"
         return {"trace": trace, "stop_reason": "refused", "final_answer": GATE_REFUSED.format(message=message)}
@@ -1060,13 +1086,55 @@ class NoQuizWorkflow:
         user_id: str = DEFAULT_USER_ID,
         on_event: Callable[[RunEvent], None] | None = None,
     ) -> WorkflowOutcome:
-        """Answer the pending deploy approval: approve (then deploy through the 4 locks) or reject (blocked)."""
+        """Answer the pending deploy approval: approve (then deploy through the 4 locks) or reject (blocked).
+
+        A thread whose deploy failed to push (``RELEASE_RETRY_CODES``) is no longer paused, but a new approval of the
+        same diff retries that very deploy (``_retry_deploy``); anything else is a ``ValueError``.
+        """
         config = _config(thread_id)
-        pending = _pending(self.app.get_state(config))
+        snapshot = self.app.get_state(config)
+        pending = _pending(snapshot)
         if pending is None or pending.kind != "deploy_approval":
-            raise ValueError(f"thread {thread_id!r} is not waiting for a deploy decision")
+            failed = _failed_release(snapshot.values or {}) if pending is None and decision.approved else None
+            if failed is None:
+                raise ValueError(f"thread {thread_id!r} is not waiting for a deploy decision")
+            with self._listening(thread_id, on_event):
+                return self._retry_deploy(config, snapshot.values, failed, decision)
         with self._listening(thread_id, on_event):
             return self._drive(config, Command(resume=decision.model_dump(mode="json")))
+
+    def _retry_deploy(
+        self,
+        config: RunnableConfig,
+        values: Mapping[str, Any],
+        failed: ToolCallTrace,
+        decision: DeployDecision,
+    ) -> WorkflowOutcome:
+        """Re-run the failed ``deploy_to_production`` of a finished thread, after a new human approval.
+
+        Same arguments and same idempotency key: the same diff and release note, never a new change. The server
+        re-checks the four locks and the publisher never pushes a tree the remote already holds. The graph is not
+        re-entered: the new trace entries and stop reason are written to the checkpoint as the ``finish`` node.
+        """
+        thread_id = _thread_id(config)
+        expected = str(failed.args.get("expected_diff_sha256") or "")
+        if decision.expected_diff_sha256 not in (None, expected):
+            raise ValueError(f"thread {thread_id!r} can only retry the deploy of diff {expected[:12]}")
+        decision = decision.model_copy(update={"expected_diff_sha256": expected})
+        locks = self.workspace.apply_deploy_decision(decision, thread_id=thread_id)
+        budget = _budget(values)
+        human = ToolCallTrace(
+            step=len(values.get("trace") or []) + 1,
+            agent="human",
+            tool="submit_deploy_decision",
+            args=decision.model_dump(mode="json"),
+            result=locks.model_dump(mode="json"),
+        )
+        self._emit(thread_id, "step", step=human, budget=budget)
+        key = failed.idempotency_key or idem_key(thread_id, "deploy_to_production", failed.args)
+        update = self._deploy(thread_id, human, failed.args, key, locks, budget)
+        self.app.update_state(config, update, as_node="finish")
+        return self._conclude(config)
 
     def _drive(self, config: RunnableConfig, payload: Any) -> WorkflowOutcome:
         thread_id = _thread_id(config)

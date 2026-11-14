@@ -83,6 +83,16 @@ const API_PROVIDER_META = {
     placeholder: "ntn_...",
     label: "notion",
   },
+  github: {
+    envVar: "NO_QUIZ_GITHUB_TOKEN",
+    placeholder: "github_pat_...",
+    label: "github",
+  },
+  git_remote: {
+    envVar: "NO_QUIZ_GIT_REMOTE_URL",
+    placeholder: "https://github.com/owner/repo.git",
+    label: "git_remote",
+  },
 };
 
 // ---- DRY Crisp 1.75px Inline SVG Icon Factory (Zero Emojis) ---------------
@@ -190,6 +200,7 @@ const store = {
 
   models: null,
   notion: { notion_enabled: false, notion_key_configured: false, hub_url: null, rules: [] },
+  git: { remote_kind: "local", repo: null, branch: "main", token_set: false },
   skillProfile: [],
   highlightedSkills: new Set(),
   forgetConfirmTimer: null,
@@ -374,6 +385,26 @@ function renderStepCardHtml(step, { forbiddenSet = null } = {}) {
       `</span>`
     );
   }
+  if (step.tool === "deploy_to_production") {
+    // the git release of the deploy: its commit once pushed, or the typed push error (conflict, upstream_error, timeout)
+    const release = step.result?.release;
+    if (step.error) {
+      subBadges.push(
+        `<span class="pill" data-status="Blocked">` +
+          `<span class="pill__dot"></span>` +
+          `<span>${escapeHtml(step.error.code)}</span>` +
+        `</span>`
+      );
+    } else if (release?.commit_sha) {
+      const verb = release.pushed === false ? "already pushed" : "pushed";
+      subBadges.push(
+        `<span class="pill" data-status="Staging">` +
+          `<span class="pill__dot"></span>` +
+          `<span>${verb} · ${escapeHtml(shortSha(release.commit_sha, 7))}</span>` +
+        `</span>`
+      );
+    }
+  }
 
   const argsPreview = formatJsonPreview(step.args || {}, 800);
   const resultPreview = formatJsonPreview(step.result, 600);
@@ -494,6 +525,14 @@ function renderApiPopoverState() {
   $("btn-save-apikey").disabled = store.isSavingApiKey;
   $("btn-save-apikey").textContent = store.isSavingApiKey ? "Saving…" : "Save";
 
+  // GitHub tab: the release remote URL above the (write-only) token; neither value is ever read back
+  $("git-remote-form").hidden = store.activeKeyProvider !== "github";
+  $("git-remote-input").placeholder = store.git?.repo
+    ? `https://github.com/${store.git.repo}.git`
+    : API_PROVIDER_META.git_remote.placeholder;
+  $("btn-save-git-remote").disabled = store.isSavingApiKey;
+  $("btn-save-git-remote").textContent = store.isSavingApiKey ? "Saving…" : "Save";
+
   document.querySelectorAll("#api-popover-tabs .api-tab").forEach((btn) => {
     const isActive = btn.dataset.keyProvider === store.activeKeyProvider;
     btn.classList.toggle("is-active", isActive);
@@ -511,9 +550,10 @@ function setApiPopoverOpen(open) {
   }
 }
 
-async function handleSaveApiKey(ev) {
+async function handleSaveApiKey(ev, { provider = store.activeKeyProvider, inputId = "api-key-input" } = {}) {
   ev.preventDefault();
-  const rawKey = $("api-key-input").value.trim();
+  const input = $(inputId);
+  const rawKey = input.value.trim();
   if (!rawKey || store.isSavingApiKey) {
     if (!rawKey) {
       showToast("Paste a non-empty API token before saving.");
@@ -529,7 +569,7 @@ async function handleSaveApiKey(ev) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        provider: store.activeKeyProvider,
+        provider,
         api_key: rawKey,
       }),
     });
@@ -538,7 +578,10 @@ async function handleSaveApiKey(ev) {
       throw new Error(data.detail || `HTTP ${resp.status}`);
     }
 
-    $("api-key-input").value = "";
+    input.value = "";
+    if (data.git) {
+      store.git = data.git;
+    }
     if (data.providers) {
       store.providers = {
         openrouter: Boolean(data.providers.openrouter),
@@ -556,7 +599,7 @@ async function handleSaveApiKey(ev) {
 
     renderHeaderControls();
     triggerAuraWave("verified");
-    showToast(`${API_PROVIDER_META[store.activeKeyProvider].envVar} saved to .env (0600).`);
+    showToast(`${API_PROVIDER_META[provider].envVar} saved to .env (0600).`);
   } catch (err) {
     showToast(`Could not save key: ${err.message}`);
   } finally {
@@ -625,6 +668,13 @@ function renderHeaderControls() {
       : "Local Seed Mirror (Notion)";
     hubDot.classList.toggle("is-live", Boolean(store.notion?.notion_enabled));
   }
+
+  // Release remote pill (same component as the Notion Hub pill): GitHub once an https remote and a token are set
+  const isGithubRemote = store.git?.remote_kind === "https" && Boolean(store.git?.token_set);
+  const repoLink = $("link-github-repo");
+  repoLink.href = isGithubRemote && store.git.repo ? sanitizeHref(`https://github.com/${store.git.repo}`) || "#" : "#";
+  $("github-repo-label").textContent = isGithubRemote ? "GitHub" : "Local remote";
+  $("github-repo-dot").classList.toggle("is-live", isGithubRemote);
 
   renderApiPopoverState();
   window.requestAnimationFrame(updateModeGlider);
@@ -937,6 +987,19 @@ function renderNotionPane() {
       `<span class="mono-chip mono-chip--compact">${escapeHtml(syncModeLabel)}</span>`
     : `<span class="mono-chip mono-chip--compact">${escapeHtml(syncModeLabel)}</span>`;
 
+  // The git release commit of a deployed change (same chip as the sha row), linked to GitHub when it is there
+  const commitSha = ship.release_commit_sha;
+  const commitUrl = sanitizeHref(ship.release_commit_url);
+  const commitChip = commitSha
+    ? commitUrl
+      ? `<a class="mono-chip" href="${escapeHtml(commitUrl)}" target="_blank" rel="noopener noreferrer">commit:${escapeHtml(shortSha(commitSha, 7))}</a>`
+      : `<button type="button" class="mono-chip js-copy-sha" data-sha="${escapeHtml(commitSha)}" data-copy-label="Release commit">commit:${escapeHtml(shortSha(commitSha, 7))}</button>`
+    : "";
+  const commitRowHtml = commitSha
+    ? `<div class="notion-props__key">commit</div>` +
+      `<div class="notion-props__val tabular-nums">${commitChip}</div>`
+    : "";
+
   container.innerHTML =
     `<div class="notion-breadcrumb">` +
       `<span class="notion-breadcrumb__left">${svgIcon("database", 12)}<span>no-quiz-hub / db2_feature_ship_log</span></span>` +
@@ -964,6 +1027,7 @@ function renderNotionPane() {
           ? `<button type="button" class="mono-chip js-copy-sha" data-sha="${escapeHtml(ship.diff_sha256)}">sha:${escapeHtml(shortSha(ship.diff_sha256, 10))}</button>`
           : "") +
       `</div>` +
+      commitRowHtml +
       `<div class="notion-props__key">sync_source</div>` +
       `<div class="notion-props__val">${urlRowHtml}</div>` +
     `</div>` +
@@ -1135,15 +1199,30 @@ function renderDeployPanel() {
     );
   }).join("");
 
+  // A push that failed after the sign-off leaves all 4 locks holding (can_deploy): the same button retries it.
+  const canApprove = Boolean(locks?.ready_for_approval || locks?.can_deploy);
   let footerHtml = "";
   if (isDeployed) {
     const prodSha = shortSha(diff?.prod_tree_sha256, 8);
+    const commitSha = store.shipLog?.release_commit_sha || store.lastDeployReceipt?.commit_sha || null;
+    const commitUrl = sanitizeHref(
+      store.shipLog?.release_commit_url || store.lastDeployReceipt?.commit_url || ""
+    );
+    const commitHtml = commitSha
+      ? `<div><span class="deploy-receipt__head">` +
+          `<button type="button" class="mono-chip js-copy-sha" data-sha="${escapeHtml(commitSha)}" title="Copy release commit">${escapeHtml(shortSha(commitSha, 7))}</button>` +
+          (commitUrl
+            ? `<a class="md-link" href="${escapeHtml(commitUrl)}" target="_blank" rel="noopener noreferrer">View on GitHub ↗</a>`
+            : `<span>local remote</span>`) +
+        `</span></div>`
+      : "";
     footerHtml =
       `<div class="deploy-receipt">` +
         `<div class="deploy-receipt__head">${svgIcon("promote", 14)}<strong>Deployed to prod/</strong></div>` +
+        commitHtml +
         `<div><code>${escapeHtml(prodSha)}</code></div>` +
       `</div>`;
-  } else if (locks?.ready_for_approval && !treesIdentical) {
+  } else if (canApprove && !treesIdentical) {
     footerHtml =
       `<div class="deploy-actions">` +
         `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
@@ -1153,7 +1232,8 @@ function renderDeployPanel() {
         `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
           `Reject` +
         `</button>` +
-      `</div>`;
+      `</div>` +
+      `<div class="kpi-card__sub deploy-actions__sub">commit + push to ${escapeHtml(store.git?.branch || "main")}</div>`;
   } else {
     footerHtml =
       `<div class="deploy-actions">` +
@@ -1241,6 +1321,7 @@ function applyStatePayload(data) {
   store.pytest = data.workspace?.pytest || null;
   store.models = data.models || store.models;
   store.notion = data.notion || store.notion;
+  store.git = data.git || store.git;
 
   const avail = store.models?.available_providers || {};
   store.providers = {
@@ -1636,12 +1717,21 @@ async function submitDeployDecision(action) {
       }),
     });
     const data = await resp.json();
+    if (Array.isArray(data.trace)) {
+      for (const step of data.trace) {
+        appendStepToFeed(step);
+      }
+    }
     if (resp.status === 409) {
       if (data.locks) {
         store.locks = data.locks;
       }
       triggerAuraWave("shield");
-      showToast(data.message || "Gate locked: promotion rejected server-side.");
+      showToast(
+        data.retryable
+          ? `Push failed (${data.code}): prod/ untouched, locks intact. Approve & Deploy retries the same deploy.`
+          : data.message || "Gate locked: promotion rejected server-side."
+      );
       return;
     }
     if (!resp.ok) {
@@ -1661,7 +1751,11 @@ async function submitDeployDecision(action) {
     store.interrupt = null;
 
     if (data.deployed) {
-      store.lastDeployReceipt = { deployed_at: data.deployed_at };
+      store.lastDeployReceipt = {
+        deployed_at: data.deployed_at,
+        commit_sha: data.ship_log?.release_commit_sha || null,
+        commit_url: data.ship_log?.release_commit_url || null,
+      };
       triggerAuraWave("verified");
       showToast("Promoted to prod/ (`prod == staging` SHA-256 verified).");
     } else {
@@ -2297,6 +2391,8 @@ function openTraceDrawer(run) {
     ["quiz_attempts", String(fs.quiz_attempts ?? 0)],
     ["quiz_passed", String(Boolean(fs.quiz_passed))],
     ["deployed", String(Boolean(fs.deployed))],
+    ["pushed", String(Boolean(fs.pushed))],
+    ["release_commit_sha", fs.release_commit_sha || "null"],
     ["forbidden_called", JSON.stringify(run.forbidden_called || [])],
     ["hidden_failure", String(Boolean(run.hidden_failure))],
   ];
@@ -2440,6 +2536,17 @@ function bindEvents() {
     input.type = input.type === "password" ? "text" : "password";
   });
   $("api-key-form").addEventListener("submit", handleSaveApiKey);
+  $("git-remote-form").addEventListener("submit", (ev) =>
+    handleSaveApiKey(ev, { provider: "git_remote", inputId: "git-remote-input" })
+  );
+  $("link-github-repo").addEventListener("click", (ev) => {
+    if ($("link-github-repo").getAttribute("href") === "#") {
+      ev.preventDefault();
+      showToast(
+        `Deploys commit + push to ${store.git?.branch || "main"} on the workspace's local bare remote (set NO_QUIZ_GIT_REMOTE_URL and NO_QUIZ_GITHUB_TOKEN to push to GitHub).`
+      );
+    }
+  });
 
   document.addEventListener("click", (ev) => {
     if (
@@ -2647,7 +2754,7 @@ function bindEvents() {
     }
     const shaBtn = ev.target.closest(".js-copy-sha");
     if (shaBtn) {
-      copyToClipboard(shaBtn.dataset.sha, "Diff SHA-256");
+      copyToClipboard(shaBtn.dataset.sha, shaBtn.dataset.copyLabel || "Diff SHA-256");
     }
   });
 
@@ -2674,6 +2781,11 @@ function bindEvents() {
   });
 
   $("deploy-panel").addEventListener("click", (ev) => {
+    const shaBtn = ev.target.closest(".js-copy-sha");
+    if (shaBtn) {
+      copyToClipboard(shaBtn.dataset.sha, "Release commit");
+      return;
+    }
     if (ev.target.closest("#btn-approve-deploy")) {
       submitDeployDecision("approve");
       return;
