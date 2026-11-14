@@ -1,10 +1,11 @@
-"""Command-line interface (`no-quiz-no-prod`) for interactive HITL runs, workspace reset, Studio UI & Notion setup."""
+"""Command-line interface (`no-quiz-no-prod`): interactive HITL runs, workspace reset, Studio UI, Notion & GitHub setup."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +13,10 @@ from typing import Any, Literal
 
 import httpx
 
+from no_quiz_no_prod.backend.errors import WorkspaceError
+from no_quiz_no_prod.backend.release import GitReleasePublisher, describe_release_remote, github_repo
+from no_quiz_no_prod.backend.seeds import populate_area, seed_path
+from no_quiz_no_prod.backend.store import workspace_lock
 from no_quiz_no_prod.contracts import (
     ALL_QUIZ_OPTION_KEYS,
     ALL_TOPOLOGIES,
@@ -338,6 +343,82 @@ def _cmd_init_notion(
     return 0
 
 
+def _print_git_failure(label: str, error: WorkspaceError, out: Any) -> None:
+    """One failed check: the typed message, plus git's (already redacted) output when there is some."""
+    print(f"  ✗ {label}: {error.payload.message}", file=out)
+    if output := str(error.payload.details.get("git_output", "")).strip():
+        print(f"      {output.splitlines()[-1]}", file=out)
+
+
+def _cmd_init_github(
+    args: argparse.Namespace,
+    *,
+    settings: RuntimeSettings | None = None,
+    out: Any = sys.stdout,
+) -> int:
+    """Inspect or verify the release remote (``--verify``), or push the seed as the first commit of its branch.
+
+    Never prints the token (only whether one is set) nor a remote URL that failed validation.
+    """
+    cfg = settings or RuntimeSettings.from_env()
+    publisher = GitReleasePublisher(cfg)
+    summary = describe_release_remote(cfg)
+    print("GitHub Release Remote Configuration Status:", file=out)
+    print(f"  remote_kind       : {summary['remote_kind']}", file=out)
+    print(f"  repo              : {summary['repo'] or '-'}", file=out)
+    print(f"  branch            : {summary['branch']}", file=out)
+    print(f"  NO_QUIZ_GITHUB_TOKEN : {'configured' if summary['token_set'] else 'not set'}", file=out)
+
+    try:
+        version = publisher.git_version()
+    except WorkspaceError as error:
+        _print_git_failure("git >= 2.31", error, out)
+        return 1
+    print(f"  ✓ git {version}", file=out)
+    try:
+        remote = publisher.resolve_remote()
+    except WorkspaceError as error:
+        _print_git_failure("remote URL", error, out)
+        return 1
+    repo = github_repo(cfg.git_remote_url) if remote.kind == "https" else None
+    print(f"  ✓ remote: {repo or remote.display} ({remote.kind})", file=out)
+    if remote.kind == "https" and not summary["token_set"]:
+        print("  ✗ token: NO_QUIZ_GITHUB_TOKEN is not set (an HTTPS push needs it)", file=out)
+        return 1
+    print(f"  ✓ token: {'configured' if remote.kind == 'https' else 'not needed for a local remote'}", file=out)
+
+    cfg.workspace_dir.mkdir(parents=True, exist_ok=True)
+    if args.verify:
+        try:
+            with workspace_lock(cfg.workspace_dir):
+                head = publisher.inspect_remote()
+        except WorkspaceError as error:
+            _print_git_failure("access (ls-remote)", error, out)
+            return 1
+        print("  ✓ access: ls-remote answered" if head.remote_exists else "  ✓ access: created on first use", file=out)
+        print(f"  repo   : {repo or remote.display}", file=out)
+        print(f"  branch : {head.branch}", file=out)
+        print(f"  head   : {head.tip or 'absent (run `no-quiz-no-prod init-github` to create it)'}", file=out)
+        return 0
+
+    message = (
+        f"chore(release): initialize the release branch with the {args.seed} seed\n\n"
+        "Pristine production tree: every later commit on this branch is a gated deploy.\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="nqnp_seed_") as tmp, workspace_lock(cfg.workspace_dir):
+            populate_area(Path(tmp), seed_path(args.seed), injection_target=None, injection_text="")
+            head = publisher.initialize_branch(Path(tmp), message=message)
+    except WorkspaceError as error:
+        _print_git_failure("initialize branch", error, out)
+        return 1
+    if head.created:
+        print(f"  ✓ pushed the {args.seed} seed as {head.tip} to {head.branch} (fast-forward)", file=out)
+    else:
+        print(f"  ✓ {head.branch} already exists at {head.tip}: left untouched (never forced)", file=out)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the ``no-quiz-no-prod`` CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -411,6 +492,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ping the Notion REST API to verify reachability of configured database IDs.",
     )
 
+    # 5. init-github
+    github_p = sub.add_parser(
+        "init-github",
+        help="Verify the release remote (--verify) or push the seed as the first commit of the release branch.",
+    )
+    github_p.add_argument(
+        "--verify",
+        action="store_true",
+        help="Check git >= 2.31, the remote URL, the token and access (ls-remote); show repo, branch and head.",
+    )
+    github_p.add_argument(
+        "--seed", default=DEFAULT_SEED, help=f"Seed pushed to a new branch (default: {DEFAULT_SEED})."
+    )
+
     return parser
 
 
@@ -430,6 +525,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_ui_server(ui_args)
     if args.command == "init-notion":
         return _cmd_init_notion(args)
+    if args.command == "init-github":
+        return _cmd_init_github(args)
     return 2
 
 

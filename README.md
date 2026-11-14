@@ -44,7 +44,7 @@ flowchart TD
 | Pillar | Mechanism & Guarantees |
 | :--- | :--- |
 | **4-Lock SHA-256 Production Gate** | `deploy_to_production` recomputes `diff_sha256 = sha256(prod_tree:staging_tree)` server-side and refuses (`code="gate_locked"`) unless all four locks hold on that exact digest: **1. `tests_passed`**, **2. `sha256_matches`** (zero TOCTOU post-test drift), **3. `quiz_passed`**, and **4. `human_approved`**. |
-| **Git Release on Deploy** | Once the four locks hold, the harness-only `deploy_to_production` commits the approved staging tree and pushes it **fast-forward only** (no `+` refspec, no `--force`) to the release branch, and promotes `prod/` only after the push succeeded. The remote is a local bare repository (`<workspace>/release_remote.git`) by default, or any HTTPS remote such as GitHub. The GitHub token reaches git only through its environment (`http.<remote>.extraHeader`), never argv, a remote URL, `.git/config`, a log, a trace or an error. No agent has a git tool. |
+| **Git Release on Deploy** | Once the four locks hold, the harness-only `deploy_to_production` commits the approved staging tree and pushes it **fast-forward only** (no `+` refspec, no `--force`) to the release branch, and promotes `prod/` only after the push succeeded. The remote is a local bare repository (`<workspace>/release_remote.git`) by default, or any HTTPS remote such as GitHub. The GitHub token reaches git only through its environment (`http.<remote>.extraHeader`), never argv, a remote URL, `.git/config`, a log, a trace or an error. No agent has a git tool. Each release commit carries the gate evidence as trailers (`Diff-SHA256`, `Quiz-Attempts`, `Approved-By: human`, `Rules`, `Thread`), and `RunFinalState.pushed` / `ExpectedState.pushed` make the push a scored end state. |
 | **Dual vs. Single Agent Topology** | **`dual` (Default)**: `Coder` edits `staging/` and runs `pytest`, with **zero tool access** to `deploy_to_production` or quiz authoring; `Examiner` reads Layer 4 memory, publishes the Notion Ship Log, authors the quiz, and handles remediation. **`single`**: Unified agent baseline used for multi-cohort evaluation ablations. |
 | **Zero-Leakage Adaptive Remediation** | `create_comprehension_quiz` stores `correct_option` and `explanation_by_option` exclusively in SQLite and returns `PublicQuizView`. A wrong answer on Attempt 1 triggers `Examiner` to upgrade the Notion Ship Log from `v1` to **`Remediation v2`** (with a targeted trap callout) and issue a fresh Attempt 2 question; failing Attempt 2 permanently marks the diff `Blocked`. |
 | **Layer 4 Developer Skill Memory** | Tracks 6 canonical fintech engineering skills (`decimal_rounding`, `sql_parameterization`, `auth_token_validation`, `idempotency_and_retries`, `boundary_conditions`, `refund_policy_compliance`) across threads (`Not Assessed` → `Weakness Detected` / `Practicing` → `Mastered`), steering future explanations and quizzes, with 1-click GDPR `/forget` erasure. |
@@ -78,6 +78,7 @@ cp .env.example .env
 | `NO_QUIZ_GIT_REMOTE_URL` | No | `<workspace>/release_remote.git` (local bare) | Release remote of `deploy_to_production`: an `https://` URL (e.g. `https://github.com/<owner>/<repo>.git`, no credentials in it) or an absolute local repository path |
 | `NO_QUIZ_GIT_BRANCH` | No | `main` | Release branch (fast-forward pushes only) |
 | `NO_QUIZ_GITHUB_TOKEN` | With an HTTPS remote | — | Token with `contents: write` on the release repository; sent to git as an HTTP header through its environment only |
+| `NO_QUIZ_ENV_FILE` | No | `.env` (repository root) | Load another `.env` instead (hermetic tests, isolated runs). Variables already set in the process always win, even empty ones |
 
 ### 2. Launch the Conversational Web Studio & Trace Explorer
 
@@ -115,6 +116,12 @@ uv run no-quiz-no-prod run "Fix VAT calculation in orders.py per RULE-001 and ru
 
 # Verify Notion Relational Hub database configuration
 uv run no-quiz-no-prod init-notion --verify
+
+# Check the release remote (git >= 2.31, URL, token, ls-remote access) and show repo, branch and head commit
+uv run no-quiz-no-prod init-github --verify
+
+# Push the pristine seed as the first commit of the release branch if it does not exist yet (fast-forward only)
+uv run no-quiz-no-prod init-github
 ```
 
 **Connecting Claude Code, Antigravity, or MCP Inspector via `.mcp.json`**:
@@ -256,7 +263,7 @@ DeepSeek is the more reliable and cheaper default. Gemini is the low-latency opt
 ## Development & Verification
 
 ```bash
-# Run full automated test suite (104 tests: backend+MCP 28, graph+memory 38, eval 9, UI 10, end-to-end 2, git release 17)
+# Run full automated test suite (122 tests: backend+MCP 28, graph+memory 38, eval 9, UI 11, end-to-end 2, git release 30, hermetic env 4)
 uv run pytest -v
 
 # Run lint and formatting checks

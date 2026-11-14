@@ -4,7 +4,9 @@ Offline only: every remote is a local bare repository under ``tmp_path``; the on
 three network git commands (``ls-remote``, ``fetch``, ``push``) and runs every local git command for real.
 """
 
+import argparse
 import base64
+import io
 import os
 import subprocess
 from collections.abc import Callable
@@ -13,15 +15,17 @@ from typing import Any, Final
 
 import pytest
 from pydantic import SecretStr
-from testkit import FIXED_FINTECH_ORDERS
+from testkit import FIXED_FINTECH_ORDERS, HERMETIC_RELEASE_ENV
 
 from no_quiz_no_prod.agents import AGENTS, TOOLS
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError, catalog
 from no_quiz_no_prod.backend import release as release_module
+from no_quiz_no_prod.cli import _cmd_init_github, build_parser
 from no_quiz_no_prod.contracts import (
     DEFAULT_GIT_BRANCH,
     DeployDecision,
     EnvVar,
+    ExpectedState,
     OptionTexts,
     QuizDraft,
     ReleaseCommit,
@@ -55,7 +59,7 @@ SECOND_FIX: Final = FIXED_FINTECH_ORDERS + "\n\n# Release 2: no behaviour change
 def git(*args: str, cwd: Path | None = None) -> str:
     """Test-side git, isolated from the developer's config like the gate itself."""
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
-    env |= {
+    env |= HERMETIC_RELEASE_ENV | {
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_AUTHOR_NAME": "Someone Else",
@@ -83,18 +87,20 @@ def refusal(action: Callable[[], Any]) -> ToolErrorPayload:
     return caught.value.payload
 
 
-def ship(sandbox: SandboxWorkspace, content: str = FIXED_FINTECH_ORDERS, *, approve: bool = True) -> str:
+def ship(
+    sandbox: SandboxWorkspace, content: str = FIXED_FINTECH_ORDERS, *, approve: bool = True, **ship_log: Any
+) -> str:
     """Stage ``content`` as orders.py and earn Locks 1-3 (and Lock 4 when ``approve``) on it."""
     diff = sandbox.write_staging_file("orders.py", content)["diff_sha256"]
     assert sandbox.run_staging_tests().passed
-    sandbox.upsert_ship_log(
-        title="Fix VAT float drift in orders.py",
-        diff_sha256=diff,
-        changed_files=["orders.py"],
-        applied_rules=["RULE-001"],
-        targeted_weaknesses=["decimal_rounding"],
-        doc_markdown="## What changed\nMoney is Decimal end to end.",
-    )
+    fields: dict[str, Any] = {
+        "title": "Fix VAT float drift in orders.py",
+        "changed_files": ["orders.py"],
+        "applied_rules": ["RULE-001"],
+        "targeted_weaknesses": ["decimal_rounding"],
+        "doc_markdown": "## What changed\nMoney is Decimal end to end.",
+    }
+    sandbox.upsert_ship_log(diff_sha256=diff, **(fields | ship_log))
     question = sandbox.create_quiz(QUIZ, diff_sha256=diff)
     assert sandbox.grade_quiz_answer(question.question_id, "A").passed
     if approve:
@@ -226,9 +232,10 @@ def test_an_invalid_release_branch_is_refused_before_any_write(tmp_path: Path, b
 class FakeNetworkGit:
     """Runs local git commands for real and answers the network ones (``ls-remote``/``fetch``/``push``)."""
 
-    def __init__(self, *, push_stderr: str | None = None) -> None:
+    def __init__(self, *, push_stderr: str | None = None, ls_remote: str = "") -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
         self.push_stderr = push_stderr
+        self.ls_remote = ls_remote  # "" : the branch does not exist yet
         self._real_run = subprocess.run
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -240,7 +247,8 @@ class FakeNetworkGit:
             return self._real_run(argv, **kwargs)
         if command == "push" and self.push_stderr is not None:
             return subprocess.CompletedProcess(argv, 128, stdout="", stderr=self.push_stderr)
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")  # ls-remote: the branch does not exist yet
+        stdout = self.ls_remote if command == "ls-remote" else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
     def network_envs(self) -> list[dict[str, str]]:
         return [env for argv, env in self.calls if any(arg in NETWORK_COMMANDS for arg in argv)]
@@ -365,3 +373,129 @@ def test_the_completed_run_names_its_release_commit() -> None:
     suffix = workflow_module._release_suffix({"ok": True, "release": release.model_dump(mode="json")})
     assert suffix == " Release commit aaaaaaaaaaaa is on main (/tmp/release_remote.git)."
     assert workflow_module._release_suffix({"ok": True}) == ""  # e.g. a scripted backend without git
+
+
+# ---- task 2: observable push state, commit links, gate trailers ------------------------------------------------------
+def trailers(remote: Path, commit: str) -> set[str]:
+    return set(git("--git-dir", str(remote), "log", "-1", "--format=%(trailers:unfold,only)", commit).splitlines())
+
+
+def test_the_release_commit_carries_the_gate_evidence_as_trailers(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    diff = ship(sandbox, thread_id="thr-release-1", applied_rules=["RULE-001", "RULE-003"])
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(diff, "Fix VAT")["release"])
+    found = trailers(sandbox.settings.default_release_remote_dir, release.commit_sha)
+    assert {
+        f"Diff-SHA256: {diff}",
+        "Quiz-Attempts: 1",
+        "Approved-By: human",
+        "Rules: RULE-001, RULE-003",
+        "Thread: thr-release-1",
+    } <= found
+
+
+def test_an_unbound_thread_gets_no_thread_trailer(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Fix VAT")["release"])
+    found = trailers(sandbox.settings.default_release_remote_dir, release.commit_sha)
+    assert "Rules: RULE-001" in found and not [line for line in found if line.startswith("Thread:")]
+    assert release.commit_url is None  # a local remote has no web page
+
+
+def test_pushed_is_read_from_the_local_remote_and_scored_by_expected_state(tmp_path: Path) -> None:
+    sandbox = workspace_for(tmp_path)
+    assert not sandbox.snapshot_final_state().pushed  # nothing deployed yet
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Fix VAT")["release"])
+    final = sandbox.snapshot_final_state()
+    assert final.deployed and final.pushed and final.release_commit_sha == release.commit_sha
+    assert ExpectedState(deployed=True, pushed=True).mismatches(final) == {}
+    # someone rewrites the remote branch behind the gate's back (test-side, no push): the release is no longer on it
+    remote = sandbox.settings.default_release_remote_dir
+    git("--git-dir", str(remote), "update-ref", f"refs/heads/{DEFAULT_GIT_BRANCH}", release.parent_sha or "")
+    final = sandbox.snapshot_final_state()
+    assert final.deployed and not final.pushed
+    assert ExpectedState(pushed=True).mismatches(final) == {"pushed": (True, False)}
+
+
+def test_github_release_links_its_commit_and_pushed_uses_the_deploy_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeNetworkGit()
+    sandbox = github_workspace(tmp_path, monkeypatch, fake)
+    payload = sandbox.deploy_to_production(ship(sandbox), "Fix VAT")
+    release = ReleaseCommit.model_validate(payload["release"])
+    url = f"https://github.com/example-owner/example-release/commit/{release.commit_sha}"
+    assert release.commit_url == payload["commit_url"] == url
+    entry = sandbox.get_latest_ship_log()
+    assert entry is not None and entry.release_commit_url == url
+    calls_before = len(fake.network_envs())
+    assert sandbox.snapshot_final_state().pushed
+    assert len(fake.network_envs()) == calls_before  # judged on the deploy record: no network call
+    (sandbox.prod_dir / "orders.py").write_text("# drifted after the deploy\n")
+    assert not sandbox.snapshot_final_state().pushed  # prod no longer holds the pushed tree
+
+
+@pytest.mark.parametrize(
+    ("url", "repo"),
+    [
+        ("https://github.com/acme/release.git", "acme/release"),
+        ("https://GitHub.com/acme/release/", "acme/release"),
+        ("https://github.com/acme/release/extra", None),
+        ("https://gitlab.com/acme/release.git", None),
+        (f"https://x:{TOKEN}@github.com/acme/release.git", None),
+        ("/srv/git/release.git", None),
+        (None, None),
+    ],
+)
+def test_github_repo_is_parsed_only_from_a_clean_github_url(url: str | None, repo: str | None) -> None:
+    assert release_module.github_repo(url) == repo
+    expected = f"https://github.com/{repo}/commit/{'a' * 40}" if repo else None
+    assert release_module.github_commit_url(url, "a" * 40) == expected
+
+
+# ---- task 2: `no-quiz-no-prod init-github [--verify]` ---------------------------------------------------------------
+def init_github(settings: RuntimeSettings, *argv: str) -> tuple[int, str]:
+    out = io.StringIO()
+    args: argparse.Namespace = build_parser().parse_args(["init-github", *argv])
+    return _cmd_init_github(args, settings=settings, out=out), out.getvalue()
+
+
+def test_init_github_pushes_the_seed_once_and_deploys_build_on_it(tmp_path: Path) -> None:
+    remote = bare_repo(tmp_path / "team_release.git")
+    settings = RuntimeSettings(workspace_dir=tmp_path / "workspace", git_remote_url=str(remote))
+    code, before = init_github(settings, "--verify")
+    assert code == 0 and "head   : absent" in before and "✓ git" in before
+    code, created = init_github(settings)
+    seed_commit = tip(remote)
+    assert code == 0 and seed_commit is not None and f"pushed the fintech seed as {seed_commit}" in created
+    assert git("--git-dir", str(remote), "rev-list", "--count", seed_commit) == "1"
+    code, again = init_github(settings)
+    assert code == 0 and "left untouched" in again and tip(remote) == seed_commit  # never re-pushed, never forced
+    code, verified = init_github(settings, "--verify")
+    assert code == 0 and f"head   : {seed_commit}" in verified and f"branch : {DEFAULT_GIT_BRANCH}" in verified
+
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset()
+    release = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Fix VAT")["release"])
+    assert release.parent_sha == seed_commit  # the seed already matches prod: no baseline commit in between
+
+
+def test_init_github_verify_checks_the_token_and_never_prints_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = "c" * 40
+    fake = FakeNetworkGit(ls_remote=f"{head}\trefs/heads/{DEFAULT_GIT_BRANCH}\n")
+    monkeypatch.setattr(release_module.subprocess, "run", fake)
+    no_token = RuntimeSettings(workspace_dir=tmp_path / "workspace", git_remote_url=GITHUB_URL)
+    code, missing = init_github(no_token, "--verify")
+    assert code == 1 and "NO_QUIZ_GITHUB_TOKEN is not set" in missing
+    assert not fake.network_envs()  # no access attempt without a token
+
+    settings = no_token.model_copy(update={"github_token": SecretStr(TOKEN)})
+    code, verified = init_github(settings, "--verify")
+    assert code == 0 and "example-owner/example-release" in verified and f"head   : {head}" in verified
+    assert "NO_QUIZ_GITHUB_TOKEN : configured" in verified
+    leaky = settings.model_copy(update={"git_remote_url": f"https://x:{TOKEN}@github.com/example-owner/r.git"})
+    code, refused = init_github(leaky, "--verify")
+    assert code == 1 and "must not embed credentials" in refused
+    assert_token_absent(missing, verified, refused)

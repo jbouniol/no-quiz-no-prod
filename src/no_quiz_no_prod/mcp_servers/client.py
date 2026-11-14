@@ -10,9 +10,15 @@ from typing import Any
 from mcp import StdioServerParameters
 from mcp.types import CallToolResult, TextContent
 
-from no_quiz_no_prod.contracts import MCP_SERVER_MODULES, EnvVar, McpServerName, ToolErrorPayload
+from no_quiz_no_prod.contracts import DEFAULT_GIT_BRANCH, MCP_SERVER_MODULES, EnvVar, McpServerName, ToolErrorPayload
 
 WRAPPED_RESULT_KEY = "result"  # MCPServer wraps a non-object return value (a list) as {"result": value}
+# A launched server reads .env itself: without these, a GitHub remote and token configured there would be used.
+HERMETIC_RELEASE_ENV = {
+    EnvVar.NO_QUIZ_GIT_REMOTE_URL.value: "",
+    EnvVar.NO_QUIZ_GITHUB_TOKEN.value: "",
+    EnvVar.NO_QUIZ_GIT_BRANCH.value: DEFAULT_GIT_BRANCH,
+}
 
 
 def server_parameters(
@@ -21,9 +27,11 @@ def server_parameters(
     """Launch parameters of one server under the current interpreter, bound to ``workspace_dir`` when given.
 
     ``env`` is merged over the SDK's default environment, e.g. ``{"NOTION_API_KEY": ""}`` keeps an eval run off the
-    real Notion workspace (an empty value counts as unset).
+    real Notion workspace (an empty value counts as unset). The release remote is hermetic by default: the URL and
+    token are blanked (deploys go to the workspace's local bare remote) unless ``env`` sets them explicitly, since an
+    empty variable wins over the ``.env`` the server loads.
     """
-    extra = dict(env or {})
+    extra = HERMETIC_RELEASE_ENV | dict(env or {})
     if workspace_dir is not None:
         extra[EnvVar.NO_QUIZ_WORKSPACE_DIR.value] = str(workspace_dir)
     return StdioServerParameters(command=sys.executable, args=["-m", MCP_SERVER_MODULES[server]], env=extra)

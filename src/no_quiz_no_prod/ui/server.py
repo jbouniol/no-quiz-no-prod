@@ -25,7 +25,7 @@ import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 
 from no_quiz_no_prod import __version__
 from no_quiz_no_prod.contracts import (
@@ -315,13 +315,38 @@ class DeploySubmitRequest(BaseModel):
     topology: Topology | None = None
 
 
-ApiKeyProvider = Literal["openrouter", "anthropic", "notion"]
+ApiKeyProvider = Literal["openrouter", "anthropic", "notion", "github", "git_remote"]
 
 _API_KEY_ENV_MAP: Final[dict[ApiKeyProvider, tuple[EnvVar, str]]] = {
     "openrouter": (EnvVar.OPENROUTER_API_KEY, "openrouter_api_key"),
     "anthropic": (EnvVar.ANTHROPIC_API_KEY, "anthropic_api_key"),
     "notion": (EnvVar.NOTION_API_KEY, "notion_api_key"),
+    "github": (EnvVar.NO_QUIZ_GITHUB_TOKEN, "github_token"),
+    "git_remote": (EnvVar.NO_QUIZ_GIT_REMOTE_URL, "git_remote_url"),  # not a secret, but handled write-only too
 }
+_PLAIN_SETTINGS: Final = frozenset({"git_remote_url"})  # every other updatable setting is a SecretStr
+# The env var names are accepted as provider aliases (e.g. "NO_QUIZ_GITHUB_TOKEN").
+_PROVIDER_ALIASES: Final[dict[str, ApiKeyProvider]] = {
+    env_var.value: provider for provider, (env_var, _) in _API_KEY_ENV_MAP.items()
+}
+
+
+def _git_summary(settings: RuntimeSettings) -> dict[str, Any]:
+    """``{"remote_kind", "repo", "branch", "token_set"}``: the secret-free release remote view of health and state."""
+    from no_quiz_no_prod.backend.release import describe_release_remote  # local: the UI also runs without backend
+
+    return describe_release_remote(settings)
+
+
+def _check_release_remote_url(url: str) -> None:
+    """Validate a release remote URL before it is written (same rules as the deploy); never echoes the URL."""
+    from no_quiz_no_prod.backend.errors import WorkspaceError  # local: the UI also runs without backend
+    from no_quiz_no_prod.backend.release import GitReleasePublisher
+
+    try:
+        GitReleasePublisher(RuntimeSettings(git_remote_url=url)).resolve_remote()
+    except WorkspaceError as error:
+        raise ValueError(error.payload.message) from None
 
 
 class ApiKeyUpdateRequest(BaseModel):
@@ -329,6 +354,11 @@ class ApiKeyUpdateRequest(BaseModel):
 
     provider: ApiKeyProvider
     api_key: str = Field(min_length=1, repr=False)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _accept_env_var_names(cls, raw: Any) -> Any:
+        return _PROVIDER_ALIASES.get(raw, raw) if isinstance(raw, str) else raw
 
     @field_validator("api_key")
     @classmethod
@@ -339,6 +369,12 @@ class ApiKeyUpdateRequest(BaseModel):
         if "\n" in cleaned or "\r" in cleaned or "\x00" in cleaned:
             raise ValueError("API key must be a single-line token.")
         return cleaned
+
+    @model_validator(mode="after")
+    def _validate_release_remote(self) -> ApiKeyUpdateRequest:
+        if self.provider == "git_remote":
+            _check_release_remote_url(self.api_key)
+        return self
 
 
 def _format_env_assignment(var_name: str, secret_value: str) -> str:
@@ -568,7 +604,7 @@ class StudioManager:
             os.environ[env_var.value] = api_key
 
         notion_ids = _read_notion_metadata(self.notion_ids_file)
-        updates: dict[str, Any] = {settings_attr: SecretStr(api_key)}
+        updates: dict[str, Any] = {settings_attr: api_key if settings_attr in _PLAIN_SETTINGS else SecretStr(api_key)}
         if not self.settings.notion_ship_log_db_id and notion_ids.get("ship_log_db_id"):
             updates["notion_ship_log_db_id"] = notion_ids["ship_log_db_id"]
         if not self.settings.notion_rules_db_id and notion_ids.get("rules_db_id"):
@@ -588,6 +624,10 @@ class StudioManager:
                 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
 
                 self._workspace.notion = NotionDatabaseSync(self.settings)  # type: ignore[attr-defined]
+            if hasattr(self._workspace, "release"):
+                from no_quiz_no_prod.backend.release import GitReleasePublisher
+
+                self._workspace.release = GitReleasePublisher(self.settings)  # type: ignore[attr-defined]
         for session in self.sessions.values():
             session.workflow = None
         return self.provider_status
@@ -706,6 +746,7 @@ class StudioManager:
                 "locks": locks.model_dump(mode="json"),
             },
             "skill_profile": [rec.model_dump(mode="json") for rec in skills],
+            "git": _git_summary(self.settings),
         }
 
     def load_eval_results(self) -> dict[str, Any]:
@@ -903,6 +944,7 @@ def create_app(
             "version": __version__,
             "workspace_dir": ws_rel,
             "providers": manager.settings.providers,
+            "git": _git_summary(manager.settings),
         }
 
     @app.get("/api/state")
@@ -957,6 +999,7 @@ def create_app(
                 "providers": providers,
                 "notion_enabled": manager.settings.notion_enabled,
                 "models": _build_models_catalogue(manager.settings),
+                "git": _git_summary(manager.settings),
             },
         )
 

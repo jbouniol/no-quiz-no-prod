@@ -583,7 +583,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.workers < 1:
         parser.error("--workers must be >= 1")
 
-    settings = RuntimeSettings.from_env()
+    # An eval never pushes to a configured (e.g. GitHub) release remote, dry-run or live: each live run releases to
+    # the local bare remote of its own temporary workspace (see _execute_live_scenario).
+    settings = RuntimeSettings.from_env().model_copy(update={"git_remote_url": None, "github_token": None})
     scenarios = load_scenarios(args.scenarios, limit=args.limit)
     if args.scenario_ids:
         wanted = {sid.strip() for sid in args.scenario_ids.split(",") if sid.strip()}

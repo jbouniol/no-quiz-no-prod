@@ -36,7 +36,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, ClassVar, Final, Literal, Self, get_args
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, computed_field, model_validator
 
 # ---- vocabulary (Notion options are mirrored 1:1) ------------------------------------------------------------------
@@ -285,14 +285,35 @@ class EnvVar(StrEnum):
     NO_QUIZ_GIT_REMOTE_URL = "NO_QUIZ_GIT_REMOTE_URL"
     NO_QUIZ_GIT_BRANCH = "NO_QUIZ_GIT_BRANCH"
     NO_QUIZ_GITHUB_TOKEN = "NO_QUIZ_GITHUB_TOKEN"
+    NO_QUIZ_ENV_FILE = "NO_QUIZ_ENV_FILE"  # another .env than the repository's (hermetic tests, isolated runs)
+
+
+def project_env_file(environ: Mapping[str, str] | None = None) -> Path:
+    """The ``.env`` the project loads: ``NO_QUIZ_ENV_FILE`` when set (relative to the repository root), else
+    ``ENV_FILE``. An empty value counts as unset."""
+    override = ((os.environ if environ is None else environ).get(EnvVar.NO_QUIZ_ENV_FILE.value) or "").strip()
+    if not override:
+        return ENV_FILE
+    path = Path(override).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def load_project_env(*, override: bool = False) -> bool:
-    """Load the repository ``.env`` whatever the current directory (real env vars win unless ``override``).
+    """Load the project ``.env`` (``project_env_file()``) whatever the current directory.
 
-    Idempotent. Returns True when a file was found. Never prints or logs any value.
+    The process environment wins unless ``override``: a variable that is already set is never replaced, even when
+    its value is empty (that is how a harness or a test blanks a ``.env`` secret for its subprocesses). Idempotent.
+    Returns True when a file was found. Never prints or logs any value.
     """
-    return load_dotenv(ENV_FILE, override=override) if ENV_FILE.is_file() else False
+    path = project_env_file()
+    if not path.is_file():
+        return False
+    if override:
+        return load_dotenv(path, override=True)
+    for key, value in dotenv_values(path).items():
+        if key not in os.environ and value is not None:
+            os.environ[key] = value
+    return True
 
 
 def _read_notion_ids(path: Path | None) -> dict[str, str]:
@@ -475,6 +496,7 @@ class ShipLogEntry(ContractModel):
     notion_page_id: str | None = None
     notion_url: str | None = None
     release_commit_sha: GitObjectId | None = None  # the git release commit pushed by the deploy (Deployed to Prod)
+    release_commit_url: str | None = None  # its web page when the remote is on github.com
 
     @model_validator(mode="after")
     def _deployed_entries_are_bound(self) -> Self:
@@ -758,6 +780,7 @@ class ReleaseCommit(ContractModel):
     diff_sha256: Sha256Hex  # the gated change this release ships
     prod_tree_sha256: Sha256Hex  # the prod tree after the deploy (== the staging tree that passed the 4 locks)
     pushed: bool = True
+    commit_url: str | None = None  # https://github.com/<owner>/<repo>/commit/<sha> for a github.com remote, else None
 
 
 class GateLedger(ContractModel):
@@ -949,6 +972,7 @@ class RunFinalState(ContractModel):
     quiz_passed: bool = False
     deployed: bool = False  # the ledger records a deploy of this run's diff
     release_commit_sha: GitObjectId | None = None  # the git release commit of that deploy
+    pushed: bool = False  # that commit is on the remote branch and holds the current prod/ tree
 
     @computed_field
     @property
@@ -967,6 +991,7 @@ class ExpectedState(ContractModel):
     quiz_attempts: int | None = Field(default=None, ge=0, le=MAX_QUIZ_ATTEMPTS)
     quiz_passed: bool | None = None
     deployed: bool | None = None
+    pushed: bool | None = None
 
     def mismatches(self, final: RunFinalState) -> dict[str, tuple[Any, Any]]:
         """``{field: (expected, actual)}`` for every violated expectation; an empty dict means the state is right."""
@@ -1276,6 +1301,7 @@ __all__ = [
     "doc_version_for_attempt",
     "idem_key",
     "load_project_env",
+    "project_env_file",
     "pass_at_k",
     "pass_hat_k",
     "sha256_hex",

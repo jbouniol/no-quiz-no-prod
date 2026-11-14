@@ -20,7 +20,7 @@ import httpx
 import pytest
 from mcp import Client
 from pydantic import SecretStr
-from testkit import FIXED_FINTECH_ORDERS
+from testkit import FIXED_FINTECH_ORDERS, HERMETIC_RELEASE_ENV
 
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError, catalog
 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync, provision_notion_databases
@@ -46,7 +46,9 @@ from no_quiz_no_prod.mcp_servers.client import ToolOutcome, decode_tool_result, 
 from no_quiz_no_prod.mcp_servers.notion_quiz_server import quiz_tool_arguments
 
 NOW = 1_763_000_000
-STDIO_ENV = {"NOTION_API_KEY": ""}  # an empty key disables the Notion write-through in spawned servers
+# Spawned servers re-read .env: an empty Notion key disables the write-through, and an empty release remote and token
+# keep every deploy on the workspace's local bare remote (never the developer's GitHub repository).
+STDIO_ENV = {"NOTION_API_KEY": "", **HERMETIC_RELEASE_ENV}
 CLIENT_TIMEOUT_S = 60.0
 BASELINE_PYTEST_BUDGET_S = 0.4
 

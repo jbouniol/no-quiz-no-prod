@@ -7,10 +7,14 @@ code, real staging pytest, SHA-256 gate ledger, private quizzes, Layer 4 skill p
 
     doc v1 + quiz 1 -> wrong answer (B) -> Layer 4 "Weakness Detected" -> fresh Examiner: doc v2 + quiz 2
     -> right answer (C) -> human approval -> deploy_to_production (system role, over stdio) -> prod == staging
+    -> the release commit (content == prod/, gate trailers) is on the workspace's local bare release remote
 
-while every premature, mismatched or replayed approval gets ``409 gate_locked`` and leaves prod untouched.
+while every premature, mismatched or replayed approval gets ``409 gate_locked``, leaves prod untouched and pushes
+nothing.
 """
 
+import os
+import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +23,15 @@ from typing import Any, Final
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from testkit import FIXED_FINTECH_ORDERS, SCRIPTED_MODEL, ScriptedLLM, call, parse_sse_events, turn
+from testkit import (
+    FIXED_FINTECH_ORDERS,
+    HERMETIC_RELEASE_ENV,
+    SCRIPTED_MODEL,
+    ScriptedLLM,
+    call,
+    parse_sse_events,
+    turn,
+)
 
 from no_quiz_no_prod.agents.examiner import REMEDIATION_HEADING
 from no_quiz_no_prod.agents.tools import SEALED
@@ -122,6 +134,21 @@ class LiveStudio:
     def prod_file(self, name: str) -> str:
         return (self.settings.area_dir("prod") / name).read_text(encoding="utf-8")
 
+    def remote_git(self, *args: str) -> str:
+        """git against the default local bare release remote, isolated from the developer's git config."""
+        env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+        env |= {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, **HERMETIC_RELEASE_ENV}
+        argv = ["git", "--git-dir", str(self.settings.default_release_remote_dir), *args]
+        return subprocess.run(argv, env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+    def release_tip(self) -> str | None:
+        """Tip of the release branch on the local remote; None while nothing was ever pushed."""
+        if not (self.settings.default_release_remote_dir / "HEAD").is_file():
+            return None
+        ref = f"refs/heads/{self.settings.git_branch}"
+        listing = self.remote_git("for-each-ref", "--format=%(objectname)", ref)  # reads the bare remote's own refs
+        return listing or None
+
     def stream_run(self) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
         payload = {"prompt": TASK, "thread_id": THREAD, "user_id": USER, "model": SCRIPTED_MODEL, "topology": "dual"}
         response = self.client.post("/api/runs/stream", json=payload)
@@ -212,7 +239,7 @@ def test_studio_drives_remediation_to_production_over_real_stdio_mcp(live_studio
 
     # 2. A premature approval is refused server-side: Lock 3 (quiz) is missing
     assert_gate_locked(live_studio.approve(), "quiz_passed")
-    assert live_studio.prod_tree() == seed_prod
+    assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
 
     # 3. Wrong answer -> Layer 4 "Weakness Detected" -> a fresh Examiner publishes doc v2 + a new quiz 2
     wrong = live_studio.answer("B")
@@ -249,7 +276,7 @@ def test_studio_drives_remediation_to_production_over_real_stdio_mcp(live_studio
     )
     assert bypass.error is not None and bypass.error.code == "gate_locked" and not bypass.error.retryable
     assert bypass.error.details["missing_locks"] == ["human_approved"]
-    assert live_studio.prod_tree() == seed_prod
+    assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
 
     # 6. The human approves the reviewed hash -> system deploy over stdio -> prod == staging, Ship Log deployed
     response = live_studio.approve(diff_sha)
@@ -260,8 +287,27 @@ def test_studio_drives_remediation_to_production_over_real_stdio_mcp(live_studio
     assert all(deployed["locks"][lock] for lock in ALL_DEPLOY_LOCKS) and not deployed["locks"]["blocked"]
     assert live_studio.prod_file("orders.py") == FIXED_FINTECH_ORDERS and live_studio.prod_tree() != seed_prod
 
+    # 6b. The deploy is a real git release on the local bare remote: content == prod/, gate evidence in its trailers
+    release = live_studio.release_tip()
+    assert release is not None and deployed["ship_log"]["release_commit_sha"] == release
+    prod_dir = live_studio.settings.area_dir("prod")
+    files = live_studio.remote_git("ls-tree", "-r", "--name-only", release).splitlines()
+    assert sorted(files) == sorted(path.name for path in prod_dir.iterdir() if path.is_file())
+    for name in files:
+        assert live_studio.remote_git("show", f"{release}:{name}") == (prod_dir / name).read_text().strip()
+    trailers = live_studio.remote_git("log", "-1", "--format=%(trailers:unfold,only)", release).splitlines()
+    assert {
+        f"Diff-SHA256: {diff_sha}",
+        "Quiz-Attempts: 2",
+        "Approved-By: human",
+        "Rules: RULE-001",
+        f"Thread: {THREAD}",
+    } <= set(trailers)
+    assert live_studio.workflow.workspace.snapshot_final_state(THREAD).pushed
+
     # 7. Replaying the approval cannot ship anything twice
     assert_gate_locked(live_studio.approve(diff_sha), "tests_passed")
+    assert live_studio.release_tip() == release  # nothing pushed on top
 
     # 8. Trace: only the system role deployed, no model ever saw the deploy tool, every scripted turn was used
     trace = live_studio.workflow.app.get_state({"configurable": {"thread_id": THREAD}}).values["trace"]
@@ -287,5 +333,5 @@ def test_gate_answers_409_when_nothing_is_staged_or_resumable(live_studio: LiveS
     unknown_quiz = client.post(f"/api/runs/{THREAD}/quiz", json={"selected_option": "A", "user_id": USER})
     assert_gate_locked(unknown_quiz)  # no paused quiz interrupt on this thread
 
-    assert live_studio.prod_tree() == seed_prod
+    assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
     assert live_studio.llm.calls == []  # refused before any agent ran

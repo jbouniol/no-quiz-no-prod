@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 from pydantic import SecretStr
+from testkit import HERMETIC_RELEASE_ENV
 
 from no_quiz_no_prod.contracts import (
     ALL_SKILL_TAGS,
@@ -502,6 +504,7 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
         capture_output=True,
         text=True,
         check=True,
+        env=os.environ | HERMETIC_RELEASE_ENV,
     )
     assert "--scenarios" in help_proc.stdout
     assert "--out" in help_proc.stdout
@@ -586,6 +589,7 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
             "--dry-run",
         ],
         check=True,
+        env=os.environ | HERMETIC_RELEASE_ENV,
     )
     assert (sub_out / "results.jsonl").is_file()
     assert (sub_out / "summary.md").is_file()

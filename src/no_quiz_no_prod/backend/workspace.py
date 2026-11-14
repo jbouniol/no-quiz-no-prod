@@ -254,6 +254,7 @@ class SandboxWorkspace:
                 run_diff = entry.diff_sha256 if entry else (quiz.diff_sha256 if quiz else None)
                 attempts = entry.quiz_attempts if entry else (self._graded_count(conn, run_diff) if run_diff else 0)
                 release = self._release_for_diff(conn, run_diff)
+            pushed = release is not None and self.release.is_released(release, self.prod_dir)
         return RunFinalState(
             prod_tree_sha256=prod_tree,
             staging_tree_sha256=staging_tree,
@@ -265,6 +266,7 @@ class SandboxWorkspace:
             quiz_passed=run_diff is not None and run_diff in ledger.quiz_passed,
             deployed=run_diff is not None and run_diff in ledger.deployed,
             release_commit_sha=release.commit_sha if release else None,
+            pushed=pushed,
         )
 
     def consume_fault(self, kind: FaultKind) -> bool:
@@ -385,7 +387,8 @@ class SandboxWorkspace:
         The release is a git commit of the staging tree, pushed fast-forward to the release remote BEFORE prod is
         promoted: a refused or failed push raises (``conflict``, ``upstream_error``, ``timeout``) and leaves prod, the
         ledger and the ship log untouched, the locks still holding for a retry. The payload's ``release`` is the
-        ``ReleaseCommit``.
+        ``ReleaseCommit`` (``commit_url`` is repeated at the top level). Its trailers carry the quiz attempts, the
+        applied rules and the thread of the change's ship log.
         """
         self.ensure_ready()
         tool = catalog.DEPLOY_TO_PRODUCTION
@@ -403,12 +406,19 @@ class SandboxWorkspace:
             status = self._ledger().status(current, expected_diff_sha256)
             if prod_tree == staging_tree or not status.can_deploy:
                 raise self._gate_locked(status, expected_diff_sha256, trees_identical=prod_tree == staging_tree)
+            with self._read() as conn:
+                documented = self._ship_log_for_diff(conn, current)
+                attempts = self._graded_count(conn, current)
+            thread = documented.thread_id if documented else None
             release = self.release.publish(
                 source_dir=self.staging_dir,
                 baseline_dir=self.prod_dir,
                 diff_sha256=current,
                 prod_tree_sha256=staging_tree,
                 release_note=release_note,
+                quiz_attempts=attempts,
+                applied_rules=documented.applied_rules if documented else (),
+                thread_id=None if thread == catalog.DEFAULT_THREAD_ID else thread,
             )
             self._swap_tree(self.prod_dir, lambda fresh: copy_tree(self.staging_dir, fresh), expected=staging_tree)
             self._record("deployed", current)
@@ -423,6 +433,7 @@ class SandboxWorkspace:
                             "status": "Deployed to Prod",
                             "deployed_at": deployed_at,
                             "release_commit_sha": release.commit_sha,
+                            "release_commit_url": release.commit_url,
                         }
                     )
                     self._save_ship_log(conn, entry)
@@ -446,6 +457,7 @@ class SandboxWorkspace:
                 "release_note": release_note,
                 "ship_log_status": entry.status if entry else None,
                 "release": release.model_dump(mode="json"),
+                "commit_url": release.commit_url,
                 "replayed": False,
             }
             self._remember(catalog.CODE_SERVER, tool, idempotency_key, payload)

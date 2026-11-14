@@ -1210,3 +1210,44 @@ def test_post_apikey_updates_temp_env_0600_without_leaking_secrets(
     state = json.loads(state_txt)
     assert state["notion"]["notion_enabled"] is True
     assert state["notion"]["notion_key_configured"] is True
+
+
+# ---- 8. Git release remote: secret-free health/state view and write-only token & URL (POST /api/apikey) -------------
+def test_git_remote_status_and_write_only_github_settings(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    client, _, _ = studio_env
+    studio = client.app.state.studio
+    env_file: Path = studio.env_file
+    token = "ghp_TESTONLYstudiotoken0123456789abcdef"
+    url = "https://github.com/acme/fintech-release.git"
+    local_view = {"remote_kind": "local", "repo": None, "branch": "main", "token_set": False}
+    assert client.get("/api/health").json()["git"] == local_view
+    assert client.get("/api/state").json()["git"] == local_view
+
+    # 1. A URL with embedded credentials or a non-https scheme is refused before anything is written, never echoed
+    leaky = f"https://x-access-token:{token}@github.com/acme/fintech-release.git"
+    refused = client.post("/api/apikey", json={"provider": "git_remote", "api_key": leaky})
+    assert refused.status_code == 422 and token not in refused.text and "NO_QUIZ_GITHUB_TOKEN" in refused.text
+    ssh = client.post("/api/apikey", json={"provider": "git_remote", "api_key": "ssh://git@github.com/acme/r.git"})
+    assert ssh.status_code == 422
+    assert not env_file.exists() or "NO_QUIZ_GIT_REMOTE_URL" not in env_file.read_text(encoding="utf-8")
+
+    # 2. Token and URL are accepted under their provider names or their env var names, and never returned
+    saved_token = client.post("/api/apikey", json={"provider": "NO_QUIZ_GITHUB_TOKEN", "api_key": f" {token} "})
+    assert saved_token.status_code == 200 and token not in saved_token.text
+    assert saved_token.json()["provider"] == "github" and saved_token.json()["git"]["token_set"] is True
+    assert saved_token.json()["providers"] == {"openrouter": True, "anthropic": False, "notion": False}
+    saved_url = client.post("/api/apikey", json={"provider": "git_remote", "api_key": url})
+    assert saved_url.status_code == 200 and url not in saved_url.text
+    github_view = {"remote_kind": "https", "repo": "acme/fintech-release", "branch": "main", "token_set": True}
+    assert saved_url.json()["git"] == github_view
+
+    # 3. Same write-only persistence as Notion: 0o600 .env, settings refreshed, nothing secret in health or state
+    assert (env_file.stat().st_mode & 0o777) == 0o600
+    lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert f"NO_QUIZ_GITHUB_TOKEN={token}" in lines and f"NO_QUIZ_GIT_REMOTE_URL={url}" in lines
+    assert studio.settings.github_token.get_secret_value() == token and studio.settings.git_remote_url == url
+    health, state = client.get("/api/health"), client.get("/api/state")
+    assert health.json()["git"] == github_view and state.json()["git"] == github_view
+    assert token not in health.text and token not in state.text and url not in health.text

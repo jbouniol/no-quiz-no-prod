@@ -4,6 +4,8 @@
   scripted turns, recognised by the role header of the system prompt, and records every call it receives.
 - ``FIXED_FINTECH_ORDERS``: a RULE-001 compliant ``orders.py`` that keeps the seeded ``test_fintech.py`` suite green.
 - ``parse_sse_events``: decodes a Studio SSE body and validates every frame against the frozen ``RunEvent`` contract.
+- ``HERMETIC_RELEASE_ENV``: the release-remote variables every test process and subprocess gets, so a GitHub remote
+  or token in the developer's ``.env`` can never be read, let alone pushed to (``conftest.py`` applies it).
 """
 
 import copy
@@ -13,10 +15,16 @@ from types import SimpleNamespace
 from typing import Any, Final
 
 from no_quiz_no_prod.agents.prompts import ROLE_HEADER_CODER, ROLE_HEADER_EXAMINER, ROLE_HEADER_SINGLE
-from no_quiz_no_prod.contracts import RunEvent
+from no_quiz_no_prod.contracts import DEFAULT_GIT_BRANCH, EnvVar, RunEvent
 from no_quiz_no_prod.llm import ChatTurnResponse, LLMUsage, NormalizedToolCall
 
 SCRIPTED_MODEL: Final = "fake/scripted"
+# Set (empty) wins over .env: load_project_env never replaces a variable that is already set, even an empty one.
+HERMETIC_RELEASE_ENV: Final[dict[str, str]] = {
+    EnvVar.NO_QUIZ_GIT_REMOTE_URL.value: "",
+    EnvVar.NO_QUIZ_GITHUB_TOKEN.value: "",
+    EnvVar.NO_QUIZ_GIT_BRANCH.value: DEFAULT_GIT_BRANCH,
+}
 USAGE: Final = LLMUsage(tokens_in=100, tokens_out=20, cost_usd=0.0001, latency_s=0.0, model=SCRIPTED_MODEL)
 ROLE_BY_HEADER: Final = {ROLE_HEADER_CODER: "coder", ROLE_HEADER_EXAMINER: "examiner", ROLE_HEADER_SINGLE: "single"}
 
