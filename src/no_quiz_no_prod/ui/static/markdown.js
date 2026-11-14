@@ -74,29 +74,23 @@ export function extractRemediationCallout(rawMarkdown, fallbackMisconception = n
   let text = String(rawMarkdown || "");
   let extracted = "";
 
-  // 1. Check Notion-style <callout icon="⚠️" color="orange_bg">...Remediation...</callout>
+  // 1. Check Notion-style <callout ...>...Remediation...</callout>
   const notionCalloutRe = /<callout([^>]*)>([\s\S]*?)<\/callout>/gi;
-  text = text.replace(notionCalloutRe, (fullMatch, attrs, inner) => {
+  text = text.replace(notionCalloutRe, (_fullMatch, attrs, inner) => {
     const isRemediation =
       /remediation|trap|previous answer|attempt\s*1/i.test(inner) || /orange/i.test(attrs);
     if (isRemediation && !extracted) {
       extracted = inner.trim().replace(/^\t+/gm, "");
       return "";
     }
-    // Convert any other Notion <callout> to standard blockquote so it renders cleanly
-    const iconMatch = String(attrs).match(/icon="([^"]+)"/);
-    const prefix = iconMatch ? `${iconMatch[1]} ` : "💡 ";
     const lines = inner
       .trim()
       .split(/\r?\n/)
       .map((l) => `> ${l.replace(/^\t+/, "")}`);
-    if (lines.length > 0) {
-      lines[0] = `> ${prefix}${lines[0].slice(2)}`;
-    }
     return `\n${lines.join("\n")}\n`;
   });
 
-  // 2. Check blockquote starting with > ⚠️ Pedagogical Remediation or ## Remediation v2 section
+  // 2. Check blockquote starting with > Pedagogical Remediation or ## Remediation v2 section
   if (!extracted && isV2) {
     const bqRe = /(?:^|\n)((?:>\s*[^\n]*(?:Remediation|trap|misconception)[^\n]*\n)(?:>\s*[^\n]*\n?)*)/i;
     const bqMatch = text.match(bqRe);
@@ -113,6 +107,8 @@ export function extractRemediationCallout(rawMarkdown, fallbackMisconception = n
   if (!extracted && isV2 && fallbackMisconception) {
     extracted = fallbackMisconception;
   }
+
+  extracted = extracted.replace(/^[\u26A0\uFE0F\s]+/, "").trim();
 
   return {
     calloutBody: extracted,
@@ -193,13 +189,26 @@ export function renderNotionMarkdown(rawMarkdown) {
         i += 1;
       }
       const joined = quoteLines.join(" ");
-      const iconMatch = joined.match(/^(💡|🚫|⚠️|🛡️|🎯|✅|📌)\s*(.*)$/);
+      const iconMatch = joined.match(
+        /^(\u{1F4A1}|\u{1F6AB}|\u26A0\uFE0F?|\u{1F6E1}\uFE0F?|\u{1F3AF}|\u2705|\u{1F4CC})\s*(.*)$/u
+      );
       if (iconMatch) {
-        const icon = iconMatch[1];
-        const tone = icon === "🚫" ? "danger" : icon === "⚠️" ? "warn" : "info";
+        const marker = iconMatch[1];
+        const tone =
+          marker === "\u{1F6AB}"
+            ? "danger"
+            : marker.startsWith("\u26A0")
+              ? "warn"
+              : "info";
+        const svgIcon =
+          tone === "danger"
+            ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="m15 9-6 6M9 9l6 6"></path></svg>`
+            : tone === "warn"
+              ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></svg>`
+              : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>`;
         blocks.push(
           `<aside class="md-callout md-callout--${tone}">` +
-            `<span class="md-callout__icon" aria-hidden="true">${icon}</span>` +
+            `<span class="md-callout__icon" aria-hidden="true">${svgIcon}</span>` +
             `<div class="md-callout__body">${renderInlineMarkdown(iconMatch[2])}</div>` +
           `</aside>`
         );

@@ -83,8 +83,8 @@ uv run no-quiz-ui
 ```
 
 Open `http://127.0.0.1:8000`:
-- **Mode 1 (`⌘1`) — Live Studio**: 3-pane workspace with live SSE step telemetry (`idem_key`, retry, injection containment badges), Unified/Split word-level code diff + SHA-256 pills, Notion Ship Log preview with animated **v2 Remediation Callout**, keyboard-driven `1–4` + `Enter` Quiz Gate, 4-Lock Production Approval, and Layer 4 Skill Profile (`/forget`).
-- **Mode 2 (`⌘2`) — Trace & Golden Set Explorer**: State-scored evaluation analytics across `normal`, `ambiguous`, `impossible`, and `adversarial` scenarios, `pass@k` & `pass^k`, Dual vs. Single cohort comparison, and 1-click full Trace Replay.
+- **Mode 1 (`⌘1`) — Workbench**: Dev Hero Launch Stage (`Plus Jakarta Sans` + `JetBrains Mono`, `.ambient-glow` + 24px engineering grid, top-bar `.env` API key & Notion popover) transitioning seamlessly into a 3-pane IDE split with live SSE MCP traces, Unified/Split `prod..staging` diff + SHA-256 commit bar, Notion Ship Log `v1` → `Remediation v2` inspector, keyboard-driven `1–4` + `Enter` Quiz Gate, vertical 4-Lock Production Pipeline, and Layer 4 Skill Matrix (`/forget`).
+- **Mode 2 (`⌘2`) — Benchmarks & Traces**: State-scored observability matrix across `normal`, `ambiguous`, `impossible`, and `adversarial` scenarios, `pass@k` & `pass^k`, Dual vs. Single cohort comparison, and 1-click full Trace & `RunFinalState` Replay.
 
 ### 3. Run the 30-Scenario State-Based Evaluation Harness
 
@@ -256,7 +256,7 @@ DeepSeek is the more reliable and cheaper default. Gemini is the low-latency opt
 ## Development & Verification
 
 ```bash
-# Run full automated test suite (86 tests: backend+MCP 28, graph+memory 38, eval 9, UI 9, end-to-end 2)
+# Run full automated test suite (87 tests: backend+MCP 28, graph+memory 38, eval 9, UI 10, end-to-end 2)
 uv run pytest -v
 
 # Run lint and formatting checks

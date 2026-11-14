@@ -571,6 +571,7 @@ def studio_env(tmp_path: Path) -> tuple[TestClient, StubSandboxWorkspace, Path]:
         workflow_factory=wf_factory,
         eval_dir=eval_dir,
         notion_ids_file=notion_ids_path,
+        env_file=tmp_path / ".env",
     )
     return TestClient(app), stub_ws, eval_dir
 
@@ -582,6 +583,13 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     index_resp = client.get("/")
     assert index_resp.status_code == 200
     assert "No-Quiz-No-Prod" in index_resp.text
+    assert "Plus+Jakarta+Sans" in index_resp.text
+    assert "JetBrains+Mono" in index_resp.text
+    assert 'class="ambient-glow"' in index_resp.text
+    assert 'id="home-hero-stage"' in index_resp.text
+    assert 'id="home-prompt-card"' in index_resp.text
+    assert 'id="workbench-split"' in index_resp.text
+    assert 'id="api-popover"' in index_resp.text
     assert "/static/tokens.css" in index_resp.text
     assert "/static/styles.css" in index_resp.text
     assert "/static/app.js" in index_resp.text
@@ -598,10 +606,13 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     assert "rgba(" not in styles_text.lower()
     assert "cubic-bezier(" not in styles_text.lower()
 
-    # Enforce zero hardcoded hex palettes in JS/HTML files owned by ui-docs
+    # Enforce zero hardcoded hex palettes & zero decorative emoji slop in JS/HTML files
+    banned_emojis = ("🛡️", "📄", "🎯", "⚡", "🚀", "🛑", "🧠", "🔒", "🗑", "🔐", "↺", "▶")
     for name in ("index.html", "app.js", "diff.js", "markdown.js"):
         content = (STATIC_DIR / name).read_text(encoding="utf-8")
         assert re.search(r"#[0-9a-fA-F]{6}\b", content) is None, f"Hardcoded hex found in {name}"
+        for emoji in banned_emojis:
+            assert emoji not in content, f"Decorative emoji {emoji!r} found in {name}"
 
     # Verify every $(id) lookup in app.js maps to an element ID in index.html or dynamically rendered card
     html_text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -1109,3 +1120,93 @@ def test_eval_deduplication_and_seed_rules_body_file(
     assert isinstance(loaded_rules[0], NotionRule)
     assert "Use Decimal." in loaded_rules[0].body_markdown
     _ = stub_ws
+
+
+# ---- 7. Write-Only .env API Key & Notion Popover Endpoint (POST /api/apikey) ----------------------------------------
+def test_post_apikey_updates_temp_env_0600_without_leaking_secrets(
+    studio_env: tuple[TestClient, StubSandboxWorkspace, Path],
+) -> None:
+    client, _, _ = studio_env
+    env_file: Path = client.app.state.studio.env_file
+
+    # Seed isolated temp .env with comments & unrelated keys to verify non-destructive upsert
+    env_file.write_text(
+        "# Local developer overrides\nOPENROUTER_MODEL=openai/gpt-4o-mini\nOPENROUTER_API_KEY=sk-or-old-value\n",
+        encoding="utf-8",
+    )
+
+    secret_or = "sk-or-v1-super-secret-live-token"
+    secret_ant = "sk-ant-api03-super-secret-claude-token"
+    secret_ntn = "ntn_super_secret_notion_token"
+
+    # 1. Reject empty, whitespace, newline-injected, or unknown provider payloads without echoing secrets
+    empty_res = client.post("/api/apikey", json={"provider": "openrouter", "api_key": "   "})
+    assert empty_res.status_code == 422
+    assert empty_res.json()["ok"] is False
+
+    injected_secret = f"{secret_or}\nMALICIOUS=1"
+    newline_res = client.post("/api/apikey", json={"provider": "openrouter", "api_key": injected_secret})
+    assert newline_res.status_code == 422
+    assert secret_or not in newline_res.text
+
+    bad_prov = client.post("/api/apikey", json={"provider": "unknown", "api_key": secret_or})
+    assert bad_prov.status_code == 422
+    assert secret_or not in bad_prov.text
+
+    # 1b. Block drive-by text/plain no-cors CSRF and cross-origin Origin headers
+    no_cors_csrf = client.post(
+        "/api/apikey",
+        content=json.dumps({"provider": "openrouter", "api_key": secret_or}),
+        headers={"Content-Type": "text/plain"},
+    )
+    assert no_cors_csrf.status_code == 415
+    assert secret_or not in no_cors_csrf.text
+
+    cross_origin = client.post(
+        "/api/apikey",
+        json={"provider": "openrouter", "api_key": secret_or},
+        headers={"Origin": "https://evil.example.com", "Host": "127.0.0.1:8000"},
+    )
+    assert cross_origin.status_code == 403
+    assert secret_or not in cross_origin.text
+
+    # 2. Save OpenRouter, Anthropic, and Notion keys sequentially
+    res_or = client.post("/api/apikey", json={"provider": "openrouter", "api_key": f"  {secret_or}  "})
+    assert res_or.status_code == 200
+    assert secret_or not in res_or.text
+    assert res_or.json()["ok"] is True
+    assert res_or.json()["providers"] == {"openrouter": True, "anthropic": False, "notion": False}
+
+    res_ant = client.post("/api/apikey", json={"provider": "anthropic", "api_key": secret_ant})
+    assert res_ant.status_code == 200
+    assert secret_ant not in res_ant.text
+    assert res_ant.json()["providers"] == {"openrouter": True, "anthropic": True, "notion": False}
+    anthropic_opt = next(o for o in res_ant.json()["models"]["options"] if o["provider"] == "anthropic")
+    assert anthropic_opt["enabled"] is True
+
+    res_ntn = client.post("/api/apikey", json={"provider": "notion", "api_key": secret_ntn})
+    assert res_ntn.status_code == 200
+    assert secret_ntn not in res_ntn.text
+    assert res_ntn.json()["providers"] == {"openrouter": True, "anthropic": True, "notion": True}
+    assert res_ntn.json()["notion_enabled"] is True
+
+    # 3. Verify 0o600 permissions, preserved comments/lines, and refreshed /api/health + /api/state
+    assert (env_file.stat().st_mode & 0o777) == 0o600
+    written_lines = env_file.read_text(encoding="utf-8").splitlines()
+    assert "# Local developer overrides" in written_lines
+    assert "OPENROUTER_MODEL=openai/gpt-4o-mini" in written_lines
+    assert f"OPENROUTER_API_KEY={secret_or}" in written_lines
+    assert f"ANTHROPIC_API_KEY={secret_ant}" in written_lines
+    assert f"NOTION_API_KEY={secret_ntn}" in written_lines
+    assert sum(1 for line in written_lines if line.startswith("OPENROUTER_API_KEY=")) == 1
+
+    health = client.get("/api/health").json()
+    assert health["providers"] == {"openrouter": True, "anthropic": True}
+
+    state_txt = client.get("/api/state").text
+    assert secret_or not in state_txt
+    assert secret_ant not in state_txt
+    assert secret_ntn not in state_txt
+    state = json.loads(state_txt)
+    assert state["notion"]["notion_enabled"] is True
+    assert state["notion"]["notion_key_configured"] is True

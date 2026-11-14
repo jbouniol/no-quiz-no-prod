@@ -310,6 +310,24 @@ function renderSplitTable(hunks) {
   return `<table class="diff-table diff-table--split" aria-label="Side-by-side prod vs staging code diff"><tbody>${trs.join("")}</tbody></table>`;
 }
 
+const FILE_CODE_SVG =
+  `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">` +
+  `<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"></path>` +
+  `<polyline points="14 2 14 8 20 8"></polyline>` +
+  `<path d="m10 13-2 2 2 2"></path>` +
+  `<path d="m14 17 2-2-2-2"></path>` +
+  `</svg>`;
+
+/**
+ * Canonical DOM element ID for a FileDiff card, shared across diff.js and app.js.
+ * @param {string} path
+ * @param {number} index
+ * @returns {string}
+ */
+export function diffFileDomId(path, index) {
+  return `diff-file-${index}-${String(path || "file").replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
 /**
  * Render all changed FileDiff cards in either "unified" or "split" mode.
  * @param {Array<{path: string, additions: number, deletions: number, unified_diff: string}>} files
@@ -322,7 +340,7 @@ export function renderDiffFiles(files, mode = "unified") {
   }
   return files
     .map((file, index) => {
-      const safeId = `diff-file-${index}-${ String(file.path || "file").replace(/[^a-zA-Z0-9_-]/g, "-") }`;
+      const safeId = diffFileDomId(file.path, index);
       const hunks = parseUnifiedDiff(file.unified_diff || "");
       const bodyHtml =
         hunks.length === 0
@@ -334,9 +352,9 @@ export function renderDiffFiles(files, mode = "unified") {
         `<section class="diff-file-card" id="${safeId}" data-file-path="${escapeHtml(file.path)}">` +
           `<header class="diff-file-card__header">` +
             `<div class="diff-file-card__title">` +
-              `<span class="diff-file-card__icon" aria-hidden="true">📄</span>` +
+              `<span class="diff-file-card__icon" aria-hidden="true">${FILE_CODE_SVG}</span>` +
               `<span class="mono-text">${escapeHtml(file.path)}</span>` +
-              `<span class="diff-file-card__scope">prod ↔ staging</span>` +
+              `<span class="diff-file-card__scope">prod..staging</span>` +
             `</div>` +
             `<div class="diff-file-card__stats tabular-nums">` +
               `<span class="diff-stat-add">+${Number(file.additions || 0)}</span>` +

@@ -3,23 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>No-Quiz-No-Prod — Agentic Coding &amp; Pedagogy Studio</title>
+    <title>No-Quiz-No-Prod — Agentic Gate &amp; Dev Platform</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap"
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/tokens.css" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <!-- french-data-rag Reactive Ambient Aura + 24px Engineering Dot-Grid -->
+    <div id="ambient-glow" class="ambient-glow" aria-hidden="true"></div>
+
     <!-- =====================================================================
-         Sticky 52px Global Header Bar
+         Floating Glassmorphic Dev Platform Top Bar
          ===================================================================== -->
     <header class="app-header">
       <div class="app-header__left">
-        <div class="brand">
+        <button
+          type="button"
+          id="btn-brand-home"
+          class="brand"
+          title="No-Quiz-No-Prod · Toggle Launch Stage &amp; 3-Pane IDE Workbench"
+        >
           <svg
             class="brand__icon"
             width="18"
@@ -27,19 +35,33 @@
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
-            stroke-width="2"
+            stroke-width="1.75"
             stroke-linecap="round"
             stroke-linejoin="round"
             aria-hidden="true"
           >
-            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-            <path class="brand__check" d="m9 12 2 2 4-4"></path>
+            <path d="M12 22s8-3.8 8-10V5l-8-3-8 3v7c0 6.2 8 10 8 10z"></path>
+            <circle class="brand__commit" cx="12" cy="11.5" r="2.25"></circle>
+            <path class="brand__commit" d="M12 6.8v2.45M12 13.75v2.45"></path>
           </svg>
-          <span class="brand__title">No-Quiz-No-Prod</span>
-          <span class="brand__env">FINTECH SANDBOX</span>
-        </div>
+          <span class="brand__title">No-Quiz<span class="brand-blue">-No-Prod</span></span>
+        </button>
+        <span class="brand__repo" title="Active Seed Repository &amp; Branch">
+          <span class="brand__branch-dot" aria-hidden="true"></span>
+          <span>main · fintech</span>
+        </span>
+      </div>
 
-        <div class="mode-switcher" role="tablist" aria-label="Workspace Mode">
+      <!-- Center: french-data-rag Sliding Glider Segmented Switcher -->
+      <div class="app-header__center">
+        <div
+          id="mode-switcher"
+          class="mode-switcher"
+          role="tablist"
+          aria-label="Workspace Mode"
+          data-active-mode="studio"
+        >
+          <span id="mode-switcher-glider" class="mode-switcher__glider" aria-hidden="true"></span>
           <button
             type="button"
             id="mode-btn-studio"
@@ -49,7 +71,11 @@
             aria-controls="view-studio"
             data-mode="studio"
           >
-            <span>Live Studio</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <path d="M9 3v18M15 3v18"></path>
+            </svg>
+            <span>Workbench</span>
             <kbd class="kbd-hint">⌘1</kbd>
           </button>
           <button
@@ -61,337 +87,612 @@
             aria-controls="view-explorer"
             data-mode="explorer"
           >
-            <span>Trace &amp; Golden Set Explorer</span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 3v18h18"></path>
+              <path d="m7 15 4-4 3 3 5-6"></path>
+            </svg>
+            <span>Benchmarks &amp; Traces</span>
             <span id="explorer-count-badge" class="mode-switcher__count tabular-nums">0</span>
             <kbd class="kbd-hint">⌘2</kbd>
           </button>
         </div>
       </div>
 
+      <!-- Right: Topology · Model + Brand Icon · .env & Notion Popover · Seed Reset -->
       <div class="app-header__right">
-        <label class="sr-only" for="topology-select">Agent Topology</label>
-        <select id="topology-select" class="header-select" aria-label="Agent Topology">
-          <option value="dual">Dual: Coder → Examiner</option>
-          <option value="single">Single: Unified Agent</option>
-        </select>
+        <div class="header-capsule" title="LangGraph Agent Topology (Dual Coder->Examiner vs Single Unified)">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="6" y1="3" x2="6" y2="15"></line>
+            <circle cx="18" cy="6" r="3"></circle>
+            <circle cx="6" cy="18" r="3"></circle>
+            <path d="M18 9a9 9 0 0 1-9 9"></path>
+          </svg>
+          <label class="sr-only" for="topology-select">Agent Topology</label>
+          <select id="topology-select" class="header-select header-select--mono" aria-label="Agent Topology">
+            <option value="dual">dual · coder→exam</option>
+            <option value="single">single · unified</option>
+          </select>
+        </div>
 
-        <label class="sr-only" for="model-select">LLM Provider and Model</label>
-        <select id="model-select" class="header-select header-select--model" aria-label="LLM Provider and Model">
-          <option value="~deepseek/deepseek-v4-flash-latest">OpenRouter · ~deepseek/deepseek-v4-flash-latest</option>
-        </select>
+        <div class="header-capsule header-capsule--model" title="LLM Provider &amp; Model">
+          <span id="provider-brand-icon" class="provider-brand-icon" aria-hidden="true"></span>
+          <label class="sr-only" for="model-select">LLM Provider and Model</label>
+          <select id="model-select" class="header-select header-select--model" aria-label="LLM Provider and Model">
+            <option value="~deepseek/deepseek-v4-flash-latest">deepseek-v4-flash</option>
+          </select>
+        </div>
+
+        <div class="api-popover-anchor">
+          <button
+            type="button"
+            id="btn-api-popover"
+            class="api-status-pill"
+            aria-expanded="false"
+            aria-controls="api-popover"
+            title="Configure .env Provider Keys &amp; Live Notion Hub"
+          >
+            <span id="api-status-dot" class="api-status-pill__dot" aria-hidden="true"></span>
+            <span id="api-status-label" class="api-status-pill__label">env · keys</span>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="7.5" cy="15.5" r="5.5"></circle>
+              <path d="m21 2-9.6 9.6"></path>
+              <path d="m15.5 7.5 3 3L22 7l-3-3"></path>
+            </svg>
+          </button>
+
+          <div
+            id="api-popover"
+            class="api-popover"
+            role="dialog"
+            aria-label="Runtime .env API Keys and Notion Hub"
+            hidden
+          >
+            <div class="api-popover__head">
+              <div>
+                <div class="eyebrow">RUNTIME CREDENTIALS (.ENV · 0600)</div>
+                <div class="api-popover__subtitle">Write-only local environment configuration</div>
+              </div>
+              <button
+                type="button"
+                id="btn-close-api-popover"
+                class="ghost-micro-btn"
+                aria-label="Close credentials popover"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M18 6 6 18M6 6l12 12"></path>
+                </svg>
+              </button>
+            </div>
+
+            <div id="api-provider-badges" class="api-provider-badges"></div>
+
+            <div id="api-popover-tabs" class="api-popover__tabs" role="tablist" aria-label="Provider Key Tabs">
+              <button type="button" class="api-tab is-active" role="tab" aria-selected="true" data-key-provider="openrouter">
+                OpenRouter
+              </button>
+              <button type="button" class="api-tab" role="tab" aria-selected="false" data-key-provider="anthropic">
+                Anthropic
+              </button>
+              <button type="button" class="api-tab" role="tab" aria-selected="false" data-key-provider="notion">
+                Notion Sync
+              </button>
+            </div>
+
+            <form id="api-key-form" class="api-key-form" autocomplete="off">
+              <label id="api-key-var-label" for="api-key-input" class="api-key-form__label">
+                OPENROUTER_API_KEY
+              </label>
+              <div class="api-key-form__row">
+                <input
+                  type="password"
+                  id="api-key-input"
+                  class="api-key-form__input"
+                  placeholder="sk-or-v1-..."
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button
+                  type="button"
+                  id="btn-toggle-key-vis"
+                  class="ghost-micro-btn"
+                  title="Show or hide typed key"
+                  aria-label="Toggle key visibility"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"></path>
+                    <circle cx="12" cy="12" r="3"></circle>
+                  </svg>
+                </button>
+                <button type="submit" id="btn-save-apikey" class="btn-save-key">
+                  Save
+                </button>
+              </div>
+              <p class="api-key-form__note">
+                Saved atomically with <code>0600</code> permissions · Secrets never leave the server.
+              </p>
+            </form>
+
+            <div class="api-popover__footer">
+              <a
+                id="link-notion-hub"
+                href="#"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="notion-hub-pill"
+                title="Open Notion Relational 3-Database Hub"
+              >
+                <span class="notion-hub-pill__left">
+                  <span id="notion-hub-dot" class="notion-hub-pill__dot" aria-hidden="true"></span>
+                  <span id="notion-hub-label">Open Live Notion Hub</span>
+                </span>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M7 17 17 7"></path>
+                  <path d="M7 7h10v10"></path>
+                </svg>
+              </a>
+            </div>
+          </div>
+        </div>
 
         <button
           type="button"
           id="btn-reset-seed"
-          class="header-btn"
+          class="header-btn header-btn--capsule"
           title="Reset workspace to clean Fintech seed (hold Shift to also reset Layer 4 Skill Memory)"
         >
-          <span aria-hidden="true">↺</span>
-          <span>Reset Seed</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+            <path d="M3 3v5h5"></path>
+          </svg>
+          <span>Seed Reset</span>
         </button>
-
-        <a
-          id="link-notion-hub"
-          href="#"
-          target="_blank"
-          rel="noopener noreferrer"
-          class="notion-hub-pill"
-          title="Notion Relational 3-Database Hub"
-        >
-          <span id="notion-hub-dot" class="notion-hub-pill__dot" aria-hidden="true"></span>
-          <span id="notion-hub-label">Local Seed Mirror</span>
-        </a>
       </div>
     </header>
 
-    <!-- Compact / Mobile Pane Switcher (< 1200px) -->
-    <nav id="mobile-pane-bar" class="mobile-pane-bar" aria-label="Studio Panes">
-      <button type="button" class="mobile-pane-bar__btn is-active" data-pane-target="left">
-        <span>1. Prompt &amp; Stream</span>
-      </button>
-      <button type="button" class="mobile-pane-bar__btn" data-pane-target="center">
-        <span>2. Diff &amp; Notion Doc</span>
-        <span id="mobile-badge-center" class="mobile-pane-bar__dot" hidden></span>
-      </button>
-      <button type="button" class="mobile-pane-bar__btn" data-pane-target="right">
-        <span>3. Quiz &amp; Prod Gate</span>
-        <span id="mobile-badge-right" class="mobile-pane-bar__dot" hidden></span>
-      </button>
-    </nav>
-
     <!-- =====================================================================
-         MODE 1: Live Studio 3-Pane Conversational Workspace
+         MODE 1: Workbench (Hero Launch Stage <-> 3-Pane IDE Split)
          ===================================================================== -->
-    <main id="view-studio" class="studio-grid" role="tabpanel" aria-labelledby="mode-btn-studio">
-      <!-- LEFT PANE (360px): Conversational Prompt & Live LangGraph SSE Stream -->
-      <section class="studio-pane studio-pane--left" data-pane="left" data-mobile-active="true" aria-label="Prompt and Live Step Stream">
-        <div class="telemetry-bar">
-          <div class="telemetry-bar__row">
-            <button
-              type="button"
-              id="thread-chip"
-              class="mono-chip"
-              title="Click to copy active thread_id"
-            >
-              Thread: new
-            </button>
-            <span id="run-status-pill" class="pill" data-agent="system">
-              <span class="pill__dot"></span>
-              <span id="run-status-text">Idle</span>
-            </span>
+    <main id="view-studio" class="studio-shell" role="tabpanel" aria-labelledby="mode-btn-studio">
+      <!-- STAGE A: french-data-rag Dev Hero Launch Stage -->
+      <section id="home-hero-stage" class="hero-stage" aria-label="Developer Launch Stage">
+        <div class="hero-stage__inner">
+          <div class="hero-eyebrow">
+            <span class="hero-eyebrow__dot" aria-hidden="true"></span>
+            <span>4-LOCK SHA-256 PRODUCTION GATE · 2 STDIO MCP SERVERS · LANGGRAPH HITL</span>
           </div>
 
-          <div class="telemetry-bar__budget">
-            <div class="telemetry-bar__labels tabular-nums">
-              <span id="budget-steps-label">Steps: 0 / 16</span>
-              <span id="budget-tokens-label">Tokens: 0 in · 0 out</span>
+          <h1 class="hero-headline">
+            Ship code you can <span class="hero-blue">prove you understand.</span>
+          </h1>
+
+          <p class="hero-subline">
+            <code>Coder</code> stages isolated edits and runs <code>pytest</code>;
+            <code>Examiner</code> binds Notion Ship Logs and server-graded comprehension tokens before unlocking <code>prod/</code>.
+          </p>
+
+          <!-- Central Floating Dev Prompt Card -->
+          <div id="home-prompt-card" class="hero-prompt-card">
+            <form id="home-prompt-form" class="hero-prompt-form">
+              <label class="sr-only" for="home-prompt-input">Engineering task to stage and verify</label>
+              <textarea
+                id="home-prompt-input"
+                class="hero-prompt__textarea"
+                rows="2"
+                placeholder="Describe a Fintech change to stage, test, and verify (e.g. Fix Decimal VAT rounding in orders.py per RULE-001)…"
+              ></textarea>
+
+              <div class="hero-prompt__bar">
+                <div class="hero-prompt__meta">
+                  <span class="dev-meta-chip" title="Seeded Python Fintech Sandbox">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
+                    </svg>
+                    <span>seeds/fintech · 4 py modules</span>
+                  </span>
+
+                  <label class="dev-toggle-chip" for="chk-hero-fault" title="Inject transient write_timeout fault to observe live retry + idempotency_key deduplication">
+                    <input type="checkbox" id="chk-hero-fault" />
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"></path>
+                    </svg>
+                    <span>fault: write_timeout</span>
+                  </label>
+                </div>
+
+                <div class="hero-prompt__actions">
+                  <button
+                    type="button"
+                    id="btn-inspect-ide"
+                    class="hero-ide-btn"
+                    title="Open the 3-Pane IDE Workbench immediately"
+                  >
+                    <span>Inspect 3-Pane IDE</span>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 12h14"></path>
+                      <path d="m13 6 6 6-6 6"></path>
+                    </svg>
+                  </button>
+
+                  <span class="hero-kbd-hint"><kbd class="kbd-hint">⌘↵</kbd></span>
+
+                  <button
+                    type="submit"
+                    id="btn-hero-send"
+                    class="hero-send-btn"
+                    aria-label="Launch Agent in Workbench"
+                    title="Run Agent in Workbench (⌘↵)"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M12 19V5"></path>
+                      <path d="m5 12 7-7 7 7"></path>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+
+          <!-- 4 Borderless Minimalist Dev Scenario Rows -->
+          <div class="hero-suggestions-wrap">
+            <div class="hero-suggestions__header">
+              <span class="eyebrow">CANONICAL FINTECH SCENARIOS</span>
+              <span class="hero-suggestions__hint">Click to launch in Workbench · Shift+Click to edit prompt</span>
             </div>
-            <div class="budget-track" role="progressbar" aria-valuemin="0" aria-valuemax="16" aria-valuenow="0" id="budget-progressbar">
-              <div id="budget-progress-fill" class="budget-track__fill"></div>
-            </div>
+            <div id="hero-scenario-list" class="hero-suggestions"></div>
           </div>
-
-          <div class="telemetry-bar__micro tabular-nums">
-            <span id="budget-latency-label">Latency: 0.00s</span>
-            <span aria-hidden="true">·</span>
-            <span id="budget-cost-label">Est. Cost: $0.0000</span>
-          </div>
-        </div>
-
-        <div class="scenarios-drawer" id="scenarios-drawer">
-          <div class="scenarios-drawer__header">
-            <button type="button" id="btn-toggle-scenarios" class="scenarios-toggle" aria-expanded="true">
-              <span>⚡ Quick-Launch Fintech Scenarios</span>
-              <span id="scenarios-chevron" aria-hidden="true">▾</span>
-            </button>
-          </div>
-          <div id="scenarios-body" class="scenarios-drawer__body">
-            <div id="scenario-chips" class="scenario-grid"></div>
-            <label class="fault-toggle">
-              <input type="checkbox" id="chk-fault-timeout" />
-              <span>Simulate <code>write_timeout</code> fault (live retry + <code>idem_key</code>)</span>
-            </label>
-          </div>
-        </div>
-
-        <div id="stream-feed" class="stream-feed" aria-live="polite">
-          <div class="stream-empty" id="stream-empty-state">
-            <div class="stream-empty__title">Ready for Agentic Task</div>
-            <p class="stream-empty__desc">
-              Select a canonical Fintech scenario above or describe a change below.
-              <code>Coder</code> stages edits &amp; runs <code>pytest</code>;
-              <code>Examiner</code> writes the Notion Ship Log &amp; Comprehension Quiz before unlocking Production.
-            </p>
-          </div>
-        </div>
-
-        <form id="prompt-form" class="composer">
-          <label class="sr-only" for="prompt-input">Developer task or clarification answer</label>
-          <textarea
-            id="prompt-input"
-            class="composer__textarea"
-            rows="2"
-            placeholder="Ask Coder to implement a fix, or answer a clarification…"
-          ></textarea>
-          <div class="composer__footer">
-            <div class="composer__footer-left">
-              <button type="button" id="btn-new-thread" class="ghost-micro-btn" title="Start a fresh conversation thread without resetting files">
-                + New Thread
-              </button>
-              <span class="composer__hint"><kbd class="kbd-hint">⌘↵</kbd> to send</span>
-            </div>
-            <button type="submit" id="btn-run-agent" class="btn-primary-run">
-              Run Agent →
-            </button>
-          </div>
-        </form>
-      </section>
-
-      <!-- CENTER PANE (minmax(460px, 1fr)): Dual-Tab Artifact Inspector -->
-      <section class="studio-pane studio-pane--center" data-pane="center" aria-label="Code Diff and Notion Ship Log Inspector">
-        <div class="center-tabbar" role="tablist" aria-label="Artifact Inspector Tabs">
-          <div class="center-tabbar__tabs">
-            <button
-              type="button"
-              id="tab-diff"
-              class="center-tab is-active"
-              role="tab"
-              aria-selected="true"
-              aria-controls="panel-diff"
-            >
-              <span>Code Diff: prod ↔ staging</span>
-              <span id="tab-diff-badge" class="mono-chip mono-chip--compact tabular-nums">0 files</span>
-            </button>
-            <button
-              type="button"
-              id="tab-notion"
-              class="center-tab"
-              role="tab"
-              aria-selected="false"
-              aria-controls="panel-notion"
-            >
-              <span>Notion Ship Log DB Entry</span>
-              <span id="tab-notion-status" class="pill" hidden></span>
-              <span id="tab-notion-version" class="mono-chip mono-chip--compact" hidden>v1</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- TAB 1: Code Diff (prod <-> staging) -->
-        <div id="panel-diff" class="inspector-panel" role="tabpanel" aria-labelledby="tab-diff">
-          <div class="diff-banner">
-            <div class="diff-banner__left">
-              <span id="pytest-banner-pill" class="pill" data-agent="system">
-                <span class="pill__dot"></span>
-                <span id="pytest-banner-text">pytest not run on current tree</span>
-              </span>
-              <button type="button" id="btn-toggle-pytest-log" class="ghost-micro-btn" hidden>
-                Output ▾
-              </button>
-            </div>
-
-            <div class="diff-banner__hashes">
-              <button type="button" id="sha-prod" class="hash-pill" title="Click to copy full prod_tree_sha256">
-                <span class="hash-pill__label">prod:</span>
-                <code id="sha-prod-val">…</code>
-              </button>
-              <button type="button" id="sha-staging" class="hash-pill" title="Click to copy full staging_tree_sha256">
-                <span class="hash-pill__label">staging:</span>
-                <code id="sha-staging-val">…</code>
-              </button>
-              <button type="button" id="sha-diff" class="hash-pill hash-pill--emphasis" title="Click to copy full diff_sha256 bound to the 4-Lock Production Gate">
-                <span aria-hidden="true">🔐</span>
-                <span class="hash-pill__label">diff SHA-256:</span>
-                <code id="sha-diff-val">…</code>
-              </button>
-            </div>
-
-            <div class="segmented-mini" role="group" aria-label="Diff View Mode">
-              <button type="button" id="diff-mode-unified" class="segmented-mini__btn is-active" data-diff-mode="unified">
-                Unified
-              </button>
-              <button type="button" id="diff-mode-split" class="segmented-mini__btn" data-diff-mode="split">
-                Split
-              </button>
-            </div>
-          </div>
-
-          <pre id="pytest-output-drawer" class="pytest-drawer" hidden></pre>
-          <div id="changed-files-strip" class="changed-files-strip" hidden></div>
-
-          <div id="diff-viewport" class="diff-viewport">
-            <div class="empty-artifact-card">
-              <div class="empty-artifact-card__icon" aria-hidden="true">🛡️</div>
-              <h2 class="empty-artifact-card__title">Zero Cryptographic Delta</h2>
-              <p class="empty-artifact-card__desc">
-                Staging &amp; Production trees are cryptographically identical (<code>SHA-256</code> match).
-                Launch a task in the Left Pane to stage changes.
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <!-- TAB 2: Notion Ship Log DB Entry -->
-        <div id="panel-notion" class="inspector-panel inspector-panel--notion" role="tabpanel" aria-labelledby="tab-notion" hidden>
-          <div id="notion-page-container" class="notion-page-wrap"></div>
         </div>
       </section>
 
-      <!-- RIGHT PANE (380px): Quiz Gate, 4-Lock Prod Approval & Layer 4 Skill Memory -->
-      <aside class="studio-pane studio-pane--right" data-pane="right" aria-label="Comprehension Quiz, Production Gate and Skill Memory">
-        <div class="right-pane-scroll">
-          <!-- Section A: Comprehension Quiz Gate -->
-          <section id="quiz-panel" class="gate-card" aria-label="Comprehension Quiz Gate"></section>
+      <!-- STAGE B: 3-Pane IDE Split Workbench -->
+      <div id="workbench-split" class="workbench-shell" hidden>
+        <!-- Compact / Mobile Pane Switcher (< 1200px) -->
+        <nav id="mobile-pane-bar" class="mobile-pane-bar" aria-label="Workbench Panes">
+          <button type="button" class="mobile-pane-bar__btn is-active" data-pane-target="left">
+            <span>01 Stream</span>
+          </button>
+          <button type="button" class="mobile-pane-bar__btn" data-pane-target="center">
+            <span>02 Diff &amp; Docs</span>
+            <span id="mobile-badge-center" class="mobile-pane-bar__dot" hidden></span>
+          </button>
+          <button type="button" class="mobile-pane-bar__btn" data-pane-target="right">
+            <span>03 Gate &amp; Skills</span>
+            <span id="mobile-badge-right" class="mobile-pane-bar__dot" hidden></span>
+          </button>
+        </nav>
 
-          <!-- Section B: Critical Production Approval & 4-Lock Gate -->
-          <section id="deploy-panel" class="gate-card gate-card--deploy" aria-label="4-Lock Production Gate"></section>
+        <div class="studio-grid">
+          <!-- LEFT PANE: Agent Stream & MCP Trace -->
+          <section class="studio-pane studio-pane--left" data-pane="left" data-mobile-active="true" aria-label="Agent Stream and MCP Trace">
+            <div class="telemetry-bar">
+              <div class="telemetry-bar__row">
+                <div class="telemetry-bar__left">
+                  <button
+                    type="button"
+                    id="btn-back-to-launch"
+                    class="ghost-micro-btn telemetry-back-btn"
+                    title="Return to Hero Launch Stage"
+                  >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="m15 18-6-6 6-6"></path>
+                    </svg>
+                    <span>Launch</span>
+                  </button>
+                  <button
+                    type="button"
+                    id="thread-chip"
+                    class="mono-chip"
+                    title="Click to copy active thread_id"
+                  >
+                    thread: new
+                  </button>
+                </div>
 
-          <!-- Section C: Developer Skill Profile (Layer 4 Memory) -->
-          <section id="memory-panel" class="gate-card" aria-label="Developer Skill Profile Layer 4 Memory"></section>
+                <span id="run-status-pill" class="pill" data-agent="system">
+                  <span class="pill__dot"></span>
+                  <span id="run-status-text">Idle</span>
+                </span>
+              </div>
+
+              <div
+                class="budget-track"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="16"
+                aria-valuenow="0"
+                id="budget-progressbar"
+              >
+                <div id="budget-progress-fill" class="budget-track__fill"></div>
+              </div>
+
+              <div class="telemetry-bar__stats tabular-nums">
+                <span id="budget-steps-label">0/16 steps</span>
+                <span aria-hidden="true">·</span>
+                <span id="budget-tokens-label">0 in / 0 out</span>
+                <span aria-hidden="true">·</span>
+                <span id="budget-latency-label">0.00s</span>
+                <span aria-hidden="true">·</span>
+                <span id="budget-cost-label">$0.0000</span>
+              </div>
+            </div>
+
+            <div id="stream-feed" class="stream-feed" aria-live="polite">
+              <div class="stream-empty" id="stream-empty-state">
+                <div class="stream-empty__icon" aria-hidden="true">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="4 17 10 11 4 5"></polyline>
+                    <line x1="12" y1="19" x2="20" y2="19"></line>
+                  </svg>
+                </div>
+                <div class="stream-empty__title">Agent Stream Ready</div>
+                <p class="stream-empty__desc">
+                  Submit a task below or expand <code>Scenarios</code>. Every <code>code-mcp</code> and <code>notion-quiz-mcp</code> call streams live with expandable JSON payloads.
+                </p>
+              </div>
+            </div>
+
+            <div class="scenarios-drawer" id="scenarios-drawer">
+              <div class="scenarios-drawer__header">
+                <button type="button" id="btn-toggle-scenarios" class="scenarios-toggle" aria-expanded="false">
+                  <span class="scenarios-toggle__label">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                      <polyline points="2 17 12 22 22 17"></polyline>
+                      <polyline points="2 12 12 17 22 12"></polyline>
+                    </svg>
+                    <span>Preset Scenarios</span>
+                  </span>
+                  <svg id="scenarios-chevron" class="scenarios-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="m9 18 6-6-6-6"></path>
+                  </svg>
+                </button>
+              </div>
+              <div id="scenarios-body" class="scenarios-drawer__body" hidden>
+                <div id="scenario-chips" class="scenario-grid"></div>
+              </div>
+            </div>
+
+            <form id="prompt-form" class="composer">
+              <label class="sr-only" for="prompt-input">Developer task or clarification answer</label>
+              <textarea
+                id="prompt-input"
+                class="composer__textarea"
+                rows="2"
+                placeholder="Stage a fix in staging/, or reply to a clarification…"
+              ></textarea>
+              <div class="composer__footer">
+                <div class="composer__footer-left">
+                  <button
+                    type="button"
+                    id="btn-new-thread"
+                    class="ghost-micro-btn"
+                    title="Start a fresh conversation thread without resetting workspace files"
+                  >
+                    + Thread
+                  </button>
+                  <label class="fault-inline-toggle" for="chk-fault-timeout" title="Inject one-shot write_timeout fault to verify retry + idem_key">
+                    <input type="checkbox" id="chk-fault-timeout" />
+                    <span>fault: timeout</span>
+                  </label>
+                </div>
+                <div class="composer__footer-right">
+                  <kbd class="kbd-hint">⌘↵</kbd>
+                  <button type="submit" id="btn-run-agent" class="btn-primary-run">
+                    <span>Run</span>
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M5 12h14"></path>
+                      <path d="m12 5 7 7-7 7"></path>
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </form>
+          </section>
+
+          <!-- CENTER PANE: Git Diff & Notion Ship Log -->
+          <section class="studio-pane studio-pane--center" data-pane="center" aria-label="Git Diff and Notion Ship Log Inspector">
+            <div class="center-tabbar" role="tablist" aria-label="Artifact Inspector Tabs">
+              <div class="center-tabbar__tabs">
+                <button
+                  type="button"
+                  id="tab-diff"
+                  class="center-tab is-active"
+                  role="tab"
+                  aria-selected="true"
+                  aria-controls="panel-diff"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="6" cy="6" r="3"></circle>
+                    <circle cx="6" cy="18" r="3"></circle>
+                    <path d="M6 9v6"></path>
+                    <circle cx="18" cy="18" r="3"></circle>
+                    <path d="M18 15V9a3 3 0 0 0-3-3h-2"></path>
+                  </svg>
+                  <span>Git Diff: prod..staging</span>
+                  <span id="tab-diff-badge" class="mono-chip mono-chip--compact tabular-nums">0 files</span>
+                </button>
+                <button
+                  type="button"
+                  id="tab-notion"
+                  class="center-tab"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="panel-notion"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+                    <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+                    <path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"></path>
+                  </svg>
+                  <span>Notion Ship Log</span>
+                  <span id="tab-notion-status" class="pill" hidden></span>
+                  <span id="tab-notion-version" class="mono-chip mono-chip--compact" hidden>v1</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- TAB 1: Git Diff (prod..staging) -->
+            <div id="panel-diff" class="inspector-panel" role="tabpanel" aria-labelledby="tab-diff">
+              <div class="diff-banner">
+                <div class="diff-banner__left">
+                  <span id="pytest-banner-pill" class="pill" data-agent="system">
+                    <span class="pill__dot"></span>
+                    <span id="pytest-banner-text">pytest: pending</span>
+                  </span>
+                  <button type="button" id="btn-toggle-pytest-log" class="ghost-micro-btn mono-text" hidden>
+                    <span>stdout</span>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="m6 9 6 6 6-6"></path>
+                    </svg>
+                  </button>
+                </div>
+
+                <div class="diff-banner__hashes">
+                  <button type="button" id="sha-prod" class="hash-pill" title="Click to copy full prod_tree_sha256">
+                    <span class="hash-pill__label">prod @</span>
+                    <code id="sha-prod-val">…</code>
+                  </button>
+                  <span class="hash-arrow" aria-hidden="true">→</span>
+                  <button type="button" id="sha-staging" class="hash-pill" title="Click to copy full staging_tree_sha256">
+                    <span class="hash-pill__label">staging @</span>
+                    <code id="sha-staging-val">…</code>
+                  </button>
+                  <button
+                    type="button"
+                    id="sha-diff"
+                    class="hash-pill hash-pill--emphasis"
+                    title="Click to copy full diff_sha256 bound to the 4-Lock Production Gate"
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    <span class="hash-pill__label">gate_sha256:</span>
+                    <code id="sha-diff-val">…</code>
+                  </button>
+                </div>
+
+                <div class="segmented-mini" role="group" aria-label="Diff View Mode">
+                  <button type="button" id="diff-mode-unified" class="segmented-mini__btn is-active" data-diff-mode="unified">
+                    Unified
+                  </button>
+                  <button type="button" id="diff-mode-split" class="segmented-mini__btn" data-diff-mode="split">
+                    Split
+                  </button>
+                </div>
+              </div>
+
+              <pre id="pytest-output-drawer" class="pytest-drawer" hidden></pre>
+              <div id="changed-files-strip" class="changed-files-strip" hidden></div>
+
+              <div id="diff-viewport" class="diff-viewport"></div>
+            </div>
+
+            <!-- TAB 2: Notion Ship Log DB Entry -->
+            <div id="panel-notion" class="inspector-panel inspector-panel--notion" role="tabpanel" aria-labelledby="tab-notion" hidden>
+              <div id="notion-page-container" class="notion-page-wrap"></div>
+            </div>
+          </section>
+
+          <!-- RIGHT PANE: Gate Pipeline & Layer 4 Skill Matrix -->
+          <aside class="studio-pane studio-pane--right" data-pane="right" aria-label="Comprehension Gate, 4-Lock Pipeline and Skill Matrix">
+            <div class="right-pane-scroll">
+              <section id="quiz-panel" class="gate-card" aria-label="Comprehension Quiz Gate"></section>
+              <section id="deploy-panel" class="gate-card gate-card--deploy" aria-label="4-Lock Production Pipeline"></section>
+              <section id="memory-panel" class="gate-card" aria-label="Layer 4 Skill Matrix"></section>
+            </div>
+          </aside>
         </div>
-      </aside>
+      </div>
     </main>
 
     <!-- =====================================================================
-         MODE 2: Trace & Golden Set Explorer (15-Min MSc Oral Defence View)
+         MODE 2: Benchmarks & Traces (State-Verification Observability Suite)
          ===================================================================== -->
     <main id="view-explorer" class="explorer-shell" role="tabpanel" aria-labelledby="mode-btn-explorer" hidden>
       <div class="explorer-container">
         <section class="defence-hero">
           <div class="defence-hero__copy">
-            <div class="eyebrow">15-MINUTE MSC ORAL DEFENCE HARNESS</div>
-            <h1 class="defence-hero__title">Golden Set &amp; State-Based Evaluation Harness</h1>
+            <div class="eyebrow">EVALUATION &amp; STATE VERIFICATION · 30 GOLDEN SCENARIOS</div>
+            <h1 class="defence-hero__title">Benchmark &amp; State-Verification Matrix</h1>
             <p class="defence-hero__subtitle">
-              Scored strictly on backend final state (<code>expect_state</code> vs <code>RunFinalState</code>,
-              <code>SHA-256</code>, <code>forbidden_called</code>, step budget) — never on LLM self-report.
+              Scored deterministically on backend <code>RunFinalState</code>, cryptographic <code>SHA-256</code> digests,
+              <code>forbidden_called</code> invariants, and step budgets — never on LLM self-report.
             </p>
           </div>
           <div class="defence-hero__actions">
             <button type="button" id="btn-showcase-passed" class="showcase-btn showcase-btn--pass">
-              ▶ Inspect Showcase Passed Run
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5"></path>
+              </svg>
+              <span>Inspect Passed Trace</span>
             </button>
             <button type="button" id="btn-showcase-failed" class="showcase-btn showcase-btn--fail">
-              ▶ Inspect Showcase Failed / Blocked Run
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                <path d="m14.5 9.5-5 5M9.5 9.5l5 5"></path>
+              </svg>
+              <span>Inspect Blocked Trace</span>
             </button>
           </div>
         </section>
 
-        <!-- Graceful Empty State Card when eval/results.jsonl has not been generated yet -->
+        <!-- Empty State Card when eval/results.jsonl has not been generated yet -->
         <section id="explorer-empty-card" class="explorer-empty-card" hidden>
           <div class="explorer-empty-card__header">
             <span class="pill" data-status="Staging">
               <span class="pill__dot"></span>
-              <span>No eval/results.jsonl found on disk yet</span>
+              <span>eval/results.jsonl not generated yet</span>
             </span>
           </div>
-          <h2 class="explorer-empty-card__title">Run the 30-Scenario Golden Set Evaluation Campaign</h2>
+          <h2 class="explorer-empty-card__title">Run the 30-Scenario Golden Set Evaluation Suite</h2>
           <p class="explorer-empty-card__desc">
-            Execute the deterministic evaluation harness below to populate <code>eval/results.jsonl</code>,
-            or load a built-in preview sample to rehearse the Trace Explorer interface.
+            Execute the deterministic state-verification harness below to populate <code>eval/results.jsonl</code>,
+            or inspect a built-in 4-scenario trace sample immediately.
           </p>
           <div class="command-copy-bar">
             <code id="eval-cli-command">uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/</code>
-            <button type="button" id="btn-copy-eval-cmd" class="header-btn">Copy Command</button>
+            <button type="button" id="btn-copy-eval-cmd" class="header-btn">Copy CLI</button>
           </div>
           <div class="explorer-empty-card__actions">
             <button type="button" id="btn-load-demo-eval" class="header-btn">
-              Load Representative Defence Preview Sample
+              Load Representative Trace Sample
             </button>
             <button type="button" id="btn-refresh-eval" class="ghost-micro-btn">
-              ↻ Re-check eval/results.jsonl
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"></path>
+                <path d="M21 3v5h-5"></path>
+              </svg>
+              <span>Reload eval/results.jsonl</span>
             </button>
           </div>
         </section>
 
         <div id="explorer-dashboard-body">
-          <!-- 5-Card KPI Bento Grid -->
           <section id="explorer-kpi-grid" class="kpi-bento-grid" aria-label="Evaluation Reliability Metrics"></section>
 
-          <!-- Model & Topology Comparison Matrix -->
           <section class="explorer-card">
             <div class="explorer-card__header">
-              <h2 class="explorer-card__title">Model &amp; Topology Cohort Comparison Matrix</h2>
+              <h2 class="explorer-card__title">Cohort Comparison Matrix (model × topology)</h2>
               <span id="explorer-source-label" class="mono-chip mono-chip--compact">eval/results.jsonl</span>
             </div>
             <div id="explorer-cohort-wrap" class="table-scroll"></div>
           </section>
 
-          <!-- Filterable 30-Run Table -->
           <section class="explorer-card">
             <div class="explorer-toolbar">
               <div class="explorer-toolbar__group" id="explorer-kind-filters" role="group" aria-label="Filter by Scenario Kind"></div>
               <div class="explorer-toolbar__group" id="explorer-outcome-filters" role="group" aria-label="Filter by Verdict Outcome"></div>
               <div class="explorer-toolbar__inputs">
                 <label class="sr-only" for="explorer-cohort-select">Cohort Filter</label>
-                <select id="explorer-cohort-select" class="header-select">
-                  <option value="all">All Models / Topologies</option>
+                <select id="explorer-cohort-select" class="header-select header-select--mono">
+                  <option value="all">all cohorts</option>
                 </select>
                 <label class="sr-only" for="explorer-search-input">Search runs</label>
                 <input
                   type="search"
                   id="explorer-search-input"
                   class="search-input"
-                  placeholder="Filter by key (n01#0), task, tool, outcome, or stop_reason…"
+                  placeholder="Filter key (n01#0), task, tool, outcome, stop_reason…"
                 />
               </div>
             </div>
@@ -411,7 +712,7 @@
                     <th class="num-col">Tokens</th>
                     <th class="num-col">Latency</th>
                     <th class="num-col">Cost</th>
-                    <th>Action</th>
+                    <th>Trace</th>
                   </tr>
                 </thead>
                 <tbody id="explorer-runs-tbody"></tbody>
@@ -423,10 +724,10 @@
     </main>
 
     <!-- =====================================================================
-         Slide-Over Full Trace Replay Drawer (Mode 2)
+         Slide-Over Trace & RunFinalState Proof Inspector
          ===================================================================== -->
     <div id="trace-drawer-backdrop" class="drawer-backdrop" hidden></div>
-    <aside id="trace-drawer" class="trace-drawer" aria-label="Full Trace Replay Inspector" hidden>
+    <aside id="trace-drawer" class="trace-drawer" aria-label="Trace and RunFinalState Proof Inspector" hidden>
       <header class="trace-drawer__header">
         <div class="trace-drawer__title-row">
           <div class="trace-drawer__meta">
@@ -436,10 +737,17 @@
           </div>
           <div class="trace-drawer__actions">
             <button type="button" id="btn-load-in-studio" class="header-btn">
-              Load Prompt in Live Studio ↗
+              <span>Load Prompt in Workbench</span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M7 17 17 7"></path>
+                <path d="M7 7h10v10"></path>
+              </svg>
             </button>
             <button type="button" id="btn-close-drawer" class="ghost-micro-btn" aria-label="Close Trace Drawer">
-              ✕ Close
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M18 6 6 18M6 6l12 12"></path>
+              </svg>
+              <span>Close</span>
             </button>
           </div>
         </div>
@@ -448,10 +756,10 @@
 
         <div class="drawer-tabs" role="tablist">
           <button type="button" id="drawer-tab-trace" class="center-tab is-active" role="tab" aria-selected="true">
-            Step-by-Step Tool Call Timeline
+            Tool Call Timeline
           </button>
           <button type="button" id="drawer-tab-state" class="center-tab" role="tab" aria-selected="false">
-            Backend Final State Proof (RunFinalState)
+            RunFinalState Proof
           </button>
         </div>
       </header>

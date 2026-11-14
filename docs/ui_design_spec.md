@@ -9,10 +9,10 @@
 
 ## 1. Design Philosophy & Zero-Build Architecture
 
-**No-Quiz-No-Prod** is a flagship **Tech Premium** conversational Agentic Coding & Pedagogy Studio built for high-trust production engineering and the 15-minute MSc Oral Defence. Its visual language fuses:
+**No-Quiz-No-Prod** is a flagship **Dev Platform** Agentic Gate & State-Verification Workbench blending Jonathan's **`french-data-rag` (`Alter-Ego`)** visual DNA with **Linear / Vercel / Cursor** engineering ergonomics:
 
-1. **Google Antigravity & Linear Precision**: Ultra-crisp `1px` structural hairlines (`#E6E6E4`), `tabular-nums` telemetry counters, high-density monospace diff inspection, keyboard-first shortcuts, and deterministic cryptographic state indicators (`SHA-256` tree & diff digests).
-2. **Notion Warm Editorial Clarity**: Warm paper canvas (`#FBFBFA`), elevated crisp white cards (`#FFFFFF`), deep charcoal ink (`#191918`), generous editorial line-height for technical & pedagogical guides, and faithful relational Notion Database page rendering.
+1. **Cool Architectural Daylight & Reactive Aura (`french-data-rag` DNA)**: Cool slate daylight canvas (`#F8FAFC`), pure elevated cards (`#FFFFFF`), deep slate terminal drawers (`#0B1120`), `Plus Jakarta Sans` (`400;500;600;700`) + `JetBrains Mono` (`400;500;600`), and a reactive `.ambient-glow` layer with a 24px engineering dot-grid (`is-thinking` indigo pulse during SSE streams, `aura-verified-wave` emerald wave on green `pytest`/quiz/deploy, `aura-shield-wave` crimson-amber wave on prompt injection containment or gate lock).
+2. **Dev Platform Precision (Zero Pastel Pill Soup & Zero Emoji Slop)**: Technical tags (`.pill`, `.mono-chip`, agent roles, MCP servers, scenario kinds, `pass@k`/`pass^k`, `RULE-00X`) use crisp `5px`–`6px` radius monospace badges (`11px`, `1px` hairline border, `5px` status LED dot), reserving `9999px` capsules strictly for the `french-data-rag` floating top-bar controls and sliding segmented glider. All iconography uses crisp `1.75px`-stroke inline SVGs (`currentColor`).
 
 ### 1.1 File Organization (`src/no_quiz_no_prod/ui/`)
 
@@ -34,31 +34,32 @@ src/no_quiz_no_prod/ui/
 ### 1.2 Strict DRY & Quality Guardrails (Non-Negotiable)
 
 - **Zero Hardcoded Colors / Radii / Easings**: Every color, border, shadow, spacing unit, font stack, and transition in `styles.css` and JS MUST reference variables from `tokens.css` (e.g., `var(--bg-surface)`, `var(--border-hairline)`, `var(--transition-base)`).
-- **Attribute-Driven Semantic Styling**: Status pills, mastery badges, agent pills, MCP server badges, and scenario kinds MUST bind via `tokens.css` data attributes (`data-status="Remediation v2"`, `data-agent="coder"`, `data-mcp="code-mcp"`, `data-mastery="Weakness Detected"`, `data-kind="adversarial"`) paired with a single shared `.pill` CSS class:
+- **Attribute-Driven Semantic Styling**: Status badges, mastery badges, agent badges, MCP server badges, and scenario kinds MUST bind via `tokens.css` data attributes (`data-status="Remediation v2"`, `data-agent="coder"`, `data-mcp="code-mcp"`, `data-mastery="Weakness Detected"`, `data-kind="adversarial"`) paired with a single shared `.pill` CSS class (`border-radius: var(--radius-badge)` = `5px`, `font-family: var(--font-mono)`, `font-size: var(--text-2xs)`):
   ```css
   .pill {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-1-5);
-    padding: 2px var(--space-2);
-    border-radius: var(--radius-pill);
-    font-size: var(--text-xs);
+    gap: 5px;
+    padding: 2px 7px;
+    border-radius: var(--radius-badge);
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
     font-weight: var(--weight-medium);
     line-height: var(--leading-snug);
-    background: var(--pill-bg, var(--bg-muted));
+    background: var(--pill-bg, var(--bg-subtle));
     color: var(--pill-fg, var(--ink-secondary));
     border: 1px solid var(--pill-border, var(--border-hairline));
     transition: background-color var(--transition-base), border-color var(--transition-base), color var(--transition-base);
     white-space: nowrap;
   }
   .pill__dot {
-    width: 6px;
-    height: 6px;
+    width: 5px;
+    height: 5px;
     border-radius: var(--radius-pill);
     background: var(--pill-dot, currentColor);
   }
   ```
-- **Typography Loading**: Load `Inter` (`400;500;600;700`) and `JetBrains Mono` (`400;500;600`) via `<link rel="preconnect" href="https://fonts.googleapis.com">` in `index.html`, with graceful fallback to system fonts defined in `--font-sans` / `--font-mono` if offline during defence.
+- **Typography Loading**: Load `Plus Jakarta Sans` (`400;500;600;700`) and `JetBrains Mono` (`400;500;600`) via `<link rel="preconnect" href="https://fonts.googleapis.com">` in `index.html`, with graceful fallback to system fonts defined in `--font-sans` / `--font-mono`.
 - **XSS Safety**: Never inject raw tool outputs, file diffs, or LLM strings via unescaped `innerHTML`. Escape `&`, `<`, `>`, `"`, `'` before applying syntax/diff/markdown transforms.
 
 ---
@@ -813,19 +814,44 @@ Loads `eval/results.jsonl` (plus any companion comparison `.jsonl` files in `eva
 ```
 *(Graceful Empty State: If `eval/results.jsonl` has not been generated yet, return `"available": false, "runs": []` with HTTP `200 OK` — never `500` — and Mode 2 renders a clean command card showing `uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/` with a click-to-copy button.)*
 
+### 5.9 `POST /api/apikey` (Write-Only `.env` Provider & Notion Key Configuration)
+Persists a runtime API key (`openrouter`, `anthropic`, or `notion`) atomically into `.env` with strict `0o600` permissions (preserving all comments and unrelated `.env` entries), refreshes `StudioManager.settings` in memory, and returns updated boolean availability flags. **Secrets are write-only and NEVER returned, logged, or echoed in error payloads.**
+
+- **Request Body**:
+```json
+{
+  "provider": "openrouter",
+  "api_key": "sk-or-v1-..."
+}
+```
+- **Response `200 OK`**:
+```json
+{
+  "ok": true,
+  "provider": "openrouter",
+  "providers": {
+    "openrouter": true,
+    "anthropic": false,
+    "notion": false
+  },
+  "notion_enabled": false,
+  "models": { "...refreshed _build_models_catalogue(settings)..." }
+}
+```
+
 ---
 
-## 6. CDO Acceptance Checklist (Wave 2/3 Sign-Off Criteria)
+## 6. CDO Acceptance Checklist (Dev Platform Sign-Off Criteria)
 
-During Wave 2/3 visual & DOM inspection on `http://localhost:8000`, `cdo` will grade `ui-docs` against these 10 criteria:
+During visual, security & DOM inspection on `http://localhost:8000`, `cdo` grades the Web Platform against these 10 criteria:
 
-1. **Token Purity**: `styles.css` imports `/static/tokens.css` first and contains **zero** duplicate hex palettes or magic transition curves (`160ms cubic-bezier(0.2, 0, 0, 1)` everywhere).
-2. **Exact 3-Pane Geometry**: `grid-template-columns: 360px minmax(460px, 1fr) 380px` at `>= 1200px` with independent pane scrolling (`overflow-y: auto; min-height: 0`), collapsing cleanly below `1200px` with zero horizontal scroll.
-3. **Live SSE `RunEvent` Telemetry**: Step cards appear progressively from `RunEvent` (`ToolCallTrace`) with `coder`/`examiner`/`single` + `code-mcp`/`notion-quiz-mcp` (`server`) pills, `tabular-nums` `latency_s`, `idempotency_key`/`attempts`/`replayed`/`contains_injection` badges, and `RunBudget` (`DEFAULT_MAX_STEPS = 16`).
-4. **Word-Level Code Diff + SHA-256 Proof**: Center Tab 1 renders both `Unified` and `Split` modes from `DiffReport.files[].unified_diff`, inline word highlights (`--diff-add-word-bg` / `--diff-del-word-bg`), `PytestReport` banner, and copyable `prod_tree_sha256` / `staging_tree_sha256` / `diff_sha256` pills.
-5. **Faithful Notion DB Page + Animated v2 Remediation Callout**: Center Tab 2 renders the 7-row Notion property table above Markdown prose, and triggers `nq-remediation-highlight` on the coral `"Why your previous answer was a trap"` callout when `QuizGradeResult.remediation_required === true`.
-6. **Zero Quiz Answer Leakage**: Network payload of `/api/state` and `/api/runs/stream` (`PublicQuizView`) never exposes `correct_option`; keyboard shortcuts `1–4` + `Enter` grade seamlessly via `POST /api/runs/{thread_id}/quiz` (`QuizGradeResult`).
-7. **Transparent 4-Lock Production Gate (`DeployGateStatus`)**: Right Pane displays all 4 server-side locks, enables `Approve & Deploy to Production` strictly when `locks.ready_for_approval === true`, and sends `DeployDecision` (`approve` / `reject` + `expected_diff_sha256`).
-8. **Layer 4 Skill Memory + GDPR `/forget`**: All 6 `SkillTag` rows display live mastery pills, fail/pass counters, `last_misconception`, and 2-click confirmed `DELETE /api/memory/{user_id}`.
-9. **Oral Defence Mode 2**: Displays all 4 scenario kind KPIs, `pass@k` & `pass^k` (`contracts.pass_at_k` / `pass_hat_k`), `EvalOutcome` badges (`pass`, `wrong_state`, `forbidden_call`, `over_budget`, `api_error`), cohort comparison table, filterable 30-run table, and 1-click **Passed Run** + **Failed/Blocked Run** full trace replay.
-10. **Zero Console Errors / Broken Layouts**: Clean DOM, `aria-live` announcements, focus-visible rings (`var(--focus-ring)`), and zero uncaught JS exceptions across both Live Studio and Trace Explorer.
+1. **Token Purity**: `styles.css` imports `/static/tokens.css` first and contains **zero** `#hex`, `rgba(`, or `cubic-bezier(` literals; HTML/JS contain **zero** `#RRGGBB` literals and **zero** decorative emojis.
+2. **Hero Launch Stage ↔ 3-Pane IDE Split**: Clean landing opens on `#home-hero-stage` (`Ship code you can prove you understand.`, floating `#home-prompt-card`, `Inspect 3-Pane IDE`, 4 borderless `.suggestion-row` items) and transitions seamlessly into `#workbench-split` (`368px minmax(480px, 1fr) 392px`) with `← Launch` toggle.
+3. **Top Bar Sliding Glider & `.env` Popover**: Glassmorphic header with Shield-Commit SVG mark, smooth sliding segmented glider (`Workbench ⌘1` | `Benchmarks & Traces ⌘2`), provider brand SVG indicator, and `#api-popover` (`POST /api/apikey` with `0o600` `.env` persistence + `Open Live Notion Hub ↗`).
+4. **Live SSE `RunEvent` Telemetry & Dark Terminal Inspector**: High-density step rows (`coder`/`examiner`/`single` + `code-mcp`/`notion-quiz-mcp`), `3px` step budget bar, dark `--bg-terminal` (`#0B1120`) JSON payload inspector, and reactive `.ambient-glow` waves.
+5. **Commit-Style Git Diff + SHA-256 Proof**: Center Tab 1 renders `Unified` and `Split` diffs from `DiffReport.files[].unified_diff`, commit-style `prod @ ... → staging @ ... · gate_sha256`, and dark `pytest` stdout drawer.
+6. **Notion DB2 Record + Remediation `v2` Callout**: Center Tab 2 renders the property table, clickable `RULE-00X` rule drawer, and SVG-accented Remediation `v2` callout when `QuizGradeResult.remediation_required === true`.
+7. **Zero Quiz Answer Leakage**: Network payload of `/api/state` and `/api/runs/stream` (`PublicQuizView`) never exposes `correct_option`; keyboard shortcuts `1–4` + `Enter` grade seamlessly via `POST /api/runs/{thread_id}/quiz`.
+8. **Connected 4-Lock Production Pipeline (`DeployGateStatus`)**: Vertical pipeline stepper (`01 Staging Pytest` → `04 Human Sign-Off`) enables `Approve & Promote to prod/` strictly when `locks.ready_for_approval === true`.
+9. **Layer 4 Skill Matrix + GDPR `/forget`**: All 6 `SkillTag` rows display live mastery badges, pass/fail ratio bars, `last_misconception`, and 2-click confirmed `DELETE /api/memory/{user_id}`.
+10. **Mode 2 `Benchmarks & Traces`**: `EVALUATION & STATE VERIFICATION · 30 GOLDEN SCENARIOS` header, crisp SVG secondary buttons (`Inspect Passed Trace` / `Inspect Blocked Trace`), 5-card KPI Bento Grid, cohort table, filterable runs table, and slide-over `RunFinalState` proof inspector.

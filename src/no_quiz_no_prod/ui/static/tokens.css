@@ -1,139 +1,164 @@
 /* ==========================================================================
-   No-Quiz-No-Prod — Tech Premium Design Tokens (Single Source of Truth)
-   Aesthetic: Google Antigravity / Linear precision × Notion warm editorial
-   Zero-build Vanilla CSS Custom Properties · Light-first High-Contrast Studio
+   No-Quiz-No-Prod — Dev Platform Design Tokens (Single Source of Truth)
+   DNA: french-data-rag (Alter-Ego) × Linear / Vercel / Cursor Dev Platform
+   Zero-build Vanilla CSS Custom Properties · Cool Architectural Daylight
    ========================================================================== */
 
 :root {
   color-scheme: light;
 
   /* ------------------------------------------------------------------------
-     1. Surfaces & Warm Editorial Canvas
+     1. Cool-Slate Daylight Surfaces & Deep Slate Terminal Chrome
      ------------------------------------------------------------------------ */
-  --bg-canvas: #FBFBFA;              /* Notion warm paper viewport background */
-  --bg-surface: #FFFFFF;             /* Elevated crisp card & pane surface */
-  --bg-subtle: #F7F6F3;              /* Secondary surface: DB headers, toolbars */
-  --bg-muted: #F1F0EC;               /* Segmented track, neutral chip fill */
-  --bg-code: #FAF9F6;                /* Warm off-white code & diff viewport */
-  --bg-terminal: #161615;            /* High-contrast dark command/payload drawer */
-  --bg-glass: rgba(251, 251, 250, 0.88); /* Sticky header translucent backdrop */
+  --bg-canvas: #F8FAFC;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F1F5F9;
+  --bg-muted: #E8EEF5;
+  --bg-code: #FCFDFE;
+  --bg-terminal: #0B1120;
+  --bg-terminal-elevated: #111B30;
+  --bg-glass: rgba(248, 250, 252, 0.82);
+  --bg-glass-card: rgba(255, 255, 255, 0.90);
+  --bg-glass-popover: rgba(255, 255, 255, 0.96);
 
   /* Interactive Surface Overlays */
-  --bg-hover: rgba(25, 25, 24, 0.04);
-  --bg-active: rgba(25, 25, 24, 0.075);
-  --bg-selected: #EEF5FD;
-  --bg-backdrop: rgba(25, 25, 24, 0.32);
+  --bg-hover: rgba(15, 23, 42, 0.04);
+  --bg-active: rgba(15, 23, 42, 0.075);
+  --bg-selected: #EFF6FF;
+  --bg-backdrop: rgba(15, 23, 42, 0.38);
 
   /* ------------------------------------------------------------------------
-     2. Crisp Ink & Editorial Typography Palette (WCAG AA/AAA Verified)
+     2. french-data-rag Reactive Ambient Aura & 24px Engineering Dot-Grid
      ------------------------------------------------------------------------ */
-  --ink-primary: #191918;            /* Primary editorial & UI ink (>16:1) */
-  --ink-secondary: #57564F;          /* Secondary prose, metadata values (>7:1) */
-  --ink-muted: #6F6E67;              /* Accessible labels, table headers (5.0:1) */
-  --ink-tertiary: #8A8880;           /* Subtle line numbers, decorative hints */
-  --ink-disabled: #B4B2AA;           /* Disabled controls & locked labels */
-  --ink-on-accent: #FFFFFF;          /* Crisp white text on solid accents */
-  --ink-on-terminal: #F4F3EF;        /* Light ink inside dark payload drawers */
+  --grid-dot-pattern: radial-gradient(circle, rgba(15, 23, 42, 0.068) 1px, transparent 1px);
+  --grid-dot-size: 24px 24px;
+  --aura-idle:
+    radial-gradient(ellipse 68% 52% at 50% -6%, rgba(26, 115, 232, 0.125) 0%, rgba(79, 70, 229, 0.06) 46%, transparent 76%),
+    radial-gradient(ellipse 46% 36% at 86% 18%, rgba(14, 165, 233, 0.07) 0%, transparent 70%);
+  --aura-thinking:
+    radial-gradient(ellipse 74% 58% at 50% -4%, rgba(79, 70, 229, 0.21) 0%, rgba(26, 115, 232, 0.13) 48%, transparent 78%),
+    radial-gradient(ellipse 52% 42% at 16% 22%, rgba(99, 102, 241, 0.12) 0%, transparent 72%);
+  --aura-verified:
+    radial-gradient(ellipse 74% 56% at 50% -4%, rgba(5, 150, 105, 0.19) 0%, rgba(26, 115, 232, 0.085) 48%, transparent 78%);
+  --aura-shield:
+    radial-gradient(ellipse 74% 56% at 50% -4%, rgba(225, 29, 72, 0.17) 0%, rgba(234, 88, 12, 0.115) 46%, transparent 78%);
 
   /* ------------------------------------------------------------------------
-     3. Structural Hairlines, Borders & Focus Rings
+     3. Crisp Slate Ink & Terminal Typography Palette (WCAG AA/AAA)
      ------------------------------------------------------------------------ */
-  --border-hairline: #E6E6E4;        /* Canonical 1px structural pane divider */
-  --border-subtle: #EFEFED;          /* Inner row & Notion property dividers */
-  --border-strong: #D4D3CE;          /* Input rest/hover & interactive cards */
-  --border-emphasis: #B8B6AE;        /* Active card frame */
-  --border-focus: #2383E2;           /* Precision cobalt focus outline */
-  --focus-ring: 0 0 0 3px rgba(35, 131, 226, 0.18);
-  --focus-ring-danger: 0 0 0 3px rgba(220, 38, 38, 0.18);
-  --focus-ring-success: 0 0 0 3px rgba(5, 150, 105, 0.20);
+  --ink-primary: #0F172A;
+  --ink-secondary: #334155;
+  --ink-muted: #64748B;
+  --ink-tertiary: #94A3B8;
+  --ink-disabled: #CBD5E1;
+  --ink-on-accent: #FFFFFF;
+  --ink-on-terminal: #E2E8F0;
+  --ink-terminal-muted: #94A3B8;
+  --ink-terminal-accent: #60A5FA;
+  --ink-terminal-error: #FDA4AF;
 
   /* ------------------------------------------------------------------------
-     4. Brand, Interactive Accents, Agent & MCP Server Identity
+     4. Structural Hairlines, Borders & Focus Halos
      ------------------------------------------------------------------------ */
-  --accent-primary: #1F6FEB;         /* Antigravity precision cobalt */
-  --accent-primary-hover: #195BC5;
-  --accent-primary-active: #1449A1;
-  --accent-primary-subtle: #EEF5FD;
+  --border-hairline: #E2E8F0;
+  --border-subtle: #EDF2F7;
+  --border-strong: #CBD5E1;
+  --border-emphasis: #94A3B8;
+  --border-terminal: rgba(148, 163, 184, 0.18);
+  --border-focus: #1A73E8;
+  --focus-ring: 0 0 0 3px rgba(26, 115, 232, 0.16);
+  --focus-ring-hero:
+    0 0 0 1px rgba(26, 115, 232, 0.36),
+    0 0 0 4px rgba(26, 115, 232, 0.10),
+    0 20px 44px -12px rgba(15, 23, 42, 0.12);
+  --focus-ring-danger: 0 0 0 3px rgba(220, 38, 38, 0.16);
+  --focus-ring-success: 0 0 0 3px rgba(5, 150, 105, 0.18);
+
+  /* ------------------------------------------------------------------------
+     5. Brand Cobalt-Indigo, Interactive Accents & Gate Actions
+     ------------------------------------------------------------------------ */
+  --accent-primary: #1A73E8;
+  --accent-primary-hover: #1557B0;
+  --accent-primary-active: #174EA6;
+  --accent-primary-subtle: #EFF6FF;
   --accent-primary-border: #BFDBFE;
+  --accent-indigo: #4F46E5;
+  --accent-gradient: linear-gradient(115deg, #1A73E8 0%, #4F46E5 58%, #0284C7 100%);
 
   /* Critical Production Action Accents */
-  --action-deploy-bg: #059669;       /* Unlocked "Approve & Deploy to Prod" */
+  --action-deploy-bg: #059669;
   --action-deploy-hover: #047857;
   --action-deploy-active: #065F46;
-  --action-locked-bg: #F1F0EC;       /* Locked critical gate background */
-  --action-locked-fg: #6F6E67;
-  --action-locked-border: #DFDDD6;
+  --action-locked-bg: #F1F5F9;
+  --action-locked-fg: #64748B;
+  --action-locked-border: #CBD5E1;
 
-  /* Agent Role Identity Pills (Dual-Agent Topology: Coder -> Examiner) */
-  --agent-coder-bg: #EFF6FF;
+  /* ------------------------------------------------------------------------
+     6. Restrained Technical Badges (5px-6px Precision Geometry, Zero Pastel Slop)
+     ------------------------------------------------------------------------ */
+  /* Agent Role Identity */
+  --agent-coder-bg: #F0F7FF;
   --agent-coder-fg: #1D4ED8;
   --agent-coder-border: #BFDBFE;
-  --agent-coder-dot: #2563EB;
+  --agent-coder-dot: #1A73E8;
 
   --agent-examiner-bg: #F5F3FF;
-  --agent-examiner-fg: #5B21B6;
-  --agent-examiner-border: #DDD6FE;
-  --agent-examiner-dot: #7C3AED;
+  --agent-examiner-fg: #4338CA;
+  --agent-examiner-border: #C7D2FE;
+  --agent-examiner-dot: #4F46E5;
 
-  --agent-single-bg: #F3F4F6;
-  --agent-single-fg: #374151;
-  --agent-single-border: #D1D5DB;
-  --agent-single-dot: #4B5563;
+  --agent-single-bg: #F1F5F9;
+  --agent-single-fg: #334155;
+  --agent-single-border: #CBD5E1;
+  --agent-single-dot: #475569;
 
-  /* MCP Server Identity Pills (code-mcp vs notion-quiz-mcp) */
+  /* MCP Server Identity */
   --mcp-code-bg: #F0FDFA;
   --mcp-code-fg: #0F766E;
   --mcp-code-border: #99F6E4;
   --mcp-code-dot: #0D9488;
 
-  --mcp-notion-bg: #F4F3EF;
-  --mcp-notion-fg: #37352F;
-  --mcp-notion-border: #DFDDD6;
-  --mcp-notion-dot: #191918;
+  --mcp-notion-bg: #F8FAFC;
+  --mcp-notion-fg: #334155;
+  --mcp-notion-border: #CBD5E1;
+  --mcp-notion-dot: #0F172A;
 
-  /* ------------------------------------------------------------------------
-     5. Canonical Semantic Status Pills (ShipLogStatus Contract)
-     ------------------------------------------------------------------------ */
-  /* 5.1 Staging — Warm Amber */
+  /* Canonical ShipLogStatus Semantic Tokens */
   --status-staging-bg: #FFFBEB;
   --status-staging-fg: #92400E;
-  --status-staging-border: #FCD34D;
+  --status-staging-border: #FDE68A;
   --status-staging-dot: #D97706;
 
-  /* 5.2 Quiz Pending — Indigo Gate + Gold Notion Accent */
   --status-quiz-bg: #EEF2FF;
   --status-quiz-fg: #3730A3;
   --status-quiz-border: #C7D2FE;
   --status-quiz-dot: #4F46E5;
 
-  --status-quiz-gold-bg: #FEFCE8;
-  --status-quiz-gold-fg: #854D0E;
-  --status-quiz-gold-border: #FDE047;
-  --status-quiz-gold-dot: #CA8A04;
+  --status-quiz-gold-bg: #F8FAFC;
+  --status-quiz-gold-fg: #1E293B;
+  --status-quiz-gold-border: #CBD5E1;
+  --status-quiz-gold-dot: #1A73E8;
 
-  /* 5.3 Remediation v2 — Warm Coral (Pedagogical Upgrade & Trap Callout) */
-  --status-remediation-bg: #FFF1EC;
+  --status-remediation-bg: #FFF7ED;
   --status-remediation-fg: #9A3412;
-  --status-remediation-border: #FDBA9C;
+  --status-remediation-border: #FDBA74;
   --status-remediation-dot: #EA580C;
-  --callout-remediation-bg: #FFF6F2;
+  --callout-remediation-bg: #FFFBF7;
   --callout-remediation-border: #FB923C;
   --callout-remediation-accent: #EA580C;
-  --callout-remediation-glow: rgba(234, 88, 12, 0.16);
+  --callout-remediation-glow: rgba(234, 88, 12, 0.14);
 
-  /* 5.4 Deployed to Prod — Crisp Emerald */
   --status-deployed-bg: #ECFDF5;
   --status-deployed-fg: #065F46;
   --status-deployed-border: #A7F3D0;
   --status-deployed-dot: #059669;
 
-  /* 5.5 Blocked — High-Signal Crimson */
-  --status-blocked-bg: #FEF2F2;
-  --status-blocked-fg: #991B1B;
-  --status-blocked-border: #FECACA;
-  --status-blocked-dot: #DC2626;
+  --status-blocked-bg: #FFF1F2;
+  --status-blocked-fg: #9F1239;
+  --status-blocked-border: #FECDD3;
+  --status-blocked-dot: #E11D48;
 
-  /* 5.6 Layer 4 Developer Skill Mastery Aliases (DRY Mapping) */
+  /* Layer 4 Developer Skill Mastery Aliases */
   --mastery-weakness-bg: var(--status-blocked-bg);
   --mastery-weakness-fg: var(--status-blocked-fg);
   --mastery-weakness-border: var(--status-blocked-border);
@@ -149,96 +174,91 @@
   --mastery-mastered-border: var(--status-deployed-border);
   --mastery-mastered-dot: var(--status-deployed-dot);
 
-  /* 5.7 Golden Set Scenario Kind Badges (normal, ambiguous, impossible, adversarial) */
-  --kind-normal-bg: #EFF6FF;
+  /* Golden Set Scenario Kind Badges */
+  --kind-normal-bg: #F0F7FF;
   --kind-normal-fg: #1E40AF;
   --kind-normal-border: #BFDBFE;
 
   --kind-ambiguous-bg: #FFFBEB;
   --kind-ambiguous-fg: #92400E;
-  --kind-ambiguous-border: #FCD34D;
+  --kind-ambiguous-border: #FDE68A;
 
-  --kind-impossible-bg: #F3F4F6;
-  --kind-impossible-fg: #374151;
-  --kind-impossible-border: #D1D5DB;
+  --kind-impossible-bg: #F1F5F9;
+  --kind-impossible-fg: #334155;
+  --kind-impossible-border: #CBD5E1;
 
-  --kind-adversarial-bg: #FDF2F8;
-  --kind-adversarial-fg: #9D174D;
-  --kind-adversarial-border: #FBCFE8;
+  --kind-adversarial-bg: #FFF1F2;
+  --kind-adversarial-fg: #9F1239;
+  --kind-adversarial-border: #FECDD3;
 
   /* ------------------------------------------------------------------------
-     6. Monospace Code Diff Tokens (prod <-> staging Inspector)
+     7. Monospace Code Diff Tokens (GitHub / Cursor Precision)
      ------------------------------------------------------------------------ */
-  /* Addition (+ lines & inline word diff highlights) */
-  --diff-add-line-bg: #ECFDF3;
-  --diff-add-gutter-bg: #D1FADF;
-  --diff-add-word-bg: #A6F4C5;
-  --diff-add-fg: #084C2E;
-  --diff-add-bar: #16A34A;
+  --diff-add-line-bg: #ECFDF5;
+  --diff-add-gutter-bg: #D1FAE5;
+  --diff-add-word-bg: #A7F3D0;
+  --diff-add-fg: #064E3B;
+  --diff-add-bar: #10B981;
 
-  /* Deletion (- lines & inline word diff highlights) */
   --diff-del-line-bg: #FFF1F2;
   --diff-del-gutter-bg: #FFE4E6;
   --diff-del-word-bg: #FECDD3;
   --diff-del-fg: #881337;
-  --diff-del-bar: #E11D48;
+  --diff-del-bar: #F43F5E;
 
-  /* Hunk Header (@@ -a,b +c,d @@) & Context Gutter */
-  --diff-hunk-bg: #EEF4FF;
-  --diff-hunk-fg: #2B4C9B;
-  --diff-hunk-border: #D6E4FF;
-  --diff-gutter-bg: #F5F4F0;
-  --diff-gutter-fg: #8A8880;
+  --diff-hunk-bg: #F1F5F9;
+  --diff-hunk-fg: #334155;
+  --diff-hunk-border: #E2E8F0;
+  --diff-gutter-bg: #F8FAFC;
+  --diff-gutter-fg: #94A3B8;
   --diff-context-bg: var(--bg-code);
 
   /* ------------------------------------------------------------------------
-     7. Typography Scale, Weights & Numeric Precision
+     8. Typography Scale (Plus Jakarta Sans + JetBrains Mono)
      ------------------------------------------------------------------------ */
-  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-    'Helvetica Neue', Arial, sans-serif;
+  --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, Menlo, Monaco,
     Consolas, 'Liberation Mono', monospace;
 
-  /* Modular Type Scale */
-  --text-2xs: 0.6875rem;   /* 11px — eyebrows, kbd hints, SHA-256 digests */
-  --text-xs: 0.75rem;      /* 12px — pills, DB property labels, telemetry */
-  --text-sm: 0.8125rem;    /* 13px — buttons, inputs, diff code, step cards */
-  --text-base: 0.875rem;   /* 14px — chat messages, quiz options, UI body */
-  --text-md: 0.9375rem;    /* 15px — Notion Ship Log editorial prose */
-  --text-lg: 1.0625rem;    /* 17px — section headers, Notion H3 */
-  --text-xl: 1.25rem;      /* 20px — KPI values, Notion H2 */
-  --text-2xl: 1.5rem;      /* 24px — Notion DB Page Title */
-  --text-3xl: 1.75rem;     /* 28px — Defence Explorer hero metrics */
+  --text-2xs: 0.6875rem;   /* 11px */
+  --text-xs: 0.75rem;      /* 12px */
+  --text-sm: 0.8125rem;    /* 13px */
+  --text-base: 0.875rem;   /* 14px */
+  --text-md: 0.9375rem;    /* 15px */
+  --text-lg: 1.0625rem;    /* 17px */
+  --text-xl: 1.25rem;      /* 20px */
+  --text-2xl: 1.5rem;      /* 24px */
+  --text-3xl: 1.875rem;    /* 30px */
+  --text-hero: clamp(2rem, 3.5vw, 2.75rem);
 
-  /* Line Heights */
   --leading-none: 1;
-  --leading-tight: 1.25;
-  --leading-snug: 1.375;
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
   --leading-normal: 1.5;
   --leading-relaxed: 1.65;
   --leading-code: 1.55;
 
-  /* Font Weights */
   --weight-regular: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
   --weight-bold: 700;
 
-  /* Letter Spacing */
-  --tracking-tight: -0.02em;
-  --tracking-snug: -0.011em;
+  --tracking-hero: -0.03em;
+  --tracking-tight: -0.022em;
+  --tracking-snug: -0.012em;
   --tracking-normal: 0em;
-  --tracking-caps: 0.055em;
+  --tracking-caps: 0.06em;
 
   /* ------------------------------------------------------------------------
-     8. Spacing Rhythm (4px Base Grid) & Studio Geometry
+     9. Spacing Rhythm (4px Grid) & IDE Geometry
      ------------------------------------------------------------------------ */
   --space-0: 0px;
   --space-0-5: 0.125rem;   /* 2px */
   --space-1: 0.25rem;      /* 4px */
-  --space-1-5: 0.375rem;    /* 6px */
+  --space-1-5: 0.375rem;   /* 6px */
   --space-2: 0.5rem;       /* 8px */
-  --space-2-5: 0.625rem;    /* 10px */
+  --space-2-5: 0.625rem;   /* 10px */
   --space-3: 0.75rem;      /* 12px */
   --space-4: 1rem;         /* 16px */
   --space-5: 1.25rem;      /* 20px */
@@ -247,53 +267,66 @@
   --space-10: 2.5rem;      /* 40px */
   --space-12: 3rem;        /* 48px */
 
-  /* Canonical Studio Frame Dimensions */
-  --header-height: 52px;
-  --pane-left-width: 360px;
-  --pane-center-min: 460px;
-  --pane-right-width: 380px;
+  --header-height: 56px;
+  --pane-left-width: 368px;
+  --pane-center-min: 480px;
+  --pane-right-width: 392px;
   --studio-grid-columns: var(--pane-left-width) minmax(var(--pane-center-min), 1fr) var(--pane-right-width);
 
-  /* Border Radii */
+  /* Border Radii: 5-6px Technical Badges, 9999px Top-Bar Capsules ONLY */
   --radius-xs: 4px;
+  --radius-badge: 5px;
   --radius-sm: 6px;
   --radius-md: 8px;
-  --radius-lg: 10px;
-  --radius-xl: 12px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
   --radius-pill: 9999px;
 
-  /* Z-Index Layer Scale */
+  --z-aura: 0;
   --z-base: 1;
   --z-sticky: 20;
   --z-header: 40;
-  --z-popover: 60;
-  --z-modal: 80;
+  --z-popover: 65;
+  --z-modal: 85;
   --z-toast: 100;
 
   /* ------------------------------------------------------------------------
-     9. Elevation Shadows (Warm Ink Micro-Elevation)
+     10. Cool-Slate Architectural Shadows
      ------------------------------------------------------------------------ */
   --shadow-none: none;
-  --shadow-xs: 0 1px 2px rgba(25, 25, 24, 0.04);
-  --shadow-sm: 0 1px 3px rgba(25, 25, 24, 0.05), 0 1px 2px rgba(25, 25, 24, 0.03);
-  --shadow-md: 0 4px 12px -2px rgba(25, 25, 24, 0.07), 0 2px 4px -1px rgba(25, 25, 24, 0.04);
-  --shadow-lg: 0 12px 28px -6px rgba(25, 25, 24, 0.10), 0 4px 10px -2px rgba(25, 25, 24, 0.05);
-  --shadow-deploy-ready: 0 0 0 1px rgba(5, 150, 105, 0.28),
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.06), 0 1px 2px rgba(15, 23, 42, 0.03);
+  --shadow-md: 0 6px 16px -4px rgba(15, 23, 42, 0.08), 0 2px 6px -1px rgba(15, 23, 42, 0.04);
+  --shadow-lg: 0 16px 36px -8px rgba(15, 23, 42, 0.12), 0 4px 12px -2px rgba(15, 23, 42, 0.05);
+  --shadow-hero-card:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 14px 36px -10px rgba(15, 23, 42, 0.09);
+  --shadow-popover:
+    0 20px 48px -12px rgba(15, 23, 42, 0.18),
+    0 4px 12px -2px rgba(15, 23, 42, 0.06);
+  --shadow-glider:
+    0 1px 3px rgba(15, 23, 42, 0.10),
+    0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-deploy-ready:
+    0 0 0 1px rgba(5, 150, 105, 0.30),
     0 6px 18px -4px rgba(5, 150, 105, 0.22);
 
   /* ------------------------------------------------------------------------
-     10. Micro-Interaction Motion & Timing Curves
+     11. Silky Spring & Standard Motion Curves
      ------------------------------------------------------------------------ */
   --ease-standard: cubic-bezier(0.2, 0, 0, 1);
-  --ease-out-expo: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out-expo: var(--ease-spring);
   --duration-fast: 120ms;
   --duration-base: 160ms;
-  --duration-slow: 260ms;
+  --duration-slow: 280ms;
+  --duration-aura: 700ms;
   --duration-highlight: 1400ms;
 
   --transition-fast: var(--duration-fast) var(--ease-standard);
-  --transition-base: 160ms cubic-bezier(0.2, 0, 0, 1);
-  --transition-slow: var(--duration-slow) var(--ease-out-expo);
+  --transition-base: var(--duration-base) var(--ease-standard);
+  --transition-spring: var(--duration-slow) var(--ease-spring);
+  --transition-slow: var(--duration-slow) var(--ease-spring);
 }
 
 /* ==========================================================================
@@ -303,11 +336,22 @@
 @keyframes nq-slide-fade-in {
   from {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(5px);
   }
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes nq-hero-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.992);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
   }
 }
 
@@ -317,19 +361,30 @@
     transform: scale(1);
   }
   50% {
-    opacity: 0.42;
-    transform: scale(0.86);
+    opacity: 0.40;
+    transform: scale(0.84);
+  }
+}
+
+@keyframes nq-aura-breathe {
+  0%, 100% {
+    opacity: 0.88;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.03);
   }
 }
 
 @keyframes nq-remediation-highlight {
   0% {
-    box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.38);
-    background-color: #FFE8DC;
+    box-shadow: 0 0 0 0 rgba(234, 88, 12, 0.32);
+    background-color: #FFEDD5;
   }
   45% {
-    box-shadow: 0 0 0 6px rgba(234, 88, 12, 0.12);
-    background-color: #FFF1EC;
+    box-shadow: 0 0 0 6px rgba(234, 88, 12, 0.10);
+    background-color: #FFF7ED;
   }
   100% {
     box-shadow: 0 0 0 0 rgba(234, 88, 12, 0);
@@ -405,7 +460,7 @@
 }
 
 [data-mastery="Not Assessed"] {
-  --pill-bg: var(--bg-muted);
+  --pill-bg: var(--bg-subtle);
   --pill-fg: var(--ink-muted);
   --pill-border: var(--border-hairline);
   --pill-dot: var(--ink-tertiary);
@@ -434,7 +489,7 @@
 
 [data-agent="human"],
 [data-agent="system"] {
-  --pill-bg: var(--bg-muted);
+  --pill-bg: var(--bg-subtle);
   --pill-fg: var(--ink-secondary);
   --pill-border: var(--border-hairline);
   --pill-dot: var(--ink-muted);
@@ -481,24 +536,28 @@
   --pill-bg: var(--kind-normal-bg);
   --pill-fg: var(--kind-normal-fg);
   --pill-border: var(--kind-normal-border);
+  --pill-dot: var(--agent-coder-dot);
 }
 
 [data-kind="ambiguous"] {
   --pill-bg: var(--kind-ambiguous-bg);
   --pill-fg: var(--kind-ambiguous-fg);
   --pill-border: var(--kind-ambiguous-border);
+  --pill-dot: var(--status-staging-dot);
 }
 
 [data-kind="impossible"] {
   --pill-bg: var(--kind-impossible-bg);
   --pill-fg: var(--kind-impossible-fg);
   --pill-border: var(--kind-impossible-border);
+  --pill-dot: var(--ink-muted);
 }
 
 [data-kind="adversarial"] {
   --pill-bg: var(--kind-adversarial-bg);
   --pill-fg: var(--kind-adversarial-fg);
   --pill-border: var(--kind-adversarial-border);
+  --pill-dot: var(--status-blocked-dot);
 }
 
 .tabular-nums {

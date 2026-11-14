@@ -1,9 +1,9 @@
 {
-  "schema_version": 1,
-  "generated_at": "2026-11-14T00:34:43+00:00",
+  "schema_version": 2,
+  "generated_at": "2026-11-14T08:16:12+00:00",
   "instructions_version": "0.0.6",
   "parent_project_page_id": "3ef2eeb1-0d3e-81bb-9571-edf4ceac4c74",
-  "hub_title": "No-Quiz-No-Prod — Agentic Hub",
+  "hub_title": "No-Quiz-No-Prod",
   "hub_page_id": "4182eeb1-0d3e-8182-9bd9-fd43108f40a2",
   "hub_url": "https://app.notion.com/p/4182eeb10d3e81829bd9fd43108f40a2",
   "rules_db_id": "4182eeb1-0d3e-81d5-8b86-c078239f578f",
@@ -279,6 +279,48 @@
       "name": "Live Ship Board",
       "view_id": "4182eeb1-0d3e-81c9-9afe-000c87095b48",
       "url": "view://4182eeb1-0d3e-81c9-9afe-000c87095b48"
+    },
+    "hub_active_skills_list": {
+      "name": "Active Skills",
+      "block_id": "4182eeb1-0d3e-81a7-8a03-f44892690395",
+      "view_id": "4182eeb1-0d3e-8190-8dd6-000c406fb4af",
+      "url": "view://4182eeb1-0d3e-8190-8dd6-000c406fb4af"
+    },
+    "hub_not_assessed_skills_list": {
+      "name": "Not Assessed",
+      "block_id": "4182eeb1-0d3e-8152-860e-cfaeaf53dc40",
+      "view_id": "4182eeb1-0d3e-8115-9108-000c3ef7c58f",
+      "url": "view://4182eeb1-0d3e-8115-9108-000c3ef7c58f"
+    },
+    "hub_rules_gallery": {
+      "name": "Rules",
+      "block_id": "4182eeb1-0d3e-81eb-81db-c14d24809f8a",
+      "view_id": "4182eeb1-0d3e-81ae-84fe-000c0f576a63",
+      "url": "view://4182eeb1-0d3e-81ae-84fe-000c0f576a63"
+    },
+    "hub_rules_table_tab": {
+      "name": "Table",
+      "block_id": "4182eeb1-0d3e-81eb-81db-c14d24809f8a",
+      "view_id": "4182eeb1-0d3e-8108-8160-000c2eee62b5",
+      "url": "view://4182eeb1-0d3e-8108-8160-000c2eee62b5"
+    },
+    "hub_ship_board_compact": {
+      "name": "Ship Board",
+      "block_id": "4182eeb1-0d3e-818a-8ac0-c0b2101628df",
+      "view_id": "4182eeb1-0d3e-81bf-9390-000c83e714ca",
+      "url": "view://4182eeb1-0d3e-81bf-9390-000c83e714ca"
+    },
+    "hub_ship_overview_donut": {
+      "name": "Overview",
+      "block_id": "4182eeb1-0d3e-818a-8ac0-c0b2101628df",
+      "view_id": "4182eeb1-0d3e-815b-8b5a-000cd5a4bdfe",
+      "url": "view://4182eeb1-0d3e-815b-8b5a-000cd5a4bdfe"
+    },
+    "hub_shipments_full_table": {
+      "name": "Shipments",
+      "block_id": "4182eeb1-0d3e-81a0-9cf7-f53e586f5fcd",
+      "view_id": "4182eeb1-0d3e-8198-9097-000cd0b1d812",
+      "url": "view://4182eeb1-0d3e-8198-9097-000cd0b1d812"
     }
   }
 }

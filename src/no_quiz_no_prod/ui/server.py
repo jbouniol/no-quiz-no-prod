@@ -11,18 +11,21 @@ import argparse
 import asyncio
 import inspect
 import json
+import os
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import Any, Final, Literal, Protocol
+from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from no_quiz_no_prod import __version__
 from no_quiz_no_prod.contracts import (
@@ -32,12 +35,14 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_MAX_STEPS,
     DEFAULT_SEED,
     DEFAULT_USER_ID,
+    ENV_FILE,
     NOTION_IDS_FILE,
     PROJECT_ROOT,
     DeployAction,
     DeployDecision,
     DeployGateStatus,
     DiffReport,
+    EnvVar,
     EvalRunResult,
     FaultKind,
     GateLedger,
@@ -59,10 +64,8 @@ from no_quiz_no_prod.contracts import (
     ToolCallTrace,
     Topology,
     compute_tree_sha256,
-    diff_sha256_from_trees,
     pass_at_k,
     pass_hat_k,
-    sha256_hex,
 )
 
 STATIC_DIR: Final = Path(__file__).resolve().parent / "static"
@@ -312,6 +315,73 @@ class DeploySubmitRequest(BaseModel):
     topology: Topology | None = None
 
 
+ApiKeyProvider = Literal["openrouter", "anthropic", "notion"]
+
+_API_KEY_ENV_MAP: Final[dict[ApiKeyProvider, tuple[EnvVar, str]]] = {
+    "openrouter": (EnvVar.OPENROUTER_API_KEY, "openrouter_api_key"),
+    "anthropic": (EnvVar.ANTHROPIC_API_KEY, "anthropic_api_key"),
+    "notion": (EnvVar.NOTION_API_KEY, "notion_api_key"),
+}
+
+
+class ApiKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: ApiKeyProvider
+    api_key: str = Field(min_length=1, repr=False)
+
+    @field_validator("api_key")
+    @classmethod
+    def _validate_secret_token(cls, raw: str) -> str:
+        cleaned = raw.strip()
+        if not cleaned:
+            raise ValueError("API key must not be empty or whitespace-only.")
+        if "\n" in cleaned or "\r" in cleaned or "\x00" in cleaned:
+            raise ValueError("API key must be a single-line token.")
+        return cleaned
+
+
+def _format_env_assignment(var_name: str, secret_value: str) -> str:
+    if any(ch in secret_value for ch in (" ", "\t", "#", '"', "'", "\\")):
+        escaped = secret_value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{var_name}="{escaped}"'
+    return f"{var_name}={secret_value}"
+
+
+def _upsert_env_secret(env_file: Path, env_var: EnvVar, secret_value: str) -> None:
+    """Atomically write or update ``env_var`` in ``env_file`` with strict ``0o600`` permissions."""
+    existing_lines = env_file.read_text(encoding="utf-8").splitlines() if env_file.is_file() else []
+    assignment = _format_env_assignment(env_var.value, secret_value)
+    key_pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(env_var.value)}\s*=")
+
+    updated_lines: list[str] = []
+    replaced = False
+    for line in existing_lines:
+        if key_pattern.match(line):
+            if not replaced:
+                updated_lines.append(assignment)
+                replaced = True
+        else:
+            updated_lines.append(line)
+
+    if not replaced:
+        updated_lines.append(assignment)
+
+    rendered = "\n".join(updated_lines) + "\n"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = env_file.with_name(f".{env_file.name}.{os.getpid()}.{uuid.uuid4().hex[:6]}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, env_file)
+        os.chmod(env_file, 0o600)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
 # ---- pure serialization & helper functions -------------------------------------------------------------------------
 def _normalize_skill_profile(records: list[SkillProfileRecord], user_id: str) -> list[SkillProfileRecord]:
     by_tag = {rec.skill_tag: rec for rec in records}
@@ -470,14 +540,57 @@ class StudioManager:
         workflow_factory: WorkflowFactory | None = None,
         eval_dir: Path | None = None,
         notion_ids_file: Path | None = None,
+        env_file: Path | None = None,
     ) -> None:
         self.settings = settings or RuntimeSettings.from_env()
         self._workspace = workspace
         self._workflow_factory = workflow_factory or _default_workflow_factory
         self.eval_dir = eval_dir or (PROJECT_ROOT / "eval")
         self.notion_ids_file = notion_ids_file or NOTION_IDS_FILE
+        self.env_file = env_file or ENV_FILE
         self.sessions: dict[str, _ThreadSession] = {}
         self.latest_thread_id: str | None = None
+
+    @property
+    def provider_status(self) -> dict[str, bool]:
+        llm = self.settings.providers
+        return {
+            "openrouter": bool(llm["openrouter"]),
+            "anthropic": bool(llm["anthropic"]),
+            "notion": self.settings.notion_api_key is not None,
+        }
+
+    def update_api_key(self, provider: ApiKeyProvider, api_key: str) -> dict[str, bool]:
+        """Persist ``api_key`` to ``self.env_file`` (0o600) and refresh ``self.settings`` in memory."""
+        env_var, settings_attr = _API_KEY_ENV_MAP[provider]
+        _upsert_env_secret(self.env_file, env_var, api_key)
+        if self.env_file == ENV_FILE:
+            os.environ[env_var.value] = api_key
+
+        notion_ids = _read_notion_metadata(self.notion_ids_file)
+        updates: dict[str, Any] = {settings_attr: SecretStr(api_key)}
+        if not self.settings.notion_ship_log_db_id and notion_ids.get("ship_log_db_id"):
+            updates["notion_ship_log_db_id"] = notion_ids["ship_log_db_id"]
+        if not self.settings.notion_rules_db_id and notion_ids.get("rules_db_id"):
+            updates["notion_rules_db_id"] = notion_ids["rules_db_id"]
+        if not self.settings.notion_skills_db_id and notion_ids.get("skill_profile_db_id"):
+            updates["notion_skills_db_id"] = notion_ids["skill_profile_db_id"]
+
+        self.settings = self.settings.model_copy(update=updates)
+        if self._workspace is not None:
+            if hasattr(self._workspace, "settings"):
+                self._workspace.settings = self.settings  # type: ignore[attr-defined]
+            if hasattr(self._workspace, "notion"):
+                old_notion = getattr(self._workspace, "notion", None)
+                close_fn = getattr(old_notion, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
+
+                self._workspace.notion = NotionDatabaseSync(self.settings)  # type: ignore[attr-defined]
+        for session in self.sessions.values():
+            session.workflow = None
+        return self.provider_status
 
     @property
     def workspace(self) -> WorkspaceBackend:
@@ -580,6 +693,7 @@ class StudioManager:
             "models": _build_models_catalogue(self.settings),
             "notion": {
                 "notion_enabled": self.settings.notion_enabled,
+                "notion_key_configured": self.settings.notion_api_key is not None,
                 "hub_url": _resolve_hub_url(notion_ids),
                 "rules": [r.model_dump(mode="json") for r in rules],
             },
@@ -752,6 +866,7 @@ def create_app(
     workflow_factory: WorkflowFactory | None = None,
     eval_dir: Path | None = None,
     notion_ids_file: Path | None = None,
+    env_file: Path | None = None,
 ) -> FastAPI:
     """Create the FastAPI Studio server with injectable workspace/workflow backends for testing."""
     manager = StudioManager(
@@ -760,6 +875,7 @@ def create_app(
         workflow_factory=workflow_factory,
         eval_dir=eval_dir,
         notion_ids_file=notion_ids_file,
+        env_file=env_file,
     )
 
     app = FastAPI(
@@ -795,6 +911,54 @@ def create_app(
         thread_id: str | None = Query(default=None),
     ) -> dict[str, Any]:
         return manager.build_state_payload(user_id=user_id, thread_id=thread_id)
+
+    @app.post("/api/apikey", response_model=None)
+    async def post_apikey(request: Request) -> JSONResponse:
+        content_type = request.headers.get("content-type", "").lower()
+        if not content_type.startswith("application/json"):
+            return JSONResponse(
+                status_code=415,
+                content={"ok": False, "detail": "Content-Type must be application/json."},
+            )
+        origin = request.headers.get("origin")
+        host = request.headers.get("host")
+        if origin and host and urlparse(origin).netloc.lower() != host.lower():
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "detail": "Cross-origin API key updates are forbidden."},
+            )
+        try:
+            raw_body = await request.json()
+        except ValueError:
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "detail": "Invalid JSON request body."},
+            )
+        if not isinstance(raw_body, dict):
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "detail": "Expected JSON object payload."},
+            )
+        try:
+            req = ApiKeyUpdateRequest.model_validate(raw_body)
+        except ValidationError as exc:
+            first_msg = exc.errors()[0].get("msg", "Invalid API key update request.") if exc.errors() else "Invalid."
+            return JSONResponse(
+                status_code=422,
+                content={"ok": False, "detail": str(first_msg)},
+            )
+
+        providers = await _invoke_maybe_async(manager.update_api_key, req.provider, req.api_key)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "provider": req.provider,
+                "providers": providers,
+                "notion_enabled": manager.settings.notion_enabled,
+                "models": _build_models_catalogue(manager.settings),
+            },
+        )
 
     @app.post("/api/reset")
     async def post_reset(req: ResetRequest) -> dict[str, Any]:
@@ -1024,12 +1188,6 @@ def create_app(
 
         def collect_event(ev: RunEvent) -> None:
             remediation_events.append(ev)
-
-        grade: QuizGradeResult
-        interrupt: HumanInterrupt | None = None
-        stop_reason: StopReason | None = None
-        budget: RunBudget | None = None
-        remediation_trace: list[ToolCallTrace] = []
 
         if session is None:
             resolved_model, resolved_topology = manager.resolve_thread_meta(
@@ -1361,12 +1519,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 __all__ = [
-    "DiffReport",
     "StudioManager",
     "create_app",
-    "diff_sha256_from_trees",
     "main",
-    "sha256_hex",
 ]
 
 
