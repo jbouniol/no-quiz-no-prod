@@ -10,8 +10,8 @@ from typing import Final
 from no_quiz_no_prod.agents.coder import CODER, CODER_TOOLS, build_coder_messages, developer_request
 from no_quiz_no_prod.agents.examiner import (
     EXAMINER,
-    DiffTooLargeError,
     EXAMINER_TOOLS,
+    DiffTooLargeError,
     bind_quiz_args,
     bind_ship_log_args,
     build_examiner_brief,

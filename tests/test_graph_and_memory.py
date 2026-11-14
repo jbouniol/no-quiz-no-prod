@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langgraph.types import Command
+from pydantic import ValidationError
 from testkit import ScriptedLLM, call, turn
 
 from no_quiz_no_prod.agents import (
@@ -62,7 +64,15 @@ from no_quiz_no_prod.graph.mcp_bridge import (
     create_bridge,
     decode_call_result,
 )
-from no_quiz_no_prod.graph.workflow import NoQuizWorkflow, WorkflowOutcome, make_graph
+from no_quiz_no_prod.graph.workflow import (
+    MAX_RELEASE_REAPPROVALS,
+    NoQuizWorkflow,
+    ThreadStateError,
+    WorkflowOutcome,
+    _parse_deploy_decision,
+    close_studio_workflows,
+    make_graph,
+)
 from no_quiz_no_prod.llm import ChatTurnResponse
 from no_quiz_no_prod.memory import SkillMemory, redact_sensitive
 
@@ -113,6 +123,7 @@ class FakeBackend:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.skills: dict[tuple[str, str], SkillProfileRecord] = {}
         self.push_failures = 0  # deploy_to_production calls that fail like an unreachable release remote
+        self.push_error = ToolErrorPayload(code="upstream_error", message="git push (release remote) failed")
         self.reset()
 
     # -- SandboxWorkspace harness API (#14 §4) ------------------------------------------------------------------------
@@ -145,6 +156,9 @@ class FakeBackend:
         self.latest_quiz: dict[str, str] = {}
         self.pytest: PytestReport | None = None
         self.fault, self.fault_fired, self.writes = fault, False, 0
+        # the task epoch (since the last deploy or reset): blocks and graded answers never follow a diff hash
+        self.blocked_reason: str | None = None
+        self.grades: dict[tuple[str, str], QuizGradeResult] = {}
         self.calls.clear()
         if not preserve_skill_memory:
             self.skills.clear()
@@ -203,10 +217,17 @@ class FakeBackend:
     def grade_quiz_answer(
         self, question_id: str, selected_option: str, *, user_id: str = DEFAULT_USER_ID
     ) -> QuizGradeResult:
+        if (stored := self.grades.get((question_id, selected_option))) is not None:
+            return stored  # replay-safe: the same question and option answer with the recorded grade
+        if any(question == question_id for question, _option in self.grades):
+            raise ToolCallError(ToolErrorPayload(code="conflict", message=f"question {question_id!r} is not open"))
         quiz = self.quizzes[question_id]
         grade = quiz.grade(selected_option)  # type: ignore[arg-type]
-        if grade.passed or grade.deployment_blocked:
-            self.ledger = self.ledger.record("quiz_passed" if grade.passed else "blocked", grade.diff_sha256)
+        self.grades[(question_id, selected_option)] = grade
+        if grade.passed:
+            self.ledger = self.ledger.record("quiz_passed", grade.diff_sha256)
+        if grade.deployment_blocked:
+            self.blocked_reason = "quiz_exhausted"
         entry = self.ship_logs.get(quiz.thread_id)
         if entry is not None:
             update = {"quiz_attempts": grade.attempt, "status": grade.ship_log_status, "doc_version": grade.doc_version}
@@ -219,18 +240,24 @@ class FakeBackend:
 
     def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus:
         current = self.get_diff_report().diff_sha256
-        expected = decision.expected_diff_sha256 or current
-        if decision.approved and expected == current:
+        expected = decision.expected_diff_sha256
+        if decision.approved and expected == current and self.get_gate_status(expected).ready_for_approval:
             self.ledger = self.ledger.record("human_approved", current)
-        if not decision.approved:
-            self.ledger = self.ledger.record("blocked", current)
+        if not decision.approved:  # accepted at any time: blocks the epoch, whatever is staged afterwards
+            self.blocked_reason = "human_rejected"
             entry = self.get_latest_ship_log(thread_id)
             if entry is not None and entry.thread_id:
                 self.ship_logs[entry.thread_id] = entry.model_copy(update={"status": "Blocked"})
-        return self.ledger.status(current, expected)
+        return self.get_gate_status(expected)
 
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus:
-        return self.ledger.status(self.get_diff_report().diff_sha256, expected_diff_sha256)
+    def get_gate_status(self, expected_diff_sha256: str) -> DeployGateStatus:
+        status = self.ledger.status(self.get_diff_report().diff_sha256, expected_diff_sha256)
+        epoch = {
+            "blocked": self.blocked_reason is not None,
+            "blocked_reason": self.blocked_reason,
+            "quiz_attempts": len(self.grades),
+        }
+        return DeployGateStatus.model_validate({**status.model_dump(), **epoch})
 
     def get_skill_profile(self, user_id: str = DEFAULT_USER_ID) -> list[SkillProfileRecord]:
         return [self._skill(user_id, tag) for tag in ALL_SKILL_TAGS]
@@ -347,21 +374,24 @@ class FakeBackend:
         self, expected_diff_sha256: str, release_note: str, idempotency_key: str | None = None
     ) -> dict[str, Any]:
         diff = self.get_diff_report()
-        status = self.ledger.status(diff.diff_sha256, expected_diff_sha256)
+        status = self.get_gate_status(expected_diff_sha256)
         if diff.trees_identical or not status.can_deploy:
             message = f"missing locks {status.missing_locks}"
             raise ToolCallError(
                 ToolErrorPayload(code="gate_locked", message=message, details={"missing_locks": status.missing_locks})
             )
-        if self.push_failures > 0:  # the git push of the release fails: nothing is promoted or recorded
+        if self.push_failures > 0:  # the push fails: nothing is promoted or recorded, and Lock 4 is revoked
             self.push_failures -= 1
-            raise ToolCallError(ToolErrorPayload(code="upstream_error", message="git push (release remote) failed"))
+            approved = [sha for sha in self.ledger.human_approved if sha != diff.diff_sha256]
+            self.ledger = self.ledger.model_copy(update={"human_approved": approved})
+            raise ToolCallError(self.push_error)
         if self.fault == "push_rejected" and not self.fault_fired:  # refused once, retryable, nothing pushed
             self.fault_fired = True
             payload = ToolErrorPayload(code="upstream_error", message="push rejected (injected)", retryable=True)
             raise ToolCallError(payload)
         shutil.copytree(self.root / "staging", self.root / "prod", dirs_exist_ok=True)
         self.ledger = self.ledger.record("deployed", diff.diff_sha256)
+        self.grades.clear()  # a deploy opens a new task epoch
         for thread_id, entry in list(self.ship_logs.items()):
             if entry.diff_sha256 == diff.diff_sha256:
                 update = {"status": "Deployed to Prod", "deployed_at": datetime.now(UTC)}
@@ -592,27 +622,56 @@ def test_exhausted_quiz_blocks_and_never_deploys(tmp_path: Path, backend: FakeBa
     assert result.passed, result.why
     assert result.stop_reason == "quiz_failed" and result.final_state.ship_log_status == "Blocked"
     assert "deploy_to_production" not in tools_called(backend)
-    assert backend.ledger.blocked and not backend.ledger.deployed
+    assert backend.blocked_reason == "quiz_exhausted" and not backend.ledger.deployed
 
 
-def test_a_failed_push_is_retried_by_a_new_approval_of_the_same_diff(tmp_path: Path, backend: FakeBackend) -> None:
+def at_deploy_gate(tmp_path: Path, backend: FakeBackend, thread_id: str) -> tuple[NoQuizWorkflow, str]:
+    """A dual run driven to its deploy approval: ``(workflow, the diff hash the human reviews)``."""
     workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "D")))
-    workflow.start_run(TASK, thread_id="t-push")
-    _grade, gated = workflow.submit_quiz("t-push", QuizAnswer(selected_option="D"))
-    assert gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
+    workflow.start_run(TASK, thread_id=thread_id)
+    _grade, gated = workflow.submit_quiz(thread_id, QuizAnswer(selected_option="D"))
+    assert gated.interrupt is not None and gated.interrupt.kind == "deploy_approval" and gated.interrupt.gate
+    return workflow, gated.interrupt.gate.diff_sha256
+
+
+def approve(sha: str, reason: str = "ship it") -> DeployDecision:
+    return DeployDecision(action="approve", expected_diff_sha256=sha, reason=reason)
+
+
+def reject(sha: str, reason: str = "not today") -> DeployDecision:
+    return DeployDecision(action="reject", expected_diff_sha256=sha, reason=reason)
+
+
+def test_a_failed_push_pauses_on_a_release_retry_and_a_new_approval_ships_the_same_diff(
+    tmp_path: Path, backend: FakeBackend
+) -> None:
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-push")
     backend.push_failures = 1
+    events: list[Any] = []
 
-    failed = workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", reason="ship it"))
-    assert failed.stop_reason == "refused" and failed.interrupt is None and not failed.final_state.deployed
+    failed = workflow.submit_deploy_decision("t-push", approve(sha), on_event=events.append)
+    # not "refused", not terminal: the gate passed, the release did not, and the human is asked again
+    assert failed.stop_reason is None and failed.interrupt is not None and failed.interrupt.kind == "release_retry"
+    assert failed.interrupt.release == failed.pending_release and failed.pending_release is not None
+    assert failed.pending_release.expected_diff_sha256 == sha and failed.pending_release.attempts == 1
+    assert failed.pending_release.error is not None and failed.pending_release.error.code == "upstream_error"
     assert failed.trace[-1].tool == "deploy_to_production" and failed.trace[-1].error is not None
-    assert failed.trace[-1].error.code == "upstream_error" and not backend.ledger.deployed
-    status = backend.get_gate_status()
-    assert status.can_deploy and not status.blocked  # all 4 locks still hold for the same diff
+    assert not failed.final_state.deployed and not backend.ledger.deployed
+    assert events[-1].type == "run_completed" and events[-1].interrupt.kind == "release_retry"
+    # the failed push revoked Lock 4: the re-approval is a real one
+    assert failed.interrupt.gate is not None and not failed.interrupt.gate.human_approved
+    assert failed.interrupt.gate.ready_for_approval
+    # the pending release is graph state: it survives a restart, and a follow-up turn cannot drop it
+    values = workflow.app.get_state({"configurable": {"thread_id": "t-push"}}).values
+    assert values["pending_release"]["idempotency_key"] == failed.trace[-1].idempotency_key
+    with pytest.raises(ThreadStateError, match="paused on a human gate"):
+        workflow.start_run("Also rename the function.", thread_id="t-push")
     with pytest.raises(ValueError, match="only retry the deploy"):  # a retry never ships another diff
-        workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", expected_diff_sha256="f" * 64))
+        workflow.submit_deploy_decision("t-push", approve("f" * 64))
 
-    done = workflow.submit_deploy_decision("t-push", DeployDecision(action="approve", reason="retry"))
+    done = workflow.submit_deploy_decision("t-push", approve(sha, "retry"))
     assert done.stop_reason == "completed" and done.interrupt is None and done.final_state.deployed
+    assert done.pending_release is None
     assert [(entry.agent, entry.tool) for entry in done.trace[-4:]] == [
         ("human", "submit_deploy_decision"),
         ("system", "deploy_to_production"),
@@ -623,21 +682,174 @@ def test_a_failed_push_is_retried_by_a_new_approval_of_the_same_diff(tmp_path: P
     assert retry.error is None and retry.args == first.args and retry.idempotency_key == first.idempotency_key
     assert [entry.step for entry in done.trace] == list(range(1, len(done.trace) + 1))
     assert tools_called(backend).count("deploy_to_production") == 2
-    with pytest.raises(ValueError, match="not waiting for a deploy decision"):  # a deployed thread has nothing left
-        workflow.submit_deploy_decision("t-push", DeployDecision(action="approve"))
+    with pytest.raises(ThreadStateError, match="not waiting for a deploy decision"):
+        workflow.submit_deploy_decision("t-push", approve(sha))
+
+
+def test_a_failed_push_can_be_rejected_and_that_blocks(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-push-reject")
+    backend.push_failures = 1
+    failed = workflow.submit_deploy_decision("t-push-reject", approve(sha))
+    assert failed.interrupt is not None and failed.interrupt.kind == "release_retry"
+
+    done = workflow.submit_deploy_decision("t-push-reject", reject(sha, "changed my mind"))
+    assert done.stop_reason == "human_rejected" and done.pending_release is None and not done.final_state.deployed
+    assert backend.blocked_reason == "human_rejected" and not backend.get_gate_status(sha).can_deploy
+    assert tools_called(backend).count("deploy_to_production") == 1  # the rejection made no deploy call
+
+
+def test_a_release_that_keeps_failing_ends_release_failed_never_refused(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-push-down")
+    backend.push_failures = 99
+    events: list[Any] = []
+    outcome = workflow.submit_deploy_decision("t-push-down", approve(sha))
+    for _ in range(MAX_RELEASE_REAPPROVALS):
+        assert outcome.stop_reason is None and outcome.interrupt is not None
+        outcome = workflow.submit_deploy_decision("t-push-down", approve(sha), on_event=events.append)
+
+    assert outcome.stop_reason == "release_failed" and outcome.interrupt is None
+    assert outcome.pending_release is not None and outcome.pending_release.attempts == MAX_RELEASE_REAPPROVALS + 1
+    assert "not a gate refusal" in outcome.final_answer and not outcome.final_state.deployed
+    assert events[-1].type == "run_completed" and events[-1].pending_release == outcome.pending_release
+    assert tools_called(backend).count("deploy_to_production") == MAX_RELEASE_REAPPROVALS + 1
+    assert backend.blocked_reason is None  # a failed release blocks nothing: a new run may ship it
+
+
+def test_an_unanswered_deploy_is_reconciled_with_the_workspace_before_concluding(
+    tmp_path: Path, backend: FakeBackend
+) -> None:
+    """The deploy landed but its answer was lost (timeout, outcome unknown): the run must not say "refused"."""
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-lost")
+    deploy = backend.tool_deploy_to_production
+
+    def lost_answer(**args: Any) -> dict[str, Any]:
+        deploy(**args)  # prod is promoted, the ledger records the deploy...
+        payload = ToolErrorPayload(code="timeout", message="no answer in time", outcome_unknown=True)
+        raise ToolCallError(payload)  # ...and the caller never hears about it
+
+    backend.tool_deploy_to_production = lost_answer  # type: ignore[method-assign]
+    done = workflow.submit_deploy_decision("t-lost", approve(sha))
+    assert done.stop_reason == "completed" and done.final_state.deployed and done.pending_release is None
+    assert "workspace confirms" in done.final_answer and done.trace[-1].error is not None
+
+
+def test_an_unanswered_deploy_that_did_not_land_asks_the_human_again(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-unknown")
+    backend.push_failures = 1
+    backend.push_error = ToolErrorPayload(code="timeout", message="git push timed out", outcome_unknown=True)
+    outcome = workflow.submit_deploy_decision("t-unknown", approve(sha))
+    assert outcome.stop_reason is None and outcome.interrupt is not None and outcome.interrupt.kind == "release_retry"
+    assert outcome.pending_release is not None and outcome.pending_release.error is not None
+    assert outcome.pending_release.error.outcome_unknown
+
+
+def test_a_gate_refusal_at_deploy_time_stays_refused(tmp_path: Path, backend: FakeBackend) -> None:
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-drift")
+    (backend.root / "staging" / "auth.py").write_text("# edited after the review\n")  # Lock 2: the diff drifted
+    done = workflow.submit_deploy_decision("t-drift", approve(sha))
+    assert done.stop_reason == "refused" and done.pending_release is None and not done.final_state.deployed
+    assert done.trace[-1].error is not None and done.trace[-1].error.code == "gate_locked"
+
+
+def test_a_deploy_decision_must_name_the_reviewed_diff(tmp_path: Path, backend: FakeBackend) -> None:
+    """AG-16: a decision without ``expected_diff_sha256`` is an error at every entry point, never defaulted."""
+    with pytest.raises(ValidationError):
+        DeployDecision.model_validate({"action": "approve"})
+    for bare in ("approve", True, {"action": "approve"}, {"action": "reject"}):
+        with pytest.raises((ValueError, ValidationError)):
+            _parse_deploy_decision(bare)
+    workflow, sha = at_deploy_gate(tmp_path, backend, "t-bare")
+    config = {"configurable": {"thread_id": "t-bare"}}
+    workflow.app.invoke(Command(resume="approve"), config)  # e.g. typed in LangGraph Studio
+    snapshot = workflow.app.get_state(config)
+    assert snapshot.interrupts and snapshot.interrupts[0].value["kind"] == "deploy_approval"  # asked again
+    assert not backend.ledger.human_approved and "deploy_to_production" not in tools_called(backend)
+    assert workflow.submit_deploy_decision("t-bare", approve(sha)).stop_reason == "completed"
 
 
 def test_human_rejection_blocks_and_never_deploys(tmp_path: Path, backend: FakeBackend) -> None:
     workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "D")))
     workflow.start_run(TASK, thread_id="t-reject")
     _grade, gated = workflow.submit_quiz("t-reject", QuizAnswer(selected_option="D"))
-    assert gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
-    with pytest.raises(ValueError, match="not waiting for a quiz"):
+    assert gated.interrupt is not None and gated.interrupt.kind == "deploy_approval" and gated.interrupt.gate
+    with pytest.raises(ThreadStateError, match="not waiting for a quiz"):
         workflow.submit_quiz("t-reject", QuizAnswer(selected_option="A"))
-    done = workflow.submit_deploy_decision("t-reject", DeployDecision(action="reject", reason="not today"))
+    done = workflow.submit_deploy_decision("t-reject", reject(gated.interrupt.gate.diff_sha256))
     assert done.stop_reason == "human_rejected" and not done.final_state.deployed
     assert done.final_state.ship_log_status == "Blocked" and not done.final_state.prod_changed
     assert "deploy_to_production" not in tools_called(backend)
+
+
+# ---- task epoch: blocks and attempts survive follow-ups and edits (M-1), frozen code in remediation (M-2) ----------
+@pytest.mark.parametrize("ending", ["quiz_failed", "human_rejected"])
+def test_a_follow_up_turn_cannot_clear_a_block_by_editing_staging(
+    tmp_path: Path, backend: FakeBackend, ending: str
+) -> None:
+    """BE-02 / M-1: after an exhausted quiz or a rejection, a follow-up used to restart at attempt 1 on a new diff."""
+    retry = [turn(call("write_staging_file", path="orders.py", content=FIXED_ORDERS + "# no-op edit\n"))]
+    llm = ScriptedLLM(coder=coder_fix() + retry, examiner=doc_and_quiz(1, "A") + doc_and_quiz(2, "C"))
+    workflow = make_workflow(tmp_path, backend, llm)
+    workflow.start_run(TASK, thread_id="t-epoch")
+    if ending == "quiz_failed":
+        workflow.submit_quiz("t-epoch", QuizAnswer(selected_option="B"))
+        _grade, ended = workflow.submit_quiz("t-epoch", QuizAnswer(selected_option="B"))
+    else:
+        _grade, gated = workflow.submit_quiz("t-epoch", QuizAnswer(selected_option="A"))
+        assert gated.interrupt is not None and gated.interrupt.gate is not None
+        ended = workflow.submit_deploy_decision("t-epoch", reject(gated.interrupt.gate.diff_sha256))
+    assert ended.stop_reason == ending
+    calls_before, writes_before = len(llm.calls), backend.writes
+
+    for thread_id in ("t-epoch", "t-epoch-new-thread"):  # a follow-up turn, then a brand new thread
+        again = workflow.start_run("Add a trailing comment to orders.py and ship it.", thread_id=thread_id)
+        assert again.stop_reason == "refused" and f"blocked ({backend.blocked_reason})" in again.final_answer
+    assert len(llm.calls) == calls_before and backend.writes == writes_before  # no agent ran, nothing was written
+    assert not backend.ledger.deployed
+
+
+def test_a_new_thread_resumes_the_epoch_attempt_count_instead_of_restarting_at_one(
+    tmp_path: Path, backend: FakeBackend
+) -> None:
+    first = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A")))
+    first.start_run(TASK, thread_id="t-first")
+    backend.grade_quiz_answer("q-t-first-1", "B")  # one wrong answer is recorded for this epoch
+    first.close()
+
+    llm = ScriptedLLM(coder=[turn(text="STATUS: DONE\nAlready staged and green.")], examiner=doc_and_quiz(2, "C"))
+    second = make_workflow(tmp_path, backend, llm)
+    paused = second.start_run(TASK, thread_id="t-second")
+    assert paused.interrupt is not None and paused.interrupt.quiz is not None
+    assert paused.interrupt.quiz.attempt == 2  # not a fresh "attempt 1 of 2"
+    _grade, ended = second.submit_quiz("t-second", QuizAnswer(selected_option="B"))
+    assert ended.stop_reason == "quiz_failed" and backend.blocked_reason == "quiz_exhausted"
+
+
+def test_single_agent_cannot_change_the_code_during_remediation(tmp_path: Path, backend: FakeBackend) -> None:
+    """M-2: a write during remediation changed the diff under the quiz (verified end to end on the real backend:
+    the server restarted at attempt 1 while the harness expected attempt 2, and the run died in a nudge loop)."""
+    sneaky = turn(call("write_staging_file", path="orders.py", content=FIXED_ORDERS + "# tweak\n"))
+    rerun = turn(call("run_staging_tests"))
+    script = coder_fix("")[:-1] + doc_and_quiz(1, "A") + [sneaky, rerun] + doc_and_quiz(2, "C")
+    llm = ScriptedLLM(single=script)
+    workflow = make_workflow(tmp_path, backend, llm, topology="single")
+    paused = workflow.start_run(TASK, thread_id="t-frozen", max_steps=20)
+    assert paused.interrupt is not None and paused.interrupt.gate is None
+    diff_before, writes_before = backend.get_diff_report().diff_sha256, backend.writes
+    assert "write_staging_file" in llm.calls[-1].tools  # before the quiz the single agent may still write
+
+    _grade, again = workflow.submit_quiz("t-frozen", QuizAnswer(selected_option="B"))
+    refused = [entry for entry in again.trace if entry.tool in ("write_staging_file", "run_staging_tests")][-2:]
+    assert [entry.error.code for entry in refused if entry.error] == ["forbidden", "forbidden"]
+    assert backend.writes == writes_before and backend.get_diff_report().diff_sha256 == diff_before
+    remediation_turns = [
+        seen for seen in llm.calls if any("answered WRONG" in str(m["content"]) for m in seen.messages)
+    ]
+    assert remediation_turns and all(
+        not {"write_staging_file", "run_staging_tests"} & set(seen.tools) for seen in remediation_turns
+    )
+    assert {"upsert_ship_log_doc", "create_comprehension_quiz", "read_code_file"} <= set(remediation_turns[0].tools)
+    assert again.interrupt is not None and again.interrupt.quiz is not None and again.interrupt.quiz.attempt == 2
+    assert again.interrupt.quiz.diff_sha256 == diff_before  # still the diff the first question was about
 
 
 # ---- budget, clarification, refusal, retries, security -------------------------------------------------------------

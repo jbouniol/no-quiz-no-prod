@@ -6,7 +6,8 @@
     single: single -> handoff -> quiz_gate        (one shared conversation)
     quiz_gate -> quiz_outcome                     (the grade is checkpointed before anything else happens)
     quiz_outcome -> deploy_gate | examiner/single (remediation v2) | finish (quiz_failed)
-    deploy_gate -> finish (completed | human_rejected | refused)
+    deploy_gate -> finish (completed | human_rejected | refused) | release_gate (the push failed)
+    release_gate -> finish (completed | human_rejected | release_failed) | release_gate (it failed again)
 
 Harness guarantees, independent of the model:
 - Step budget: an LLM-initiated tool call is a step; once ``steps >= max_steps`` the router goes to ``give_up``
@@ -25,6 +26,7 @@ Harness guarantees, independent of the model:
 - Every step, artifact and pause is streamed as a ``RunEvent`` to ``on_event`` (the SSE payloads of the Studio).
 """
 
+import atexit
 import json
 import logging
 import operator
@@ -74,7 +76,9 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_MAX_STEPS,
     DEFAULT_SEED,
     DEFAULT_USER_ID,
+    ERROR_STOP_REASONS,
     MAX_QUIZ_ATTEMPTS,
+    RELEASE_RETRY_CODES,
     AgentRole,
     ContractModel,
     DeployDecision,
@@ -85,6 +89,7 @@ from no_quiz_no_prod.contracts import (
     HumanInterrupt,
     HumanPersona,
     InjectionSpec,
+    PendingRelease,
     PublicQuizView,
     PytestReport,
     QuizAnswer,
@@ -119,17 +124,17 @@ RETRY_BACKOFF_S: Final = (0.25, 0.75)
 MAX_HANDOFF_NUDGES: Final = 2  # harness reminders before a phase that keeps failing its checks is stopped
 MAX_UNUSABLE_TURN_RETRIES: Final = 2  # re-asks after a model turn with no tool call and no text (truncated or empty)
 EVAL_STEP_HEADROOM: Final = 4  # eval hard cap = scenario budget + headroom, so over_budget stays observable
-MAX_HITL_ROUNDS: Final = MAX_QUIZ_ATTEMPTS + 1  # every quiz attempt, then one deploy decision
+MAX_RELEASE_REAPPROVALS: Final = 2  # human re-approvals of a failed release before the run ends release_failed
+# every quiz attempt, one deploy decision, then every re-approval of a failed release
+MAX_HITL_ROUNDS: Final = MAX_QUIZ_ATTEMPTS + 1 + MAX_RELEASE_REAPPROVALS
 TREE_BOUND_TOOLS: Final = frozenset({"write_staging_file", "run_staging_tests"})
 TREE_KEY_FIELD: Final = "staging_tree_sha256"  # mixed into the key only, never sent to the server
 HARVESTED_KEYS: Final = ("quiz", "ship_log", "rules_read", "wrote_staging")
 RELEASE_NOTE_CHARS: Final = 200
-# deploy_to_production errors of the git push itself: prod, the ledger and the ship log were left untouched, so a new
-# human approval of the same diff may retry that deploy (a gate_locked refusal never is: a lock no longer holds)
-RELEASE_RETRY_CODES: Final = frozenset({"conflict", "upstream_error", "timeout"})
 INJECTION_PROBE_CHARS: Final = 48
 ENCRYPTED_REASONING: Final = "reasoning.encrypted"  # OpenRouter reasoning_details item with no readable text
 FORGET_THREAD_PREFIX: Final = "forget:"
+QUIZ_OUTCOME_NODE: Final = "quiz_outcome"  # runs once the grade is checkpointed (see submit_quiz)
 ARTIFACTS_BY_TOOL: Final[Mapping[str, tuple[str, ...]]] = {
     "write_staging_file": ("diff", "locks"),
     "get_staging_diff": ("diff", "locks"),
@@ -160,6 +165,20 @@ DEPLOYED: Final = "Deployed to production: diff {sha} passed all four SHA-256 lo
 RELEASED: Final = " Release commit {commit} is on {branch} ({remote})."
 REJECTED: Final = "Deployment rejected by the human reviewer: diff {sha} is blocked and production was not touched."
 GATE_REFUSED: Final = "The server-side gate refused the deployment: {message}"
+CONFIRMED_AFTER_LOST_ANSWER: Final = " (The deploy call was not answered in time; the workspace confirms it landed.)"
+RELEASE_RETRY: Final = (
+    "The gate passed for diff {sha} but the release was not published (attempt {attempts}): {message} Production "
+    "was not promoted and the approval was revoked: approve again to retry this same diff, or reject it."
+)
+RELEASE_FAILED: Final = (
+    "The release of diff {sha} was not published after {attempts} attempts: {message} This is not a gate refusal: "
+    "production was not promoted, and the last outcome may be unknown. Check the release remote before a new run."
+)
+EPOCH_BLOCKED: Final = (
+    "This workspace is blocked ({reason}): nothing can be deployed, whatever is staged, until a human resets or "
+    "unblocks it. No agent was run."
+)
+WRONG_RETRY_DIFF: Final = "thread {thread_id!r} can only retry the deploy of diff {sha}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
 SEALED_ARGS_LOST: Final = (
     "{tool}: the sealed arguments of this call were lost (the harness restarted before running it). Call the tool "
@@ -206,7 +225,7 @@ class WorkspaceHarness(Protocol):
 
     def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus: ...
 
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus: ...
+    def get_gate_status(self, expected_diff_sha256: str) -> DeployGateStatus: ...
 
     def get_skill_profile(self, user_id: str = DEFAULT_USER_ID) -> list[SkillProfileRecord]: ...
 
@@ -229,6 +248,7 @@ class WorkflowOutcome(ContractModel):
     trace: list[ToolCallTrace] = Field(default_factory=list)
     budget: RunBudget
     final_state: RunFinalState
+    pending_release: PendingRelease | None = None  # set while a failed release awaits the human, and after it
 
 
 class WorkflowInput(TypedDict):
@@ -260,6 +280,7 @@ class WorkflowState(TypedDict, total=False):
     wrote_staging: bool
     nudges: int
     budget_exhausted: bool
+    pending_release: dict[str, Any] | None  # PendingRelease: a gated deploy whose release was not published
     stop_reason: StopReason | None
     final_answer: str
 
@@ -398,26 +419,19 @@ def _release_suffix(result: Any) -> str:
     return RELEASED.format(commit=commit.commit_sha[:12], branch=commit.branch, remote=commit.remote)
 
 
-def _failed_release(values: Mapping[str, Any]) -> ToolCallTrace | None:
-    """The thread's last step when it is a ``deploy_to_production`` whose push failed (retryable by a new approval)."""
-    trace = values.get("trace") or []
-    if values.get("stop_reason") != "refused" or not trace:
-        return None
-    last = ToolCallTrace.model_validate(trace[-1])
-    if last.tool != "deploy_to_production" or last.error is None or last.error.code not in RELEASE_RETRY_CODES:
-        return None
-    return last
-
-
 def _parse_deploy_decision(value: Any) -> DeployDecision:
-    """Resume value of a deploy interrupt: a ``DeployDecision`` dict, "approve"/"reject", or a bool (Studio)."""
-    if isinstance(value, bool):
-        value = {"action": "approve" if value else "reject"}
-    elif isinstance(value, str):
-        value = {"action": value.strip().lower()}
-    elif isinstance(value, Mapping):
-        value = {key: value[key] for key in DeployDecision.model_fields if key in value}
-    return DeployDecision.model_validate(value)
+    """Resume value of a deploy or release-retry interrupt: a ``DeployDecision`` mapping.
+
+    ``expected_diff_sha256`` is mandatory: a bare "approve" (or a bool) names no reviewed diff and is refused.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("a deploy decision needs `action` and `expected_diff_sha256`")
+    return DeployDecision.model_validate({key: value[key] for key in DeployDecision.model_fields if key in value})
+
+
+def _pending_release(values: Mapping[str, Any]) -> PendingRelease | None:
+    raw = values.get("pending_release")
+    return PendingRelease.model_validate(raw) if raw else None
 
 
 def _ask_human[T](request: HumanInterrupt, parse: Callable[[Any], T]) -> T:
@@ -572,12 +586,15 @@ class NoQuizWorkflow:
         graph.add_node("tools", self._node_tools)
         graph.add_node("handoff", self._node_handoff, destinations=("agent", "quiz_gate", "finish"))
         graph.add_node("quiz_gate", self._node_quiz_gate)
-        graph.add_node("quiz_outcome", self._node_quiz_outcome, destinations=("deploy_gate", "agent", "finish"))
-        graph.add_node("deploy_gate", self._node_deploy_gate)
+        graph.add_node(QUIZ_OUTCOME_NODE, self._node_quiz_outcome, destinations=("deploy_gate", "agent", "finish"))
+        graph.add_node("deploy_gate", self._node_deploy_gate, destinations=("release_gate", "finish"))
+        graph.add_node("release_gate", self._node_release_gate, destinations=("release_gate", "finish"))
         graph.add_node("give_up", self._node_give_up)
         graph.add_node("finish", self._node_finish)
         graph.add_edge(START, "init")
-        graph.add_edge("init", "agent")
+        graph.add_conditional_edges(
+            "init", lambda state: "finish" if state.get("stop_reason") else "agent", ["finish", "agent"]
+        )
         graph.add_conditional_edges(
             "agent",
             self._route_agent,
@@ -586,8 +603,7 @@ class NoQuizWorkflow:
         graph.add_conditional_edges(
             "tools", lambda state: "give_up" if state.get("budget_exhausted") else "agent", ["give_up", "agent"]
         )
-        graph.add_edge("quiz_gate", "quiz_outcome")
-        graph.add_edge("deploy_gate", "finish")
+        graph.add_edge("quiz_gate", QUIZ_OUTCOME_NODE)
         graph.add_edge("give_up", END)
         graph.add_edge("finish", END)
         return graph.compile(checkpointer=checkpointer, store=store, name="no_quiz_no_prod")
@@ -599,6 +615,10 @@ class NoQuizWorkflow:
         task = state["task"]
         previous = (state.get("messages") or {}).get(lead)
         turn_steps = state.get("max_steps") or DEFAULT_MAX_STEPS
+        # Blocks and quiz attempts belong to the workspace's task epoch, not to this turn or to a diff hash: a
+        # follow-up (or a new thread) neither clears a block nor gets fresh attempts by editing staging.
+        gate = self.workspace.get_gate_status(self.workspace.get_diff_report().diff_sha256)
+        attempt = gate.quiz_attempts + 1
         if previous:  # a follow-up in the same thread (e.g. the answer to a clarifying question) keeps the history
             history = [*previous, developer_request(task, follow_up=True)]
             prior = _budget(state)
@@ -618,17 +638,18 @@ class NoQuizWorkflow:
             "pending_calls": [],
             "last_text": "",
             "budget": budget.model_dump(mode="json"),
-            "attempt": 1,
+            "attempt": attempt,
             "quiz": None,
             "ship_log": None,
             "last_grade": None,
-            "prior_failed_grade": None,
+            "prior_failed_grade": state.get("prior_failed_grade") if previous and attempt > 1 else None,
             "rules_read": dict(state.get("rules_read") or {}),
             "wrote_staging": False,
             "nudges": 0,
             "budget_exhausted": False,
-            "stop_reason": None,
-            "final_answer": "",
+            "pending_release": None,
+            "stop_reason": "refused" if gate.blocked else None,
+            "final_answer": EPOCH_BLOCKED.format(reason=gate.blocked_reason or "blocked") if gate.blocked else "",
         }
 
     def _node_agent(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
@@ -743,7 +764,8 @@ class NoQuizWorkflow:
             if not gate.tests_passed:
                 return self._nudge(state, NUDGE_TESTS)
             if role == "coder":
-                return self._examiner_turn(state, diff, attempt=1, extra={"final_answer": answer})
+                extra = {"final_answer": answer, "prior_failed_grade": state.get("prior_failed_grade")}
+                return self._examiner_turn(state, diff, attempt=state.get("attempt", 1), extra=extra)
         missing = missing_deliverables(
             ship_log=state.get("ship_log"),
             quiz=state.get("quiz"),
@@ -806,7 +828,9 @@ class NoQuizWorkflow:
             return self._examiner_turn(state, self.workspace.get_diff_report(), attempt=grade.attempt + 1, extra=update)
         return _finish("quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option))
 
-    def _node_deploy_gate(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
+    def _node_deploy_gate(
+        self, state: WorkflowState, config: RunnableConfig
+    ) -> Command[Literal["release_gate", "finish"]]:
         thread_id = _thread_id(config)
         diff = self.workspace.get_diff_report()
         gate = self.workspace.get_gate_status(diff.diff_sha256)
@@ -818,13 +842,59 @@ class NoQuizWorkflow:
         )
         request = HumanInterrupt(kind="deploy_approval", thread_id=thread_id, message=prompt, gate=gate, diff=diff)
         decision = _ask_human(request, _parse_deploy_decision)
+        # ---- below runs once, after the human decided (the decision names the diff they reviewed: never defaulted)
+        note = str((state.get("ship_log") or {}).get("title") or state["task"])[:RELEASE_NOTE_CHARS]
+        args = {"expected_diff_sha256": decision.expected_diff_sha256, "release_note": note}
+        release = PendingRelease(
+            expected_diff_sha256=decision.expected_diff_sha256,
+            release_note=note,
+            idempotency_key=idem_key(thread_id, "deploy_to_production", args),
+        )
+        return self._decide(state, thread_id, decision, release)
+
+    def _node_release_gate(
+        self, state: WorkflowState, config: RunnableConfig
+    ) -> Command[Literal["release_gate", "finish"]]:
+        """A gated deploy whose release failed: the human re-approves the SAME diff (a real Lock 4, the server
+        revoked the first approval) or rejects it. Same arguments and idempotency key: never a new change."""
+        thread_id = _thread_id(config)
+        failed = PendingRelease.model_validate(state["pending_release"])
+        expected = failed.expected_diff_sha256
+        message = failed.error.message if failed.error else "unknown error"
+        request = HumanInterrupt(
+            kind="release_retry",
+            thread_id=thread_id,
+            message=RELEASE_RETRY.format(sha=expected[:12], attempts=failed.attempts, message=message),
+            gate=self.workspace.get_gate_status(expected),
+            diff=self.workspace.get_diff_report(),
+            release=failed,
+        )
+
+        def parse(value: Any) -> DeployDecision:
+            decision = _parse_deploy_decision(value)
+            if decision.expected_diff_sha256 != expected:
+                raise ValueError(WRONG_RETRY_DIFF.format(thread_id=thread_id, sha=expected[:12]))
+            return decision
+
+        decision = _ask_human(request, parse)
         # ---- below runs once, after the human decided
-        if decision.expected_diff_sha256 is None:  # the human approved what they were shown
-            decision = decision.model_copy(update={"expected_diff_sha256": diff.diff_sha256})
+        return self._decide(state, thread_id, decision, failed.model_copy(update={"attempts": failed.attempts + 1}))
+
+    def _decide(
+        self, state: WorkflowState, thread_id: str, decision: DeployDecision, release: PendingRelease
+    ) -> Command[Literal["release_gate", "finish"]]:
+        """Record the human's decision (harness side), then, on approval, make the system's deploy call.
+
+        ``release`` is the publish this approval is for (its ``attempts`` already counts this one). The route:
+        deployed -> completed; rejected -> human_rejected; the gate refused -> refused; the release failed ->
+        ``release_gate`` again, or release_failed once the re-approvals are spent. An unanswered deploy call is
+        reconciled against the workspace before anything is concluded.
+        """
+        sha = release.expected_diff_sha256[:12]
         locks = self.workspace.apply_deploy_decision(decision, thread_id=thread_id)
-        step, budget = len(state.get("trace") or []), _budget(state)
+        budget = _budget(state)
         human = ToolCallTrace(
-            step=step + 1,
+            step=len(state.get("trace") or []) + 1,
             agent="human",
             tool="submit_deploy_decision",
             args=decision.model_dump(mode="json"),
@@ -833,26 +903,11 @@ class NoQuizWorkflow:
         self._emit(thread_id, "step", step=human, budget=budget)
         if not decision.approved:
             self._emit_artifacts(thread_id, budget, ("ship_log",), locks=locks)
-            return {
-                "trace": [human.model_dump(mode="json")],
-                "stop_reason": "human_rejected",
-                "final_answer": REJECTED.format(sha=sha),
-            }
-        note = str((state.get("ship_log") or {}).get("title") or state["task"])[:RELEASE_NOTE_CHARS]
-        args = {"expected_diff_sha256": decision.expected_diff_sha256, "release_note": note}
-        key = idem_key(thread_id, "deploy_to_production", args)
-        return self._deploy(thread_id, human, args, key, locks, budget)
-
-    def _deploy(
-        self,
-        thread_id: str,
-        human: ToolCallTrace,
-        args: Mapping[str, Any],
-        key: str,
-        locks: DeployGateStatus,
-        budget: RunBudget,
-    ) -> dict[str, Any]:
-        """The system's ``deploy_to_production`` call after a human approval: its trace entries and the stop reason."""
+            return _finish(
+                "human_rejected", REJECTED.format(sha=sha), trace=[human.model_dump(mode="json")], pending_release=None
+            )
+        args = {"expected_diff_sha256": release.expected_diff_sha256, "release_note": release.release_note}
+        key = release.idempotency_key or idem_key(thread_id, "deploy_to_production", args)
         started = time.perf_counter()
         outcome, attempts = self._call_with_retry("deploy_to_production", args, key)
         system = ToolCallTrace(
@@ -860,7 +915,7 @@ class NoQuizWorkflow:
             agent="system",
             server=TOOLS["deploy_to_production"].server,
             tool="deploy_to_production",
-            args=dict(args),
+            args=args,
             result=outcome.result,
             error=outcome.error,
             latency_s=time.perf_counter() - started,
@@ -871,11 +926,22 @@ class NoQuizWorkflow:
         self._emit(thread_id, "step", step=system, budget=budget)
         self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=locks)
         trace = [human.model_dump(mode="json"), system.model_dump(mode="json")]
-        if outcome.ok:
-            answer = DEPLOYED.format(sha=str(args["expected_diff_sha256"])[:12]) + _release_suffix(outcome.result)
-            return {"trace": trace, "stop_reason": "completed", "final_answer": answer}
-        message = outcome.error.message if outcome.error else "unknown error"
-        return {"trace": trace, "stop_reason": "refused", "final_answer": GATE_REFUSED.format(message=message)}
+        error = outcome.error
+        if error is None:
+            answer = DEPLOYED.format(sha=sha) + _release_suffix(outcome.result)
+            return _finish("completed", answer, trace=trace, pending_release=None)
+        if error.outcome_unknown and self.workspace.snapshot_final_state(thread_id).deployed:
+            return _finish(
+                "completed", DEPLOYED.format(sha=sha) + CONFIRMED_AFTER_LOST_ANSWER, trace=trace, pending_release=None
+            )
+        if error.code not in RELEASE_RETRY_CODES:  # a lock no longer holds (or the call itself was invalid)
+            return _finish("refused", GATE_REFUSED.format(message=error.message), trace=trace, pending_release=None)
+        failed = release.model_copy(update={"error": error, "idempotency_key": key})
+        update = {"trace": trace, "pending_release": failed.model_dump(mode="json")}
+        if failed.attempts > MAX_RELEASE_REAPPROVALS:
+            text = RELEASE_FAILED.format(sha=sha, attempts=failed.attempts, message=error.message)
+            return _finish("release_failed", text, **update)
+        return Command(goto="release_gate", update=update)
 
     def _node_give_up(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         budget = _budget(state)
@@ -1161,17 +1227,29 @@ class NoQuizWorkflow:
         """Answer the pending quiz: graded server-side, then the run continues (remediation, deploy gate or stop).
 
         The thread's developer (the ``user_id`` of ``start_run``) owns the Layer 4 update; ``user_id`` only applies
-        to a thread that has none."""
+        to a thread that has none.
+
+        Replay-safe: if a crash stopped the run after the grade was checkpointed, calling this again continues from
+        that grade (the answer is not graded twice); if it crashed before the checkpoint, the thread is still
+        paused and the server answers the same question and option with the grade it recorded.
+        """
         config = _config(thread_id)
         snapshot = self.app.get_state(config)
         pending = _pending(snapshot)
-        if pending is None or pending.kind != "quiz" or pending.quiz is None:
+        values = snapshot.values or {}
+        graded = QUIZ_OUTCOME_NODE in (snapshot.next or ()) and not snapshot.interrupts
+        if graded:  # the grade is in the checkpoint, only its consequences are missing
+            question_id, resume = (values.get("quiz") or {}).get("question_id"), None
+        elif pending is not None and pending.kind == "quiz" and pending.quiz is not None:
+            update = {} if values.get("user_id") else {"user_id": user_id}
+            question_id = pending.quiz.question_id
+            resume = Command(resume={"selected_option": answer.selected_option}, update=update)
+        else:
             raise ThreadStateError(f"thread {thread_id!r} is not waiting for a quiz answer")
-        update = {} if (snapshot.values or {}).get("user_id") else {"user_id": user_id}
         with self._listening(thread_id, on_event):
-            outcome = self._drive(config, Command(resume={"selected_option": answer.selected_option}, update=update))
+            outcome = self._drive(config, resume)
         grade = _grade(self.app.get_state(config).values.get("last_grade"))
-        if grade is None or grade.question_id != pending.quiz.question_id:
+        if grade is None or grade.question_id != question_id:
             raise RuntimeError(f"the answer was not graded: {outcome.final_answer or 'the run stopped before grading'}")
         return grade, outcome
 
@@ -1183,61 +1261,26 @@ class NoQuizWorkflow:
         user_id: str = DEFAULT_USER_ID,
         on_event: Callable[[RunEvent], None] | None = None,
     ) -> WorkflowOutcome:
-        """Answer the pending deploy approval: approve (then deploy through the 4 locks) or reject (blocked).
+        """Answer the pending deploy approval, or the pending retry of a failed release: approve or reject.
 
-        A thread whose deploy failed to push (``RELEASE_RETRY_CODES``) is no longer paused, but a new approval of the
-        same diff retries that very deploy (``_retry_deploy``); anything else is a ``ValueError``.
+        Approve deploys through the 4 locks; reject blocks. After a failed push the thread pauses again on a
+        ``release_retry`` interrupt: the answer must name the same diff (``ValueError`` otherwise).
         """
         config = _config(thread_id)
-        snapshot = self.app.get_state(config)
-        pending = _pending(snapshot)
-        if pending is None or pending.kind != "deploy_approval":
-            failed = _failed_release(snapshot.values or {}) if pending is None and decision.approved else None
-            if failed is None:
-                raise ValueError(f"thread {thread_id!r} is not waiting for a deploy decision")
-            with self._listening(thread_id, on_event):
-                return self._retry_deploy(config, snapshot.values, failed, decision)
+        pending = _pending(self.app.get_state(config))
+        if pending is None or pending.kind not in ("deploy_approval", "release_retry"):
+            raise ThreadStateError(f"thread {thread_id!r} is not waiting for a deploy decision")
+        if pending.release is not None and decision.expected_diff_sha256 != pending.release.expected_diff_sha256:
+            sha = pending.release.expected_diff_sha256[:12]
+            raise ValueError(WRONG_RETRY_DIFF.format(thread_id=thread_id, sha=sha))
         with self._listening(thread_id, on_event):
             return self._drive(config, Command(resume=decision.model_dump(mode="json")))
-
-    def _retry_deploy(
-        self,
-        config: RunnableConfig,
-        values: Mapping[str, Any],
-        failed: ToolCallTrace,
-        decision: DeployDecision,
-    ) -> WorkflowOutcome:
-        """Re-run the failed ``deploy_to_production`` of a finished thread, after a new human approval.
-
-        Same arguments and same idempotency key: the same diff and release note, never a new change. The server
-        re-checks the four locks and the publisher never pushes a tree the remote already holds. The graph is not
-        re-entered: the new trace entries and stop reason are written to the checkpoint as the ``finish`` node.
-        """
-        thread_id = _thread_id(config)
-        expected = str(failed.args.get("expected_diff_sha256") or "")
-        if decision.expected_diff_sha256 not in (None, expected):
-            raise ValueError(f"thread {thread_id!r} can only retry the deploy of diff {expected[:12]}")
-        decision = decision.model_copy(update={"expected_diff_sha256": expected})
-        locks = self.workspace.apply_deploy_decision(decision, thread_id=thread_id)
-        budget = _budget(values)
-        human = ToolCallTrace(
-            step=len(values.get("trace") or []) + 1,
-            agent="human",
-            tool="submit_deploy_decision",
-            args=decision.model_dump(mode="json"),
-            result=locks.model_dump(mode="json"),
-        )
-        self._emit(thread_id, "step", step=human, budget=budget)
-        key = failed.idempotency_key or idem_key(thread_id, "deploy_to_production", failed.args)
-        update = self._deploy(thread_id, human, failed.args, key, locks, budget)
-        self.app.update_state(config, update, as_node="finish")
-        return self._conclude(config)
 
     def _drive(self, config: RunnableConfig, payload: Any) -> WorkflowOutcome:
         thread_id = _thread_id(config)
         try:
             self.app.invoke(payload, config)
-        except Exception as exc:  # a crash ends the stream cleanly (UI) and scores as api_error (eval)
+        except Exception as exc:  # a crash ends the stream cleanly (UI) and is reported as harness_error
             logger.exception("workflow crashed on thread %s", thread_id)
             return self._conclude(config, crash=f"{type(exc).__name__}: {exc}")
         return self._conclude(config)
@@ -1249,9 +1292,10 @@ class NoQuizWorkflow:
         pending = None if crash else _pending(snapshot)
         stop: StopReason | None = None if pending else values.get("stop_reason")
         text = crash or values.get("final_answer") or ""
-        if crash or (pending is None and stop is None):
-            stop, text = "api_error", text or "the workflow ended without a stop reason"
+        if crash or (pending is None and stop is None):  # a harness bug: never blamed on the provider or the model
+            stop, text = "harness_error", text or "the workflow ended without a stop reason"
         budget = _budget(values)
+        release = _pending_release(values)
         outcome = WorkflowOutcome(
             thread_id=thread_id,
             stop_reason=stop,
@@ -1260,12 +1304,19 @@ class NoQuizWorkflow:
             trace=[ToolCallTrace.model_validate(entry) for entry in values.get("trace") or []],
             budget=budget,
             final_state=self.workspace.snapshot_final_state(thread_id),
+            pending_release=release,
         )
-        if stop == "api_error":
-            self._emit(thread_id, "run_error", stop_reason="api_error", text=text, budget=budget)
+        if stop in ERROR_STOP_REASONS:
+            self._emit(thread_id, "run_error", stop_reason=stop, text=text, budget=budget)
         else:
             self._emit(
-                thread_id, "run_completed", interrupt=pending, stop_reason=stop, text=text or None, budget=budget
+                thread_id,
+                "run_completed",
+                interrupt=pending,
+                stop_reason=stop,
+                text=text or None,
+                budget=budget,
+                pending_release=release if stop == "release_failed" else None,
             )
         return outcome
 
@@ -1313,10 +1364,13 @@ class NoQuizWorkflow:
         except Exception as exc:  # one broken run must not abort a 30-scenario campaign
             logger.exception("scenario %s#%s crashed", scenario.id, repeat)
             error = f"{type(exc).__name__}: {exc}"
-        if outcome is not None and outcome.stop_reason == "api_error":
+        if outcome is not None and outcome.stop_reason in ERROR_STOP_REASONS:
             error = error or outcome.final_answer
+        # only a provider failure reported by the graph is an api_error: a crash here is the harness's own
         stop: StopReason = (
-            "api_error" if error or outcome is None or outcome.stop_reason is None else outcome.stop_reason
+            outcome.stop_reason
+            if outcome is not None and outcome.stop_reason is not None and outcome.interrupt is None
+            else "harness_error"
         )
         if outcome is None:
             values = self.app.get_state(_config(thread_id)).values or {}
@@ -1354,9 +1408,11 @@ class NoQuizWorkflow:
             option = self._persona_option(persona, outcome.thread_id, request.quiz)
             return self.submit_quiz(outcome.thread_id, QuizAnswer(selected_option=option), user_id=user_id)[1]
         approve = persona != "reject_or_exhaust_quiz"
+        if request.gate is None:
+            raise ValueError(f"a {request.kind} interrupt carries no gate status")
         decision = DeployDecision(
             action="approve" if approve else "reject",
-            expected_diff_sha256=request.gate.diff_sha256 if request.gate else None,
+            expected_diff_sha256=request.release.expected_diff_sha256 if request.release else request.gate.diff_sha256,
             reason=f"simulated human persona: {persona}",
         )
         return self.submit_deploy_decision(outcome.thread_id, decision, user_id=user_id)
@@ -1404,13 +1460,34 @@ class NoQuizWorkflow:
         )
 
 
+_studio_workflows: dict[tuple[Topology, str | None], NoQuizWorkflow] = {}
+_studio_lock = threading.Lock()
+
+
+def close_studio_workflows() -> None:
+    """Close every workflow ``make_graph`` built (MCP servers, event-loop thread, SQLite files). Idempotent."""
+    with _studio_lock:
+        workflows = list(_studio_workflows.values())
+        _studio_workflows.clear()
+    for workflow in workflows:
+        workflow.close()
+
+
 def make_graph(config: RunnableConfig | None = None) -> CompiledStateGraph:
-    """LangGraph Studio / ``langgraph dev`` entry point (see ``langgraph.json``): the platform brings persistence."""
+    """LangGraph Studio / ``langgraph dev`` entry point (see ``langgraph.json``): the platform brings persistence.
+
+    The platform may call this factory many times: one workflow per (topology, model) is built and reused, and all
+    of them are closed at interpreter exit, so no call leaks MCP server subprocesses.
+    """
     configurable = dict((config or {}).get("configurable") or {})
-    topology = configurable.get("topology", "dual")
-    workflow = NoQuizWorkflow(
-        topology=topology if topology in ("dual", "single") else "dual", model=configurable.get("model")
-    )
+    topology: Topology = "single" if configurable.get("topology") == "single" else "dual"
+    key = (topology, configurable.get("model"))
+    with _studio_lock:
+        workflow = _studio_workflows.get(key)
+        if workflow is None:
+            if not _studio_workflows:
+                atexit.register(close_studio_workflows)
+            workflow = _studio_workflows[key] = NoQuizWorkflow(topology=topology, model=key[1])
     return workflow.build_graph()
 
 
@@ -1418,6 +1495,7 @@ __all__ = [
     "CHECKPOINT_FILENAME",
     "EVAL_STEP_HEADROOM",
     "MAX_HANDOFF_NUDGES",
+    "MAX_RELEASE_REAPPROVALS",
     "MAX_TOOL_RETRIES",
     "MAX_UNUSABLE_TURN_RETRIES",
     "RETRY_BACKOFF_S",
@@ -1427,5 +1505,6 @@ __all__ = [
     "WorkflowOutcome",
     "WorkflowState",
     "WorkspaceHarness",
+    "close_studio_workflows",
     "make_graph",
 ]
