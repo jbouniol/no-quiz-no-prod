@@ -1,0 +1,38 @@
+[
+  {
+    "rule_code": "RULE-001",
+    "title": "Monetary Precision & Cent Rounding",
+    "domain": "Monetary & Rounding",
+    "severity": "Critical",
+    "status": "Active",
+    "skill_tags": ["decimal_rounding", "boundary_conditions"],
+    "body_file": "rule_001.md"
+  },
+  {
+    "rule_code": "RULE-002",
+    "title": "Authentication, Timing-Safe HMAC & Parameterized SQL",
+    "domain": "Auth & Security",
+    "severity": "Critical",
+    "status": "Active",
+    "skill_tags": ["auth_token_validation", "sql_parameterization"],
+    "body_file": "rule_002.md"
+  },
+  {
+    "rule_code": "RULE-003",
+    "title": "VIP Tiers & Coupon Stacking Policy",
+    "domain": "Discounts & VIP",
+    "severity": "Mandatory",
+    "status": "Active",
+    "skill_tags": ["boundary_conditions"],
+    "body_file": "rule_003.md"
+  },
+  {
+    "rule_code": "RULE-004",
+    "title": "Refund Window, Idempotency & Mandatory Staging Tests",
+    "domain": "Refunds & Testing",
+    "severity": "Critical",
+    "status": "Active",
+    "skill_tags": ["refund_policy_compliance", "idempotency_and_retries"],
+    "body_file": "rule_004.md"
+  }
+]
