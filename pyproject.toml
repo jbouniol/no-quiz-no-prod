@@ -62,20 +62,6 @@ warn_redundant_casts = true
 # pydantic's `@computed_field` on top of `@property` is correct at runtime; mypy cannot model that stacking
 disable_error_code = ["prop-decorator"]
 
-# Ratchet: modules that do not type-check yet are listed here so CI stays green while their backlog is fixed.
-# Remove a module from this list as soon as `uv run mypy` passes on it; never add one.
 [[tool.mypy.overrides]]
-module = [
-    "no_quiz_no_prod.graph.workflow",
-    "no_quiz_no_prod.llm",
-    "no_quiz_no_prod.mcp_servers.notion_quiz_server",
-    "no_quiz_no_prod.memory.skill_store",
-    "no_quiz_no_prod.ui.server",
-    "test_backend_and_mcp",
-    "test_end_to_end_integration",
-    "test_eval_scorer",
-    "test_git_release",
-    "test_graph_and_memory",
-    "test_ui_api",
-]
-ignore_errors = true
+module = ["test_eval_scorer"]
+warn_unused_ignores = false
