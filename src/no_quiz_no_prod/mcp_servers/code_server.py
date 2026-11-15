@@ -19,6 +19,7 @@ from no_quiz_no_prod.mcp_servers.common import (
     IdempotencyKey,
     WorkspaceBinding,
     create_server,
+    scrub_server_environment,
 )
 
 PYTEST_FILTER_MAX_CHARS: Final = 200
@@ -111,6 +112,7 @@ mcp: Final = build_server()
 
 def main() -> None:
     """Serve code-mcp on stdio."""
+    scrub_server_environment(catalog.CODE_SERVER)
     mcp.run()
 
 

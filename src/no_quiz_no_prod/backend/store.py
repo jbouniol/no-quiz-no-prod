@@ -33,7 +33,10 @@ STATE_DB_FILENAME: Final = "state.sqlite"
 LOCK_FILENAME: Final = ".workspace.lock"
 DEPLOY_LOCK_FILENAME: Final = ".deploy.lock"
 SCHEMA_VERSION: Final = 2  # 2: gate_ledger and release_journal tables, quizzes.epoch
-OPEN_JOURNAL_STATES: Final[tuple[ReleaseJournalState, ...]] = ("push_started", "pushed")  # still to reconcile
+# Journal entries still to reconcile: a publish that began ("push_started") or landed ("pushed") but is not completed.
+_OPEN_JOURNAL_ENTRIES: Final = (
+    "SELECT id, record FROM release_journal WHERE state IN ('push_started', 'pushed') ORDER BY id"
+)
 SQLITE_BUSY_TIMEOUT_S: Final = 30.0
 
 # Run tables are wiped by every reset; skill_profile is Layer 4 memory and survives `preserve_skill_memory=True`.
@@ -168,15 +171,17 @@ _BUSY_DEPLOY_SLOTS: set[Path] = set()
 
 @contextmanager
 def deploy_slot(workspace_dir: Path) -> Iterator[None]:
-    """Reserve the workspace's single deploy slot for the whole deploy, network calls included.
+    """Reserve the workspace's single slot for long operations: a whole deploy (network calls included), a staged
+    test run, a reset.
 
     Non-blocking: when another thread or process holds it, raises a retryable ``run_active`` error instead of
-    waiting. The workspace lock is NOT held by this slot, so other tools keep working during a slow push.
+    waiting. The workspace lock is NOT held by this slot, so other tools keep working during a slow push; and since
+    tests and deploys exclude each other, no test process is alive while git holds the release token.
     """
     path = (workspace_dir / DEPLOY_LOCK_FILENAME).resolve()
     busy = WorkspaceError(
         "run_active",
-        "A deploy is in progress on this workspace: wait until it is over, then repeat the call.",
+        "A deploy or a staged test run is in progress on this workspace: wait until it is over, then repeat the call.",
         retryable=True,
     )
     with _LOCKS_GUARD:
@@ -319,10 +324,5 @@ def journal_update(conn: sqlite3.Connection, journal_id: int, state: ReleaseJour
 
 
 def journal_open_entries(conn: sqlite3.Connection) -> list[tuple[int, str]]:
-    """``[(id, record JSON)]`` of the entries still to reconcile (``OPEN_JOURNAL_STATES``), oldest first."""
-    marks = ", ".join("?" for _ in OPEN_JOURNAL_STATES)
-    rows = conn.execute(
-        f"SELECT id, record FROM release_journal WHERE state IN ({marks}) ORDER BY id",  # noqa: S608 - constant marks
-        OPEN_JOURNAL_STATES,
-    )
-    return [(int(row["id"]), str(row["record"])) for row in rows]
+    """``[(id, record JSON)]`` of the entries still to reconcile (publish begun or landed, not completed)."""
+    return [(int(row["id"]), str(row["record"])) for row in conn.execute(_OPEN_JOURNAL_ENTRIES)]

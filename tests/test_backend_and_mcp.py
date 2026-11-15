@@ -9,6 +9,8 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -24,15 +26,21 @@ from pydantic import SecretStr, ValidationError
 from testkit import FIXED_FINTECH_ORDERS, HERMETIC_RELEASE_ENV
 
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError, catalog
+from no_quiz_no_prod.backend import sandbox as sandbox_module
 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync, provision_notion_databases
 from no_quiz_no_prod.backend.seeds import SEEDS_DIR, load_seed_rules
 from no_quiz_no_prod.backend.store import deploy_slot
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
+    ALL_QUIZ_OPTION_KEYS,
     ALL_RULE_DOMAINS,
     ALL_SKILL_TAGS,
+    DEFAULT_GIT_BRANCH,
     DEFAULT_SEED,
     DEFAULT_USER_ID,
+    MCP_SERVER_ENV_ALLOWLIST,
+    PROJECT_ROOT,
+    RELEASE_RETRY_CODES,
     SECRET_ENV_VARS,
     DeployDecision,
     DeployGateStatus,
@@ -47,9 +55,9 @@ from no_quiz_no_prod.contracts import (
     ToolErrorPayload,
     project_environment,
 )
-from no_quiz_no_prod.mcp_servers import code_server, notion_quiz_server
+from no_quiz_no_prod.mcp_servers import code_server, common, notion_quiz_server
 from no_quiz_no_prod.mcp_servers.client import ToolOutcome, decode_tool_result, server_parameters
-from no_quiz_no_prod.mcp_servers.common import WorkspaceBinding, server_settings
+from no_quiz_no_prod.mcp_servers.common import WorkspaceBinding, scrub_server_environment, server_settings
 from no_quiz_no_prod.mcp_servers.notion_quiz_server import quiz_tool_arguments
 
 NOW = 1_763_000_000
@@ -61,6 +69,47 @@ BASELINE_PYTEST_BUDGET_S = 0.4
 
 FIXED_ORDERS = FIXED_FINTECH_ORDERS  # the shared RULE-001 fix of orders.py (tests/testkit.py)
 REVIEW_NOTE = "\n\n# Reviewed: the rounding policy is unchanged.\n"
+TRIVIAL_TESTS = "def test_ok():\n    pass\n"
+GUTTED_ORDERS = (
+    "def calculate_order_total(*args, **kwargs):\n    return 0\n\n\n"
+    "def split_into_installments(*args, **kwargs):\n    return []\n"
+)
+# What a hostile staged test would try, knowing every absolute path, and swallowing its failures to stay green.
+ESCAPING_TEST = """
+
+def test_escape_the_sandbox():
+    import json, sqlite3
+    from pathlib import Path
+
+    workspace = Path({workspace!r})
+    attempts = []
+    try:
+        (workspace / "gate_ledger.json").write_text(json.dumps({{"quiz_passed": ["x"], "human_approved": ["x"]}}))
+        attempts.append("ledger file written")
+    except Exception:
+        pass
+    try:
+        (workspace / "prod" / "orders.py").write_text("# owned\\n")
+        attempts.append("prod written")
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(workspace / "state.sqlite") as conn:
+            conn.execute("INSERT INTO gate_ledger VALUES ('human_approved', 'x', 1, 'now')")
+        attempts.append("ledger row written")
+    except Exception:
+        pass
+    try:
+        from no_quiz_no_prod.backend.release import GitReleasePublisher  # noqa: F401
+        attempts.append("publisher imported")
+    except Exception:
+        pass
+    assert attempts == []
+"""
+needs_isolation = pytest.mark.skipif(
+    sandbox_module.detect_isolation().level == "none",
+    reason=f"no working sandbox backend on this machine: {sandbox_module.detect_isolation().detail}",
+)
 
 QUIZ = QuizDraft(
     skill_tag="decimal_rounding",
@@ -80,7 +129,11 @@ QUIZ = QuizDraft(
         D="Trap: true for the default Decimal context, but this computation never used Decimal.",
     ),
 )
-ANSWER_KEY_TEXTS = (*(QUIZ.explanation_by_option[key] for key in "ABCD"), "correct_option", "explanation_by_option")
+ANSWER_KEY_TEXTS = (
+    *(QUIZ.explanation_by_option[key] for key in ALL_QUIZ_OPTION_KEYS),
+    "correct_option",
+    "explanation_by_option",
+)
 
 
 # ---- fixtures & helpers ----------------------------------------------------------------------------------------------
@@ -104,6 +157,12 @@ def refusal(action: Callable[[], Any]) -> ToolErrorPayload:
 
 def stage_fix(sandbox: SandboxWorkspace, content: str = FIXED_ORDERS) -> str:
     return sandbox.write_staging_file("orders.py", content)["diff_sha256"]
+
+
+def latest_ship_log(sandbox: SandboxWorkspace) -> ShipLogEntry:
+    entry = sandbox.get_latest_ship_log()
+    assert entry is not None
+    return entry
 
 
 def document(sandbox: SandboxWorkspace, diff: str, **overrides: Any) -> ShipLogEntry:
@@ -291,7 +350,7 @@ def test_human_rejection_blocks_the_diff_for_good(workspace: SandboxWorkspace) -
     diff = earn_locks_1_to_3(workspace)
     status = workspace.apply_deploy_decision(DeployDecision(action="reject", expected_diff_sha256=diff, reason="no"))
     assert status.blocked and not status.can_deploy
-    assert workspace.get_latest_ship_log().status == "Blocked"
+    assert latest_ship_log(workspace).status == "Blocked"
     assert refusal(lambda: workspace.deploy_to_production(diff, "ship")).details["blocked"] is True
     approve(workspace, diff)
     assert not workspace.get_gate_status(diff).human_approved
@@ -331,14 +390,12 @@ def test_wrong_answers_remediate_then_block(workspace: SandboxWorkspace) -> None
     first = workspace.create_quiz(QUIZ, diff_sha256=diff)
     grade = workspace.grade_quiz_answer(first.question_id, "B")
     assert grade.remediation_required and grade.correct_option is None and grade.misconception
-    entry = workspace.get_latest_ship_log()
+    entry = latest_ship_log(workspace)
     assert (entry.status, entry.doc_version, entry.quiz_attempts) == ("Remediation v2", "v2", 1)
     assert refusal(lambda: workspace.grade_quiz_answer(first.question_id, "A")).code == "conflict"
     document(workspace, diff, doc_version="v1", status="Quiz Pending")  # a careless rewrite cannot go back
-    assert (workspace.get_latest_ship_log().status, workspace.get_latest_ship_log().doc_version) == (
-        "Remediation v2",
-        "v2",
-    )
+    rewritten = latest_ship_log(workspace)
+    assert (rewritten.status, rewritten.doc_version) == ("Remediation v2", "v2")
     second = workspace.create_quiz(QUIZ, diff_sha256=diff)
     assert (second.attempt, second.doc_version) == (2, "v2")
     final_grade = workspace.grade_quiz_answer(second.question_id, "C")
@@ -453,7 +510,7 @@ def test_a_deploy_starts_a_new_epoch_and_its_locks_stay_readable(workspace: Sand
 def test_the_reviewed_hash_is_mandatory_at_the_server(workspace: SandboxWorkspace) -> None:
     for action in ("approve", "reject"):
         with pytest.raises(ValidationError):
-            DeployDecision(action=action)
+            DeployDecision.model_validate({"action": action})
     with pytest.raises(TypeError):
         workspace.get_gate_status()  # type: ignore[call-arg]  # never defaulted to "whatever is staged now"
 
@@ -466,7 +523,7 @@ def test_grading_is_replay_safe_and_an_answer_is_final(workspace: SandboxWorkspa
     assert workspace.grade_quiz_answer(question.question_id, "B") == first  # e.g. the harness resumed after a crash
     skill = workspace.get_skill_profile()[ALL_SKILL_TAGS.index("decimal_rounding")]
     assert (skill.fail_count, workspace.get_gate_status(diff).quiz_attempts) == (1, 1)  # counted once
-    assert workspace.get_latest_ship_log().quiz_attempts == 1
+    assert latest_ship_log(workspace).quiz_attempts == 1
     assert refusal(lambda: workspace.grade_quiz_answer(question.question_id, "A")).code == "conflict"
     assert not workspace.get_gate_status(diff).quiz_passed
 
@@ -570,6 +627,231 @@ def test_a_version_1_state_file_is_migrated_in_place(settings: RuntimeSettings) 
     assert sandbox.get_skill_profile()[ALL_SKILL_TAGS.index("decimal_rounding")] == remembered  # nothing dropped
     exhaust_quiz(sandbox)  # the migrated tables carry epochs and the ledger
     assert gate(sandbox).blocked_reason == "quiz_exhausted"
+
+
+# ---- Lock 1: sandboxed staged tests and the hidden acceptance suite ---------------------------------------------------
+def test_a_real_fix_earns_lock_1_with_both_suites_green(workspace: SandboxWorkspace) -> None:
+    diff = stage_fix(workspace)
+    report = workspace.run_staging_tests()
+    assert (report.passed, report.acceptance_passed, report.diff_sha256) == (True, True, diff)
+    assert report.isolation == sandbox_module.detect_isolation().level
+    status = workspace.get_gate_status(diff)
+    assert status.tests_passed and not status.sandbox_disabled
+
+
+def test_the_agent_cannot_certify_a_gutted_module_with_its_own_tests(workspace: SandboxWorkspace) -> None:
+    workspace.write_staging_file("orders.py", GUTTED_ORDERS)
+    diff = workspace.write_staging_file("test_fintech.py", TRIVIAL_TESTS)["diff_sha256"]
+    report = workspace.run_staging_tests()
+    assert report.exit_code == 0  # its own suite is green...
+    assert (report.passed, report.acceptance_passed) == (
+        False,
+        False,
+    )  # ...the hidden one, which it cannot edit, is not
+    assert "tests_passed" in workspace.get_gate_status(diff).missing_locks
+    assert workspace.snapshot_final_state().tests_passed is False
+    assert "def test_" not in report.acceptance_summary  # counts only: nothing of the hidden suite leaks
+    assert sorted(workspace.list_files()) == sorted(ALL_FINTECH_MODULES)  # and it is never copied into staging
+
+
+@needs_isolation
+def test_staged_test_code_cannot_touch_the_gate_prod_or_the_publisher(workspace: SandboxWorkspace) -> None:
+    stage_fix(workspace)
+    hostile = workspace.read_file("test_fintech.py") + ESCAPING_TEST.format(workspace=str(workspace.root))
+    diff = workspace.write_staging_file("test_fintech.py", hostile)["diff_sha256"]
+    report = workspace.run_staging_tests()
+    assert report.passed  # the escape attempts all failed inside the sandbox, so the suite stayed green
+    status = workspace.get_gate_status(diff)
+    assert status.missing_locks == ["quiz_passed", "human_approved"]  # Lock 1 was earned, nothing was forged
+    assert not (workspace.root / "gate_ledger.json").exists()
+    assert not workspace.snapshot_final_state().prod_changed
+    assert not workspace.settings.default_release_remote_dir.exists()  # nothing was published
+    assert refusal(lambda: workspace.deploy_to_production(diff, "forged")).code == "gate_locked"
+
+
+def test_without_isolation_tests_do_not_run_unless_the_unsafe_opt_out_is_set(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unavailable = sandbox_module.IsolationProbe("none", "forced by the test")
+    monkeypatch.setattr(sandbox_module, "detect_isolation", lambda: unavailable)
+    closed = SandboxWorkspace(settings)
+    closed.reset()
+    diff = stage_fix(closed)
+    assert refusal(lambda: closed.run_staging_tests()).code == "sandbox_unavailable"  # fails closed
+    assert closed.get_latest_pytest() is None and "tests_passed" in closed.get_gate_status(diff).missing_locks
+    unsafe = SandboxWorkspace(settings.model_copy(update={"unsafe_no_sandbox": True}))
+    report = unsafe.run_staging_tests()
+    assert report.passed and report.isolation == "none"
+    status = unsafe.get_gate_status(diff)
+    assert status.tests_passed and status.sandbox_disabled  # the opt-out is surfaced in the gate status...
+    with sqlite3.connect(unsafe.db_path) as conn:
+        assert ("unsafe_no_sandbox",) in conn.execute("SELECT kind FROM events").fetchall()  # ...and in the event log
+
+
+# ---- the journaled deploy ----------------------------------------------------------------------------------------------
+def git_out(*args: str) -> str:
+    """Test-side git, isolated from the developer's configuration."""
+    env = {"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    return subprocess.run(["git", *args], env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def release_commits(remote: Path) -> int:
+    return int(git_out("--git-dir", str(remote), "rev-list", "--count", DEFAULT_GIT_BRANCH))
+
+
+def approved_change(settings: RuntimeSettings, content: str = FIXED_ORDERS) -> tuple[SandboxWorkspace, str]:
+    """A fresh workspace holding a change with its four locks."""
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset()
+    diff = stage_fix(sandbox, content)
+    assert sandbox.run_staging_tests().passed
+    document(sandbox, diff)
+    assert sandbox.grade_quiz_answer(sandbox.create_quiz(QUIZ, diff_sha256=diff).question_id, "A").passed
+    approve(sandbox, diff)
+    return sandbox, diff
+
+
+def lost_answer(sandbox: SandboxWorkspace, *, landed: bool) -> Callable[..., Any]:
+    """A ``publish`` whose answer is lost: the push lands (or not), then git "does not answer in time"."""
+    publish = sandbox.release.publish
+
+    def flaky(prepared: Any, *, before_push: Any = None, reject_push: Any = None) -> Any:
+        try:
+            publish(prepared, before_push=before_push, reject_push=reject_push if landed else lambda: True)
+        except WorkspaceError:
+            assert not landed  # only the injected refusal
+        raise WorkspaceError("timeout", "git push did not answer in time", retryable=True, outcome_unknown=True)
+
+    return flaky
+
+
+def crash(*_: Any, **__: Any) -> None:
+    raise RuntimeError("power cut")
+
+
+def test_the_push_runs_without_the_workspace_lock_and_keeps_the_slot(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, diff = approved_change(settings)
+    publish = sandbox.release.publish
+    seen: dict[str, Any] = {}
+
+    def slow_push(prepared: Any, **hooks: Any) -> Any:
+        def meanwhile() -> None:
+            seen["read"] = sandbox.read_file("orders.py")  # other tools keep working during the push...
+            seen["tests"] = refusal(lambda: sandbox.run_staging_tests()).code  # ...but no test process may start,
+            seen["reset"] = refusal(lambda: sandbox.reset()).code  # no reset,
+            seen["deploy"] = refusal(lambda: sandbox.deploy_to_production(diff, "again")).code  # no second deploy
+            sandbox.write_staging_file("orders.py", FIXED_ORDERS + REVIEW_NOTE)  # an edit lands in staging only
+
+        other = threading.Thread(target=meanwhile)
+        other.start()
+        other.join(timeout=30)
+        seen["finished"] = not other.is_alive()  # False would mean the workspace lock was held across the push
+        return publish(prepared, **hooks)
+
+    monkeypatch.setattr(sandbox.release, "publish", slow_push)
+    payload = sandbox.deploy_to_production(diff, "Fix VAT")
+    assert seen == {
+        "read": FIXED_ORDERS,
+        "tests": "run_active",
+        "reset": "run_active",
+        "deploy": "run_active",
+        "finished": True,
+    }
+    # prod is promoted from the pushed commit: exactly the approved tree, not what staging became meanwhile
+    assert payload["ok"] and (sandbox.prod_dir / "orders.py").read_text() == FIXED_ORDERS
+    assert sandbox.read_file("orders.py") == FIXED_ORDERS + REVIEW_NOTE
+    assert gate(sandbox).missing_locks == ["tests_passed", "quiz_passed", "human_approved"]  # a new, unapproved diff
+    assert sandbox.gate_status_of(diff).can_deploy and sandbox.snapshot_final_state().pushed
+
+
+def test_a_crash_after_the_push_is_completed_from_the_journal_on_restart(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, diff = approved_change(settings)
+    monkeypatch.setattr(SandboxWorkspace, "_complete_release", crash)  # dies right after the push landed
+    with pytest.raises(RuntimeError):
+        sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")
+    monkeypatch.undo()
+    remote = settings.default_release_remote_dir
+    assert release_commits(remote) == 2 and (sandbox.prod_dir / "orders.py").read_text() != FIXED_ORDERS
+    restarted = SandboxWorkspace(settings)  # a new process: its first call reconciles the journal
+    final = restarted.snapshot_final_state()
+    assert (final.prod_changed, final.deployed, final.pushed) == (True, True, True)
+    assert final.ship_log_status == "Deployed to Prod"
+    assert (restarted.prod_dir / "orders.py").read_text() == FIXED_ORDERS
+    replay = restarted.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")
+    assert replay["replayed"] and replay["deployed_diff_sha256"] == diff
+    assert release_commits(remote) == 2  # the baseline and ONE release: nothing was pushed twice
+
+
+def test_a_push_that_landed_with_a_lost_answer_is_completed_not_repeated(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, diff = approved_change(settings)
+    monkeypatch.setattr(sandbox.release, "publish", lost_answer(sandbox, landed=True))
+    error = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1"))
+    assert (error.code, error.outcome_unknown) == ("timeout", True)
+    monkeypatch.undo()
+    assert not sandbox.get_gate_status(diff).human_approved  # the approval does not survive a failed publish
+    final = sandbox.snapshot_final_state()  # the harness looks before concluding: the remote is asked
+    assert (final.prod_changed, final.deployed, final.pushed) == (True, True, True)
+    replay = sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")
+    assert replay["replayed"] and release_commits(settings.default_release_remote_dir) == 2
+
+
+def test_a_push_that_never_landed_is_closed_and_needs_a_new_approval(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, diff = approved_change(settings)
+    monkeypatch.setattr(sandbox.release, "publish", lost_answer(sandbox, landed=False))
+    assert refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")).outcome_unknown
+    monkeypatch.undo()
+    assert not sandbox.snapshot_final_state().deployed  # the remote was asked: nothing landed
+    locked = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1"))
+    assert locked.code == "gate_locked" and locked.details["missing_locks"] == ["human_approved"]
+    approve(sandbox, diff)
+    shipped = sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")
+    assert shipped["ok"] and not shipped["replayed"]
+    assert release_commits(settings.default_release_remote_dir) == 2
+
+
+def test_a_deploy_that_died_before_pushing_is_closed_on_restart(
+    settings: RuntimeSettings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox, diff = approved_change(settings)
+    monkeypatch.setattr(sandbox.release, "publish", crash)  # not a typed failure: no error handler runs
+    with pytest.raises(RuntimeError):
+        sandbox.deploy_to_production(diff, "Fix VAT")
+    assert sandbox.get_gate_status(diff).human_approved  # nobody revoked it: the process "died"
+    restarted = SandboxWorkspace(settings)
+    status = restarted.get_gate_status(diff)
+    assert status.missing_locks == ["human_approved"]  # the restart closes the dead release and asks the human again
+    assert not restarted.snapshot_final_state().prod_changed
+
+
+def test_a_diverged_remote_is_a_typed_refusal_that_pushes_nothing(tmp_path: Path, settings: RuntimeSettings) -> None:
+    remote = tmp_path / "team_release.git"
+    git_out("init", "--quiet", "--bare", str(remote))
+    team = settings.model_copy(update={"git_remote_url": str(remote)})
+    first, diff = approved_change(team)
+    first.deploy_to_production(diff, "Release 1")
+    second, other_diff = approved_change(team, FIXED_ORDERS + REVIEW_NOTE)  # a reset: prod no longer is the remote tip
+    error = refusal(lambda: second.deploy_to_production(other_diff, "Release 2"))
+    assert error.code == "remote_diverged" and error.code in RELEASE_RETRY_CODES
+    assert release_commits(remote) == 2  # no sync commit, no release
+    final = second.snapshot_final_state()
+    assert (final.prod_changed, final.deployed) == (False, False)
+    assert second.get_gate_status(other_diff).missing_locks == ["human_approved"]
+
+
+def test_the_default_remote_follows_a_reset(settings: RuntimeSettings) -> None:
+    first, diff = approved_change(settings)
+    first.deploy_to_production(diff, "Release 1")
+    second, other_diff = approved_change(settings, FIXED_ORDERS + REVIEW_NOTE)
+    assert second.deploy_to_production(other_diff, "Release 2")["release"]["pushed"]
+    assert release_commits(settings.default_release_remote_dir) == 2  # the workspace's own remote restarted with it
 
 
 # ---- Layer 4 skill memory ------------------------------------------------------------------------------------------
@@ -798,6 +1080,24 @@ def test_launch_helpers_and_in_process_servers_apply_the_same_allow_list(setting
     in_notion = WorkspaceBinding(catalog.NOTION_QUIZ_SERVER, full)().settings
     assert (in_code.notion_api_key, secret(in_code.github_token)) == (None, "ghp_x")
     assert (secret(in_notion.notion_api_key), in_notion.github_token) == (NOTION_KEY, None)
+
+
+def test_scrub_server_environment_and_mcp_json_enforce_per_server_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(common, "_LAUNCH_SECRETS", {})
+    for var, val in FAKE_SECRETS.items():
+        monkeypatch.setenv(var.value, val)
+    monkeypatch.setenv(EnvVar.NO_QUIZ_GIT_REMOTE_URL.value, FAKE_REMOTE)
+    scrub_server_environment(catalog.CODE_SERVER)
+    assert not [var for var in SECRET_ENV_VARS if os.environ.get(var.value)]
+    assert secret(server_settings(catalog.CODE_SERVER).github_token) == FAKE_SECRETS[EnvVar.NO_QUIZ_GITHUB_TOKEN]
+    assert server_settings(catalog.CODE_SERVER).notion_api_key is None
+
+    mcp_cfg = json.loads((PROJECT_ROOT / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+    for srv_name in (catalog.CODE_SERVER, catalog.NOTION_QUIZ_SERVER):
+        srv_env = mcp_cfg[srv_name]["env"]
+        for var in SECRET_ENV_VARS - MCP_SERVER_ENV_ALLOWLIST[srv_name]:
+            assert srv_env[var.value] == ""
+        assert not [v for v in srv_env.values() if v]
 
 
 @asynccontextmanager
@@ -1029,7 +1329,22 @@ def test_ship_log_and_skill_profile_write_through_to_notion(settings: RuntimeSet
     sandbox.deploy_to_production(diff, "Fix VAT")
     assert {"status": {"name": "Deployed to Prod"}} in fake.writes("Status")
     assert any(value.get("date") for value in fake.writes("Deployed At"))
-    assert sandbox.get_latest_ship_log().notion_page_id == entry.notion_page_id  # one page per change, updated
+    assert latest_ship_log(sandbox).notion_page_id == entry.notion_page_id  # one page per change, updated
+
+
+def test_the_harness_mirrors_a_deploy_the_code_server_could_not(settings: RuntimeSettings) -> None:
+    fake = FakeNotion()
+    harness = SandboxWorkspace(notion_settings(settings))
+    harness.notion = NotionDatabaseSync(harness.settings, transport=httpx.MockTransport(fake))
+    harness.reset()
+    diff = earn_locks_1_to_3(harness)
+    approve(harness, diff)
+    code_server = SandboxWorkspace(notion_settings(settings).restricted_to(catalog.CODE_SERVER))  # no Notion key
+    code_server.deploy_to_production(diff, "Fix VAT")
+    deployed = {"status": {"name": "Deployed to Prod"}}
+    assert deployed not in fake.writes("Status")
+    entry = harness.sync_ship_log(diff)
+    assert entry is not None and entry.status == "Deployed to Prod" and deployed in fake.writes("Status")
 
 
 def test_notion_outage_never_breaks_the_local_flow(settings: RuntimeSettings) -> None:

@@ -12,6 +12,7 @@ from pydantic import Field, ValidationError
 
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError, catalog
 from no_quiz_no_prod.contracts import (
+    ALL_QUIZ_OPTION_KEYS,
     MAX_QUIZ_ATTEMPTS,
     DocVersion,
     FintechModule,
@@ -33,6 +34,7 @@ from no_quiz_no_prod.mcp_servers.common import (
     WorkspaceBinding,
     create_server,
     invalid_argument,
+    scrub_server_environment,
 )
 
 RULE_SUMMARY_FIELDS: Final = frozenset({"rule_code", "title", "domain", "severity"})
@@ -68,9 +70,9 @@ def quiz_tool_arguments(draft: QuizDraft, *, diff_sha256: str) -> dict[str, Any]
         "diff_sha256": diff_sha256,
         "skill_tag": draft.skill_tag,
         "stem": draft.stem,
-        **{f"option_{key.lower()}": draft.options[key] for key in OptionTexts.model_fields},
+        **{f"option_{key.lower()}": draft.options[key] for key in ALL_QUIZ_OPTION_KEYS},
         "correct_option": draft.correct_option,
-        **{f"explanation_{key.lower()}": draft.explanation_by_option[key] for key in OptionTexts.model_fields},
+        **{f"explanation_{key.lower()}": draft.explanation_by_option[key] for key in ALL_QUIZ_OPTION_KEYS},
         "rule_code": draft.rule_code,
     }
 
@@ -185,6 +187,7 @@ mcp: Final = build_server()
 
 def main() -> None:
     """Serve notion-quiz-mcp on stdio."""
+    scrub_server_environment(catalog.NOTION_QUIZ_SERVER)
     mcp.run()
 
 
