@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "01_pre_fix_dual_deepseek",
+  "description": "First live baseline of the dual topology, before the unusable-turn guard and the 16k output budget. Formerly eval/history/01_pre_fix_dual_deepseek/.",
+  "created_at": null,
+  "git_commit": null,
+  "git_dirty": null,
+  "recorded_in_commit": "db1e42d",
+  "scenario_set": "dev",
+  "scenario_file_sha256": "7f1a6a32a36fc7e206a44a7c4f2331b596bbd7ac5eb23a9565ab3d7535590673",
+  "scenario_count": 30,
+  "repeats": 1,
+  "dry_run": false,
+  "push_scored": false,
+  "stop_reason_scored": false,
+  "cohorts": [
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results.jsonl",
+      "rows": 30
+    }
+  ],
+  "judge": null,
+  "cli_args": [],
+  "stale": true,
+  "stale_reason": "Recorded with the system prompts that enumerated the scenario classes, before the stop reason was scored, and on an earlier scenario file (see scenario_file_sha256). Not comparable with a run of the current harness; kept as a historical record only."
+}
