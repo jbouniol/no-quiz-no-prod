@@ -10,12 +10,14 @@ import json
 import re
 import shutil
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import anyio
 import pytest
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 from mcp import MCPError
 from mcp_types import CONNECTION_CLOSED
@@ -64,6 +66,7 @@ from no_quiz_no_prod.contracts import (
     QuizAnswer,
     QuizDraft,
     QuizGradeResult,
+    QuizOptionKey,
     QuizQuestion,
     RunFinalState,
     RuntimeSettings,
@@ -160,7 +163,7 @@ class FakeBackend:
             folder.mkdir(parents=True)
             for name, text in SEED_FILES.items():
                 planted = injection is not None and injection.target == name
-                (folder / name).write_text(f"# {injection.text}\n{text}" if planted else text)
+                (folder / name).write_text(f"# {injection.text}\n{text}" if injection and planted else text)
         self.seed_prod = compute_tree_sha256(self.root / "prod")
         self.rules = {
             code: rule.model_copy(update={"body_markdown": f"{rule.body_markdown}\n\n{injection.text}"})
@@ -368,7 +371,7 @@ class FakeBackend:
         self,
         *,
         diff_sha256: str,
-        correct_option: str,
+        correct_option: QuizOptionKey,
         thread_id: str = "default",
         attempt: int = 1,
         idempotency_key: str | None = None,
@@ -521,7 +524,7 @@ def backend(tmp_path: Path) -> FakeBackend:
 def make_workflow(tmp_path: Path, backend: FakeBackend, llm: ScriptedLLM, *, topology: str = "dual") -> NoQuizWorkflow:
     return NoQuizWorkflow(
         settings=RuntimeSettings(workspace_dir=tmp_path / "ws"),
-        llm_client=llm,  # type: ignore[arg-type]
+        llm_client=llm,
         topology=topology,  # type: ignore[arg-type]
         mcp_transport="inprocess",
         workspace=backend,
@@ -756,7 +759,7 @@ def test_an_unanswered_deploy_is_reconciled_with_the_workspace_before_concluding
         payload = ToolErrorPayload(code="timeout", message="no answer in time", outcome_unknown=True)
         raise ToolCallError(payload)  # ...and the caller never hears about it
 
-    backend.tool_deploy_to_production = lost_answer  # type: ignore[method-assign]
+    backend.tool_deploy_to_production = lost_answer  # type: ignore[method-assign, assignment]
     done = workflow.submit_deploy_decision("t-lost", approve(sha))
     assert done.stop_reason == "completed" and done.final_state.deployed and done.pending_release is None
     assert "workspace confirms" in done.final_answer and done.trace[-1].error is not None
@@ -788,7 +791,7 @@ def test_a_deploy_decision_must_name_the_reviewed_diff(tmp_path: Path, backend: 
         with pytest.raises((ValueError, ValidationError)):
             _parse_deploy_decision(bare)
     workflow, sha = at_deploy_gate(tmp_path, backend, "t-bare")
-    config = {"configurable": {"thread_id": "t-bare"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t-bare"}}
     workflow.app.invoke(Command(resume="approve"), config)  # e.g. typed in LangGraph Studio
     snapshot = workflow.app.get_state(config)
     assert snapshot.interrupts and snapshot.interrupts[0].value["kind"] == "deploy_approval"  # asked again
@@ -1319,7 +1322,7 @@ def test_the_answer_key_is_in_no_state_and_no_checkpoint(tmp_path: Path, backend
     assert paused.interrupt is not None and paused.interrupt.kind == "quiz"
     assert backend.quizzes["q-t-sealed-1"].correct_option == "C"  # the server did receive the real key
 
-    config = {"configurable": {"thread_id": "t-sealed"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t-sealed"}}
     history = list(workflow.app.get_state_history(config))
     assert len(history) > 10  # every superstep, including the one between the model turn and the tool call
     dumped = json.dumps([snapshot.values for snapshot in history], default=str)
@@ -1345,7 +1348,7 @@ def test_a_sealed_turn_drops_readable_reasoning_but_keeps_opaque_blocks() -> Non
         update={"content": extras["content"], "assistant_message": {**quiz_turn.assistant_message, **extras}}
     )
     llm = ScriptedLLM(examiner=[leaky])
-    workflow = NoQuizWorkflow(settings=RuntimeSettings(), llm_client=llm, mcp_transport="inprocess")  # type: ignore[arg-type]
+    workflow = NoQuizWorkflow(settings=RuntimeSettings(), llm_client=llm, mcp_transport="inprocess")
     state = {"phase": "examiner", "messages": {"examiner": build_examiner_messages("brief")}}
     update = workflow._node_agent(state, {"configurable": {"thread_id": "t"}})  # type: ignore[arg-type]
     stored = json.dumps(update)
@@ -1359,7 +1362,8 @@ def test_sealed_arguments_lost_by_a_restart_are_asked_again(tmp_path: Path, back
     upsert, quiz, done = doc_and_quiz(1, "A")
     llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz, done])
     workflow = make_workflow(tmp_path, backend, llm)
-    unseal, lost = workflow._unseal, []
+    unseal = workflow._unseal
+    lost: list[str] = []
 
     def restart_once(thread_id: str, call_id: str) -> dict[str, Any] | None:
         secret = unseal(thread_id, call_id)
@@ -1385,7 +1389,8 @@ def test_a_crash_after_the_grade_resumes_from_the_checkpointed_grade(tmp_path: P
     llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A"))
     workflow = make_workflow(tmp_path, backend, llm)
     workflow.start_run(TASK, thread_id="t-crash")
-    upsert, failures = workflow.memory.upsert_quiz_outcome, []
+    upsert = workflow.memory.upsert_quiz_outcome
+    failures: list[str] = []
 
     def flaky(*args: Any, **kwargs: Any) -> Any:
         if not failures:
@@ -1410,7 +1415,8 @@ def test_a_crash_before_the_checkpoint_replays_the_same_answer(tmp_path: Path, b
     llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A"))
     workflow = make_workflow(tmp_path, backend, llm)
     workflow.start_run(TASK, thread_id="t-replay")
-    grade_answer, failures = backend.grade_quiz_answer, []
+    grade_answer = backend.grade_quiz_answer
+    failures: list[str] = []
 
     def lost_answer(*args: Any, **kwargs: Any) -> QuizGradeResult:
         grade = grade_answer(*args, **kwargs)  # the server graded and recorded...
@@ -1432,12 +1438,12 @@ def test_a_harness_crash_is_a_harness_error_not_a_provider_error(tmp_path: Path,
         raise RuntimeError("harvest bug")
 
     workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix()))
-    workflow._harvest = broken  # type: ignore[method-assign]
+    workflow._harvest = broken  # type: ignore[method-assign, assignment]
     events: list[Any] = []
     crashed = workflow.start_run(TASK, thread_id="t-bug", on_event=events.append)
     assert crashed.stop_reason == "harness_error" and "harvest bug" in crashed.final_answer
     assert events[-1].type == "run_error" and events[-1].stop_reason == "harness_error"
-    workflow._harvest = broken  # type: ignore[method-assign]
+    workflow._harvest = broken  # type: ignore[method-assign, assignment]
     result = workflow.run_scenario(scenario(max_steps=14))
     assert result.stop_reason == "harness_error" and result.outcome == "harness_error"
 
@@ -1532,7 +1538,7 @@ def test_a_server_that_stays_dead_is_a_typed_error_and_a_tool_error_is_not_a_rec
         assert bridge.call("get_staging_diff", {}).error is not None and bridge.opened == 1  # no reconnect
 
 
-def test_studio_factory_reuses_one_workflow_and_closes_it() -> None:
+def test_studio_factory_reuses_one_workflow_and_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
     """AG-12: every make_graph call used to build a workflow nobody closed (two MCP servers each, once used)."""
     close_studio_workflows()
     make_graph({"configurable": {"topology": "single"}})
@@ -1542,7 +1548,7 @@ def test_studio_factory_reuses_one_workflow_and_closes_it() -> None:
     assert set(built) == {("single", None), ("dual", None)}
     closed: list[str] = []
     for workflow in built.values():
-        workflow.close = lambda topology=workflow.topology: closed.append(topology)  # type: ignore[method-assign]
+        monkeypatch.setattr(workflow, "close", partial(closed.append, workflow.topology))
     close_studio_workflows()
     assert sorted(closed) == ["dual", "single"] and not workflow_module._studio_workflows
     close_studio_workflows()  # idempotent

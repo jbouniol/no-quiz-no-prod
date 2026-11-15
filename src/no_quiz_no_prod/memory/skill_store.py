@@ -22,7 +22,7 @@ import sqlite3
 import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, Final, Literal, Protocol, TypedDict
+from typing import Any, Final, Protocol, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -168,12 +168,12 @@ class SkillMemory:
                 if record.skill_tag in ALL_SKILL_TAGS and record.user_id == user_id:
                     pulled[record.skill_tag] = record  # the last record of a tag wins: never two per skill
             for tag in ALL_SKILL_TAGS:
-                record = pulled.get(tag)
-                if record is None:
+                latest = pulled.get(tag)
+                if latest is None:
                     self.store.delete(self.namespace(user_id), tag)
                     continue
-                clean = self._sanitized(record)
-                if clean != record:
+                clean = self._sanitized(latest)
+                if clean != latest:
                     clean = self.source.upsert_skill_record(clean)
                 self._write(clean)
 
@@ -305,7 +305,7 @@ def forget_approved(decision: Any) -> bool:
 def build_forget_graph(memory: SkillMemory, checkpointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:
     """``confirm_forget`` (interrupt: what would be deleted) -> ``purge`` on approval, END otherwise."""
 
-    def confirm_forget(state: ForgetState) -> Command[Literal["purge", "__end__"]]:
+    def confirm_forget(state: ForgetState) -> Command[str]:
         user_id = state.get("user_id") or DEFAULT_USER_ID
         count = memory.count_records(user_id)
         decision = interrupt(

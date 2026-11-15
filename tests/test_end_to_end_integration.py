@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from testkit import (
@@ -164,7 +164,7 @@ class LiveStudio:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def approve(self, expected_diff_sha256: str | None = None) -> httpx.Response:
+    def approve(self, expected_diff_sha256: str | None = None) -> httpx2.Response:
         body = {"action": "approve", "user_id": USER, "reason": "e2e reviewer"}
         if expected_diff_sha256 is not None:
             body["expected_diff_sha256"] = expected_diff_sha256
@@ -197,7 +197,7 @@ def skill_record(records: list[dict[str, Any]], tag: str = SKILL) -> dict[str, A
     return next(record for record in records if record["skill_tag"] == tag)
 
 
-def assert_gate_locked(response: httpx.Response, *missing: str) -> dict[str, Any]:
+def assert_gate_locked(response: httpx2.Response, *missing: str) -> dict[str, Any]:
     assert response.status_code == 409, response.text
     body = response.json()
     assert body["code"] == "gate_locked" and body.get("deployed") is not True

@@ -20,9 +20,19 @@ Harness guarantees, independent of the model:
   staging tree they act on, so a re-run after a change is a new logical call while a retry replays). A retryable
   ``ToolErrorPayload`` (``timeout`` with ``outcome_unknown``, ``rate_limited``) is retried at most
   ``MAX_TOOL_RETRIES`` times with backoff and the SAME key; ``attempts`` and ``replayed`` land in the trace.
-- The quiz is graded server-side by the workspace; a wrong first answer updates Layer 4 memory and sends the
-  Examiner back for doc v2 + a new question; the deploy gate asks the human, records the decision on the harness
-  side (``apply_deploy_decision``) and only then calls ``code-mcp.deploy_to_production``. No agent can deploy.
+- The quiz is graded server-side by the workspace and the grade is checkpointed on its own, so a crash never
+  loses or repeats it; a wrong first answer updates Layer 4 memory and sends the Examiner back for doc v2 + a new
+  question (in single topology the code is frozen meanwhile: no write or test tool). The deploy gate asks the
+  human, who must name the diff they reviewed, records the decision on the harness side
+  (``apply_deploy_decision``) and only then calls ``code-mcp.deploy_to_production``. No agent can deploy.
+- Blocks and quiz attempts belong to the workspace's task epoch: a follow-up turn or a new thread on a blocked
+  workspace stops at once, and resumes the attempt count instead of restarting it.
+- A deploy the gate let through but whose release failed is never "refused": the thread pauses on ``release_gate``
+  with the ``PendingRelease`` in its state (re-approve the same diff, or reject), and ends ``release_failed`` once
+  ``MAX_RELEASE_REAPPROVALS`` are spent. An unanswered deploy call is reconciled with the workspace first.
+- Secrets and untrusted text: the quiz answer key never enters graph state or a checkpoint (sealed arguments stay
+  in process memory between the model turn and the tool call); every tool result reaches the model inside the
+  untrusted-data envelope. A crash of the harness is reported as ``harness_error``, never as a provider error.
 - Every step, artifact and pause is streamed as a ``RunEvent`` to ``on_event`` (the SSE payloads of the Studio).
 """
 
@@ -34,7 +44,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Annotated, Any, Final, Literal, NotRequired, Protocol, TypedDict
 
@@ -234,6 +244,19 @@ class WorkspaceHarness(Protocol):
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int: ...
 
 
+class ChatClient(Protocol):
+    """What the harness needs from an LLM client (``LLMClient``, or a scripted stand-in in tests)."""
+
+    def chat_with_tools(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = ...,
+        max_tokens: int = ...,
+    ) -> ChatTurnResponse: ...
+
+
 class ThreadStateError(ValueError):
     """The thread is not in the state the call needs: not waiting for that human decision, or paused on one."""
 
@@ -280,6 +303,7 @@ class WorkflowState(TypedDict, total=False):
     wrote_staging: bool
     nudges: int
     budget_exhausted: bool
+    code_frozen: bool  # single topology, remediation: the diff under the quiz must not change
     pending_release: dict[str, Any] | None  # PendingRelease: a gated deploy whose release was not published
     stop_reason: StopReason | None
     final_answer: str
@@ -330,7 +354,7 @@ def _assistant_message(turn: ChatTurnResponse) -> dict[str, Any]:
 def _active_spec(state: Mapping[str, Any]) -> AgentSpec:
     """The spec of the active agent: the single agent loses its write tools while it remediates (frozen code)."""
     role: AgentRole = state["phase"]
-    if role == "single" and state.get("attempt", 1) > 1:
+    if role == "single" and state.get("code_frozen"):
         return SINGLE_REMEDIATION
     return AGENTS[role]
 
@@ -453,7 +477,7 @@ def _pending(snapshot: Any) -> HumanInterrupt | None:
     return None
 
 
-def _finish(stop_reason: StopReason, answer: str, **update: Any) -> Command[Literal["finish"]]:
+def _finish(stop_reason: StopReason, answer: str, **update: Any) -> Command[str]:
     return Command(goto="finish", update={**update, "stop_reason": stop_reason, "final_answer": answer})
 
 
@@ -468,7 +492,7 @@ class NoQuizWorkflow:
     def __init__(
         self,
         settings: RuntimeSettings | None = None,
-        llm_client: LLMClient | None = None,
+        llm_client: ChatClient | None = None,
         topology: Topology = "dual",
         model: str | None = None,
         mcp_transport: McpTransport = "stdio",
@@ -505,7 +529,7 @@ class NoQuizWorkflow:
 
     # ---- lazy collaborators ----------------------------------------------------------------------------------------
     @property
-    def llm(self) -> LLMClient:
+    def llm(self) -> ChatClient:
         with self._lock:
             if self._llm is None:
                 self._llm = LLMClient(model=self.model, settings=self.settings)
@@ -647,6 +671,7 @@ class NoQuizWorkflow:
             "wrote_staging": False,
             "nudges": 0,
             "budget_exhausted": False,
+            "code_frozen": False,
             "pending_release": None,
             "stop_reason": "refused" if gate.blocked else None,
             "final_answer": EPOCH_BLOCKED.format(reason=gate.blocked_reason or "blocked") if gate.blocked else "",
@@ -743,7 +768,7 @@ class NoQuizWorkflow:
             "budget_exhausted": exhausted,
         }
 
-    def _node_handoff(self, state: WorkflowState) -> Command[Literal["agent", "quiz_gate", "finish"]]:
+    def _node_handoff(self, state: WorkflowState) -> Command[str]:
         role = state["phase"]
         text = state.get("last_text") or ""
         status = parse_agent_status(text, wrote_staging=bool(state.get("wrote_staging")))
@@ -802,9 +827,7 @@ class NoQuizWorkflow:
         )
         return {"trace": [entry.model_dump(mode="json")], "last_grade": grade.model_dump(mode="json")}
 
-    def _node_quiz_outcome(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["deploy_gate", "agent", "finish"]]:
+    def _node_quiz_outcome(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         """Everything that follows a checkpointed grade: Layer 4 memory, events, then the route. Safe to re-run."""
         thread_id = _thread_id(config)
         grade = QuizGradeResult.model_validate(state["last_grade"])
@@ -824,13 +847,12 @@ class NoQuizWorkflow:
             if state.get("topology") == "single":
                 history = [*state["messages"]["single"], *build_single_remediation_messages(grade)]
                 messages = {**state["messages"], "single": history}
-                return Command(goto="agent", update={**update, "phase": "single", "messages": messages, "nudges": 0})
+                update |= {"phase": "single", "messages": messages, "nudges": 0, "code_frozen": True}
+                return Command(goto="agent", update=update)
             return self._examiner_turn(state, self.workspace.get_diff_report(), attempt=grade.attempt + 1, extra=update)
         return _finish("quiz_failed", QUIZ_BLOCKED.format(sha=grade.diff_sha256[:12], correct=grade.correct_option))
 
-    def _node_deploy_gate(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["release_gate", "finish"]]:
+    def _node_deploy_gate(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         thread_id = _thread_id(config)
         diff = self.workspace.get_diff_report()
         gate = self.workspace.get_gate_status(diff.diff_sha256)
@@ -852,9 +874,7 @@ class NoQuizWorkflow:
         )
         return self._decide(state, thread_id, decision, release)
 
-    def _node_release_gate(
-        self, state: WorkflowState, config: RunnableConfig
-    ) -> Command[Literal["release_gate", "finish"]]:
+    def _node_release_gate(self, state: WorkflowState, config: RunnableConfig) -> Command[str]:
         """A gated deploy whose release failed: the human re-approves the SAME diff (a real Lock 4, the server
         revoked the first approval) or rejects it. Same arguments and idempotency key: never a new change."""
         thread_id = _thread_id(config)
@@ -882,7 +902,7 @@ class NoQuizWorkflow:
 
     def _decide(
         self, state: WorkflowState, thread_id: str, decision: DeployDecision, release: PendingRelease
-    ) -> Command[Literal["release_gate", "finish"]]:
+    ) -> Command[str]:
         """Record the human's decision (harness side), then, on approval, make the system's deploy call.
 
         ``release`` is the publish this approval is for (its ``attempts`` already counts this one). The route:
@@ -963,7 +983,7 @@ class NoQuizWorkflow:
     # ---- node helpers ----------------------------------------------------------------------------------------------
     def _examiner_turn(
         self, state: WorkflowState, diff: DiffReport, *, attempt: int, extra: Mapping[str, Any]
-    ) -> Command[Literal["agent", "finish"]]:
+    ) -> Command[str]:
         """A fresh, isolated Examiner context for one attempt (dual topology).
 
         Fails closed when the diff does not fit the brief: a quiz written from a truncated diff would unlock a
@@ -988,7 +1008,7 @@ class NoQuizWorkflow:
         )
 
     @staticmethod
-    def _nudge(state: WorkflowState, text: str) -> Command[Literal["agent", "finish"]]:
+    def _nudge(state: WorkflowState, text: str) -> Command[str]:
         """A harness reminder to the active agent, at most ``MAX_HANDOFF_NUDGES`` times, then a stop."""
         nudges = state.get("nudges", 0)
         if nudges >= MAX_HANDOFF_NUDGES:
@@ -1252,8 +1272,9 @@ class NoQuizWorkflow:
         pending = _pending(snapshot)
         values = snapshot.values or {}
         graded = QUIZ_OUTCOME_NODE in (snapshot.next or ()) and not snapshot.interrupts
+        resume: Command[Any] | None = None
         if graded:  # the grade is in the checkpoint, only its consequences are missing
-            question_id, resume = (values.get("quiz") or {}).get("question_id"), None
+            question_id = (values.get("quiz") or {}).get("question_id")
         elif pending is not None and pending.kind == "quiz" and pending.quiz is not None:
             update = {} if values.get("user_id") else {"user_id": user_id}
             question_id = pending.quiz.question_id
