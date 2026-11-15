@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "name": "02_benchmark_pre_git_release",
+  "description": "Benchmark of 2 models x 2 topologies on the 30-scenario set, before deploys became git releases. results.jsonl is the primary cohort and is byte-identical to results_dual_deepseek_deepseek_v4_flash_latest.jsonl; summary.md describes it, comparison.md the four cohorts. Formerly eval/results_*.jsonl, eval/comparison.md and eval/history/02_pre_git_release_dual_deepseek/.",
+  "created_at": null,
+  "git_commit": null,
+  "git_dirty": null,
+  "recorded_in_commit": "db1e42d",
+  "scenario_set": "dev",
+  "scenario_file_sha256": "7f1a6a32a36fc7e206a44a7c4f2331b596bbd7ac5eb23a9565ab3d7535590673",
+  "scenario_count": 30,
+  "repeats": 1,
+  "dry_run": false,
+  "push_scored": false,
+  "stop_reason_scored": false,
+  "cohorts": [
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results.jsonl",
+      "rows": 30
+    },
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results_dual_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 30
+    },
+    {
+      "label": "google/gemini-2.5-flash (dual)",
+      "model": "google/gemini-2.5-flash",
+      "topology": "dual",
+      "results_file": "results_dual_google_gemini_2_5_flash.jsonl",
+      "rows": 30
+    },
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (single)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "single",
+      "results_file": "results_single_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 30
+    },
+    {
+      "label": "google/gemini-2.5-flash (single)",
+      "model": "google/gemini-2.5-flash",
+      "topology": "single",
+      "results_file": "results_single_google_gemini_2_5_flash.jsonl",
+      "rows": 30
+    }
+  ],
+  "judge": {
+    "judge_model": "anthropic/claude-sonnet-4.5",
+    "judged_cohort": "~deepseek/deepseek-v4-flash-latest (dual)",
+    "verdicts_stored": false,
+    "note": "The verdicts, the swap picks and the judge cost were not stored: the judge figures in summary.md and comparison.md cannot be recomputed. Calibration used the synthetic draft labels, now eval/labels/synthetic_draft_labels.json."
+  },
+  "cli_args": [],
+  "stale": true,
+  "stale_reason": "Recorded with the system prompts that enumerated the scenario classes, before the stop reason was scored, and on an earlier scenario file (see scenario_file_sha256). Not comparable with a run of the current harness; kept as a historical record only."
+}
