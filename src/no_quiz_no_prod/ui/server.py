@@ -84,6 +84,7 @@ from no_quiz_no_prod.ui.security import (
     allowed_hosts_from,
     allowed_hosts_from_env,
     new_session_token,
+    normalize_allowed_hosts,
     same_origin_client_kwargs,
 )
 
@@ -965,7 +966,9 @@ def create_app(
     )
     app.state.studio = manager
     app.state.session_token = session_token or new_session_token()
-    app.state.allowed_hosts = tuple(allowed_hosts) if allowed_hosts is not None else allowed_hosts_from_env()
+    app.state.allowed_hosts = (
+        normalize_allowed_hosts(allowed_hosts) if allowed_hosts is not None else allowed_hosts_from_env()
+    )
     app.add_middleware(StudioGuard, allowed_hosts=app.state.allowed_hosts, session_token=app.state.session_token)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -12,12 +13,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from starlette.datastructures import Headers
 from testkit import FIXED_FINTECH_ORDERS, SCRIPTED_MODEL, ScriptedLLM, call, parse_sse_events, turn
 
 from no_quiz_no_prod.cli import _cmd_init_notion, _cmd_reset, _cmd_run, build_parser
@@ -57,7 +59,13 @@ from no_quiz_no_prod.contracts import (
     compute_tree_sha256,
 )
 from no_quiz_no_prod.graph.workflow import ThreadStateError
-from no_quiz_no_prod.ui.security import SESSION_TOKEN_HEADER, allowed_hosts_from
+from no_quiz_no_prod.ui.security import (
+    SESSION_TOKEN_HEADER,
+    StudioGuard,
+    allowed_hosts_from,
+    hostname_of,
+    normalize_allowed_hosts,
+)
 from no_quiz_no_prod.ui.server import (
     STATIC_DIR,
     StudioManager,
@@ -1628,6 +1636,232 @@ def test_guard_host_allow_list_covers_reads_and_the_page_carries_the_token(tmp_p
     assert other.state.session_token != app.state.session_token and len(app.state.session_token) >= 32
     assert allowed_hosts_from("0.0.0.0", ["Studio.Example:8443"]) == ("127.0.0.1", "localhost", "::1", "studio.example")
     assert allowed_hosts_from("192.168.1.20") == ("127.0.0.1", "localhost", "::1", "192.168.1.20")
+
+
+def _raw_asgi_request(
+    app: FastAPI,
+    *,
+    method: str = "GET",
+    path: str = "/",
+    scheme: str = "http",
+    raw_headers: list[tuple[bytes, bytes]],
+    body: bytes = b"",
+) -> tuple[int, str]:
+    """Send an HTTP request with exact raw header tuples directly through the ASGI middleware stack."""
+
+    async def _run() -> tuple[int, str]:
+        sent_status = 0
+        chunks: list[bytes] = []
+        delivered = False
+
+        async def receive() -> dict[str, Any]:
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            nonlocal sent_status
+            if message["type"] == "http.response.start":
+                sent_status = int(message["status"])
+            elif message["type"] == "http.response.body":
+                chunks.append(bytes(message.get("body", b"")))
+
+        scope: dict[str, Any] = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": scheme,
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": raw_headers,
+            "client": ("127.0.0.1", 50000),
+            "server": ("127.0.0.1", 8000),
+        }
+        await app(scope, receive, send)
+        return sent_status, b"".join(chunks).decode("utf-8")
+
+    return asyncio.run(_run())
+
+
+def test_guard_rejects_duplicate_missing_and_malformed_host_headers(tmp_path: Path) -> None:
+    """RFC 9112 §3.2 & strict authority parsing: duplicate, missing, or malformed Host headers fail closed (400)."""
+    app, _, _ = build_studio(tmp_path)
+    token: str = app.state.session_token
+    guard = StudioGuard(app, allowed_hosts=["localhost:8000", "127.0.0.1", "::1"], session_token=token)
+
+    # 1. Missing, empty, and duplicate Host headers must fail closed both on StudioGuard.refusal and end-to-end ASGI.
+    raw_host_failures: dict[str, list[tuple[bytes, bytes]]] = {
+        "omitted Host": [],
+        "empty Host": [(b"host", b"")],
+        "whitespace Host": [(b"host", b"   ")],
+        "duplicate Host (loopback + attacker)": [(b"host", b"localhost:8000"), (b"host", b"evil.com:8000")],
+        "duplicate Host (attacker + loopback)": [(b"host", b"evil.com:8000"), (b"host", b"localhost:8000")],
+        "duplicate identical Host": [(b"host", b"localhost:8000"), (b"host", b"localhost:8000")],
+    }
+    for label, raw_headers in raw_host_failures.items():
+        refusal = guard.refusal("GET", Headers(raw=raw_headers), "http")
+        assert refusal is not None and refusal[:2] == (400, "invalid_host"), label
+        status, payload = _raw_asgi_request(app, method="GET", path="/", raw_headers=raw_headers)
+        assert status == 400 and json.loads(payload)["code"] == "invalid_host", label
+        assert token not in payload, label
+
+    # Duplicate Origin or duplicate session token headers on mutating requests are also refused.
+    dup_origin_status, dup_origin_body = _raw_asgi_request(
+        app,
+        method="POST",
+        path="/api/reset",
+        raw_headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"origin", b"http://127.0.0.1:8000"),
+            (b"origin", b"https://evil.example.com"),
+            (SESSION_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")),
+            (b"content-type", b"application/json"),
+        ],
+        body=b'{"seed":"fintech"}',
+    )
+    assert dup_origin_status == 403 and json.loads(dup_origin_body)["code"] == "forbidden_origin"
+
+    dup_token_status, dup_token_body = _raw_asgi_request(
+        app,
+        method="POST",
+        path="/api/reset",
+        raw_headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"origin", b"http://127.0.0.1:8000"),
+            (SESSION_TOKEN_HEADER.lower().encode("ascii"), token.encode("ascii")),
+            (SESSION_TOKEN_HEADER.lower().encode("ascii"), b"stale-second-token"),
+            (b"content-type", b"application/json"),
+        ],
+        body=b'{"seed":"fintech"}',
+    )
+    assert dup_token_status == 403 and json.loads(dup_token_body)["code"] == "invalid_session"
+
+    # 2. Malformed authorities never strip suffixes/userinfo/bad ports into an allowed loopback host.
+    malformed_hosts = [
+        "[::1].evil.com",
+        "[::1].evil.com:8000",
+        "127.0.0.1:80@evil.com",
+        "localhost@evil.com",
+        "localhost:notaport",
+        "localhost:",
+        "localhost:0",
+        "localhost:080",
+        "localhost:65536",
+        "[::1]:notaport",
+        "[::1]:0",
+        "[::1]:65536",
+        "[::1",
+        "::1",
+        "999.999.999.999:8000",
+        "127.1:8000",
+        "localhost/evil",
+    ]
+    client = TestClient(app, base_url=PAGE_ORIGIN)
+    for bad_host in malformed_hosts:
+        assert hostname_of(bad_host) is None, bad_host
+        read_res = client.get("/", headers={"Host": bad_host})
+        assert read_res.status_code == 400 and read_res.json()["code"] == "invalid_host", bad_host
+        assert token not in read_res.text, bad_host
+        write_res = client.post(
+            "/api/reset",
+            json={"seed": "fintech"},
+            headers={"Host": bad_host, "Origin": f"http://{bad_host}", SESSION_TOKEN_HEADER: token},
+        )
+        assert write_res.status_code == 400 and write_res.json()["code"] == "invalid_host", bad_host
+
+
+def test_guard_normalizes_allowed_hosts_and_enforces_strict_origin_components(tmp_path: Path) -> None:
+    """create_app & StudioGuard normalize host[:port] entries, drop empty/invalid ones, and enforce strict Origin."""
+    settings = RuntimeSettings(workspace_dir=tmp_path / "ws")
+    app = create_app(
+        settings=settings,
+        workspace=StubSandboxWorkspace(settings),
+        eval_dir=tmp_path / "eval",
+        env_file=tmp_path / ".env",
+        allowed_hosts=["Studio.Local:8000", "", "   ", "0.0.0.0", "::", "[::1].evil.com"],
+    )
+    token: str = app.state.session_token
+
+    # 3. Both create_app and StudioGuard.__init__ normalize authorities and discard empty/wildcard/invalid entries.
+    assert app.state.allowed_hosts == ("studio.local",)
+    assert normalize_allowed_hosts(["Studio.Local:8000", "", "  ", "::1"]) == ("studio.local", "::1")
+    direct_guard = StudioGuard(app, allowed_hosts=["Studio.Local:8000", "", "   "], session_token=token)
+    assert direct_guard.allowed_hosts == frozenset({"studio.local"})
+    assert direct_guard.refusal("GET", Headers({"host": "Studio.Local:8000"}), "http") is None
+    omitted = direct_guard.refusal("GET", Headers(raw=[]), "http")
+    assert omitted is not None and omitted[:2] == (400, "invalid_host")
+
+    missing_status, missing_body = _raw_asgi_request(app, method="GET", path="/", raw_headers=[])
+    assert missing_status == 400 and json.loads(missing_body)["code"] == "invalid_host"
+    assert token not in missing_body
+
+    empty_allow_app = create_app(
+        settings=settings,
+        workspace=StubSandboxWorkspace(settings),
+        eval_dir=tmp_path / "eval",
+        env_file=tmp_path / ".env_empty",
+        allowed_hosts=["", "   "],
+    )
+    assert empty_allow_app.state.allowed_hosts == ()
+    empty_status, _ = _raw_asgi_request(empty_allow_app, method="GET", path="/", raw_headers=[])
+    assert empty_status == 400
+
+    client = TestClient(app, base_url="http://studio.local:8000")
+    mixed_get = client.get("/", headers={"Host": "Studio.Local:8000"})
+    assert mixed_get.status_code == 200 and token in mixed_get.text
+    mixed_post = client.post(
+        "/api/reset",
+        json={"seed": "fintech"},
+        headers={"Host": "Studio.Local:8000", "Origin": "http://Studio.Local:8000", SESSION_TOKEN_HEADER: token},
+    )
+    assert mixed_post.status_code == 200
+
+    # 4. _same_origin rejects non-http(s) schemes and any path, query, fragment, or userinfo component.
+    default_app, _, _ = build_studio(tmp_path / "default")
+    default_token: str = default_app.state.session_token
+    default_client = TestClient(default_app, base_url=PAGE_ORIGIN)
+    bad_origins = [
+        "http://127.0.0.1:8000/evil?x=1#y",
+        "http://127.0.0.1:8000/",
+        "http://127.0.0.1:8000/api/reset",
+        "http://127.0.0.1:8000?x=1",
+        "http://127.0.0.1:8000?",
+        "http://127.0.0.1:8000#frag",
+        "http://127.0.0.1:8000#",
+        "http://user:pass@127.0.0.1:8000",
+        "http://user@127.0.0.1:8000",
+        "http://@127.0.0.1:8000",
+        "ftp://127.0.0.1:8000",
+        "ws://127.0.0.1:8000",
+        "http://[::1",
+    ]
+    for bad_origin in bad_origins:
+        res = default_client.post(
+            "/api/reset",
+            json={"seed": "fintech"},
+            headers={"Origin": bad_origin, SESSION_TOKEN_HEADER: default_token},
+        )
+        assert res.status_code == 403 and res.json()["code"] == "forbidden_origin", bad_origin
+
+    # Even if an ASGI scope reported a non-http(s) scheme matching Origin, _same_origin rejects it.
+    ws_scheme_status, ws_scheme_body = _raw_asgi_request(
+        default_app,
+        method="POST",
+        path="/api/reset",
+        scheme="ws",
+        raw_headers=[
+            (b"host", b"127.0.0.1:8000"),
+            (b"origin", b"ws://127.0.0.1:8000"),
+            (SESSION_TOKEN_HEADER.lower().encode("ascii"), default_token.encode("ascii")),
+            (b"content-type", b"application/json"),
+        ],
+        body=b'{"seed":"fintech"}',
+    )
+    assert ws_scheme_status == 403 and json.loads(ws_scheme_body)["code"] == "forbidden_origin"
 
 
 # ---- 13. One active run per workspace (C10): 409 run_active for a second run, a Reset or a settings change --------------
