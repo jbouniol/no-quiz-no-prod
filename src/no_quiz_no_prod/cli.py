@@ -9,12 +9,25 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, TextIO
 
 import httpx
 
+from no_quiz_no_prod.backend import SandboxWorkspace
 from no_quiz_no_prod.backend.errors import WorkspaceError
-from no_quiz_no_prod.backend.release import GitReleasePublisher, describe_release_remote, github_repo
+from no_quiz_no_prod.backend.notion_sync import (
+    NOTION_API_BASE,
+    NOTION_TIMEOUT_S,
+    NOTION_VERSION,
+    NotionSyncError,
+    provision_notion_databases,
+)
+from no_quiz_no_prod.backend.release import (
+    GitReleasePublisher,
+    describe_release_remote,
+    github_repo,
+    validate_release_config,
+)
 from no_quiz_no_prod.backend.seeds import populate_area, seed_path
 from no_quiz_no_prod.backend.store import workspace_lock
 from no_quiz_no_prod.contracts import (
@@ -24,17 +37,23 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_SEED,
     DEFAULT_USER_ID,
     NOTION_IDS_FILE,
+    DeployAction,
     DeployDecision,
+    InterruptKind,
+    PendingRelease,
     QuizAnswer,
     QuizOptionKey,
     RunEvent,
     RuntimeSettings,
+    StopReason,
     Topology,
 )
-from no_quiz_no_prod.ui.server import _load_default_workspace
-from no_quiz_no_prod.ui.server import main as run_ui_server
+from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
+from no_quiz_no_prod.llm import LLMError
 
-NOTION_API_VERSION = "2022-06-28"
+if TYPE_CHECKING:
+    from no_quiz_no_prod.ui.server import WorkflowBackend, WorkspaceBackend
+
 KEY_SHORTCUT_MAP: dict[str, QuizOptionKey] = {
     "1": "A",
     "2": "B",
@@ -45,6 +64,52 @@ KEY_SHORTCUT_MAP: dict[str, QuizOptionKey] = {
     "C": "C",
     "D": "D",
 }
+DEPLOY_INTERRUPT_KINDS: Final[frozenset[InterruptKind]] = frozenset({"deploy_approval", "release_retry"})
+APPROVE_ANSWERS: Final = frozenset({"y", "yes", "a", "approve"})
+REJECT_ANSWERS: Final = frozenset({"n", "no", "r", "reject"})
+
+# ---- exit codes (documented in `no-quiz-no-prod run --help`) -------------------------------------------------------
+EXIT_OK: Final = 0
+EXIT_ERROR: Final = 1  # a typed failure (configuration, workspace, Notion, LLM provider) or an `api_error` run
+EXIT_USAGE: Final = 2  # same code as argparse
+EXIT_NO_DECISION: Final = 9  # stdin closed at a human gate: nothing was recorded, the gate is still pending
+EXIT_INTERRUPTED: Final = 130  # Ctrl-C (128 + SIGINT)
+# One code per terminal stop reason, so a script can tell a deployed run from a blocked one. A stop reason added to
+# the contracts without a code here fails `tests/test_cli.py`.
+EXIT_CODE_BY_STOP_REASON: Final[dict[StopReason, int]] = {
+    "completed": EXIT_OK,
+    "api_error": EXIT_ERROR,
+    "clarification_needed": 3,
+    "refused": 4,
+    "quiz_failed": 5,
+    "human_rejected": 6,
+    "max_steps": 7,
+    "release_failed": 8,
+    "harness_error": 10,
+}
+
+
+def _exit_code_help() -> str:
+    by_reason = "\n".join(f"  {code:>3}  stop_reason={reason}" for reason, code in EXIT_CODE_BY_STOP_REASON.items())
+    return (
+        "exit codes:\n"
+        f"{by_reason}\n"
+        f"  {EXIT_ERROR:>3}  also: configuration, workspace, Notion or LLM provider error\n"
+        f"  {EXIT_USAGE:>3}  usage error\n"
+        f"  {EXIT_NO_DECISION:>3}  stdin closed at a quiz or deploy prompt: no decision recorded\n"
+        f"  {EXIT_INTERRUPTED:>3}  interrupted (Ctrl-C)"
+    )
+
+
+def _positive_int(raw: str) -> int:
+    """argparse type: an integer >= 1."""
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected an integer >= 1, got {raw!r}")
+    return value
 
 
 def _load_workflow(
@@ -53,22 +118,11 @@ def _load_workflow(
     topology: Topology,
     model: str | None,
     transport: Literal["stdio", "inprocess"],
-) -> Any:
-    try:
-        from no_quiz_no_prod.graph.workflow import NoQuizWorkflow  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise RuntimeError(
-            "LangGraph workflow (`no_quiz_no_prod.graph.workflow`) is not available in this environment."
-        ) from exc
-    return NoQuizWorkflow(
-        settings=settings,
-        topology=topology,
-        model=model,
-        mcp_transport=transport,
-    )
+) -> WorkflowBackend:
+    return NoQuizWorkflow(settings=settings, topology=topology, model=model, mcp_transport=transport)
 
 
-def _print_run_event(ev: RunEvent, *, out: Any = sys.stdout) -> None:
+def _print_run_event(ev: RunEvent, *, out: TextIO = sys.stdout) -> None:
     if ev.type == "run_started":
         print(
             f"\n▶ Run started [thread={ev.thread_id} topology={ev.topology} model={ev.model}]",
@@ -93,7 +147,7 @@ def _print_run_event(ev: RunEvent, *, out: Any = sys.stdout) -> None:
         print(f"  #{st.step:02d} [{st.agent}{srv}] {st.tool} {ms}ms {mark}{extra_str}", file=out)
 
 
-def _prompt_quiz_choice(input_fn: Callable[[str], str], *, out: Any = sys.stdout) -> QuizOptionKey:
+def _prompt_quiz_choice(input_fn: Callable[[str], str], *, out: TextIO = sys.stdout) -> QuizOptionKey:
     while True:
         raw = input_fn("Select option [A/B/C/D or 1-4]: ").strip().upper()
         mapped = KEY_SHORTCUT_MAP.get(raw)
@@ -102,13 +156,49 @@ def _prompt_quiz_choice(input_fn: Callable[[str], str], *, out: Any = sys.stdout
         print("  Invalid choice — enter A, B, C, D (or 1, 2, 3, 4).", file=out)
 
 
+def _prompt_deploy_action(input_fn: Callable[[str], str], *, out: TextIO = sys.stdout) -> DeployAction:
+    """Ask until the answer is an explicit approval or an explicit rejection.
+
+    A rejection blocks the change, so an empty Enter or a typo is never read as one: it asks again. A closed stdin
+    raises ``EOFError`` and the caller stops without recording any decision.
+    """
+    while True:
+        raw = input_fn("\nApprove production deployment? [y = approve / n = reject and block]: ").strip().lower()
+        if raw in APPROVE_ANSWERS:
+            return "approve"
+        if raw in REJECT_ANSWERS:
+            return "reject"
+        print("  No decision recorded — enter y to approve, or n to reject (a rejection blocks this change).", file=out)
+
+
+def _print_failed_release(release: PendingRelease, out: TextIO) -> None:
+    """Why the gate asks again: the previous approval was revoked by a release that was not published."""
+    error = release.error
+    reason = f"{error.code}: {error.message}" if error is not None else "no error recorded"
+    print(f"\n✗ Release attempt {release.attempts} was not published ({reason}).", file=out)
+    if error is not None and error.outcome_unknown:
+        print("  The outcome is unknown: the push may have reached the remote.", file=out)
+    print(
+        "  Production was not promoted and the approval was revoked. Approving again retries the same diff.", file=out
+    )
+
+
+def _stop_without_decision(gate: str, thread_id: str, out: TextIO) -> int:
+    print(
+        f"\nStopped: input closed at the {gate}. No decision was recorded for thread {thread_id}; "
+        "the gate is still pending.",
+        file=out,
+    )
+    return EXIT_NO_DECISION
+
+
 def _cmd_run(
     args: argparse.Namespace,
     *,
     settings: RuntimeSettings | None = None,
-    workflow: Any | None = None,
+    workflow: WorkflowBackend | None = None,
     input_fn: Callable[[str], str] = input,
-    out: Any = sys.stdout,
+    out: TextIO = sys.stdout,
 ) -> int:
     cfg = settings or RuntimeSettings.from_env()
     task = (args.task or "").strip()
@@ -119,7 +209,16 @@ def _cmd_run(
             task = ""
     if not task:
         print("Error: a non-empty task prompt is required.", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
+
+    # A bad remote, branch, token or git version stops here (WorkspaceError, reported by main) instead of failing
+    # at the last step of the flow, after the tests, the quiz and the approval.
+    release = validate_release_config(cfg)
+    print(
+        f"Release target: {release.remote.display} ({release.remote.kind}) · branch {release.branch} "
+        f"· git {release.git_version}",
+        file=out,
+    )
 
     wf = workflow or _load_workflow(
         cfg,
@@ -157,8 +256,7 @@ def _cmd_run(
                 try:
                     choice = _prompt_quiz_choice(input_fn, out=out)
                 except EOFError:
-                    print("Aborted (EOF during quiz prompt).", file=out)
-                    return 1
+                    return _stop_without_decision("quiz prompt", thread_id, out)
 
                 grade, outcome = wf.submit_quiz(
                     thread_id,
@@ -175,18 +273,19 @@ def _cmd_run(
                     )
                 continue
 
-            if intr.kind == "deploy_approval" and intr.gate is not None:
+            if intr.kind in DEPLOY_INTERRUPT_KINDS and intr.gate is not None:
                 gate = intr.gate
+                if intr.release is not None:
+                    _print_failed_release(intr.release, out)
                 print(f"\n=== 4-Lock Production Gate [diff={gate.diff_sha256[:12]}] ===", file=out)
                 print(f"  Lock 1 (tests_passed)   : {gate.tests_passed}", file=out)
                 print(f"  Lock 2 (sha256_matches) : {gate.sha256_matches}", file=out)
                 print(f"  Lock 3 (quiz_passed)    : {gate.quiz_passed}", file=out)
                 print(f"  Lock 4 (human_approved) : {gate.human_approved} (awaiting sign-off)", file=out)
                 try:
-                    ans = input_fn("\nApprove production deployment? [y/N]: ").strip().lower()
+                    action = _prompt_deploy_action(input_fn, out=out)
                 except EOFError:
-                    ans = "n"
-                action = "approve" if ans in ("y", "yes", "a", "approve") else "reject"
+                    return _stop_without_decision("deploy prompt", thread_id, out)
                 decision = DeployDecision(
                     action=action,
                     expected_diff_sha256=gate.diff_sha256,
@@ -224,18 +323,19 @@ def _cmd_run(
         f"| cost=${outcome.budget.cost_usd:.4f}",
         file=out,
     )
-    return 0 if outcome.stop_reason != "api_error" else 1
+    # a run can only leave the loop above on a terminal outcome; one without a stop reason is reported as an error
+    return EXIT_CODE_BY_STOP_REASON.get(outcome.stop_reason, EXIT_ERROR)
 
 
 def _cmd_reset(
     args: argparse.Namespace,
     *,
     settings: RuntimeSettings | None = None,
-    workspace: Any | None = None,
-    out: Any = sys.stdout,
+    workspace: WorkspaceBackend | None = None,
+    out: TextIO = sys.stdout,
 ) -> int:
     cfg = settings or RuntimeSettings.from_env()
-    ws = workspace or _load_default_workspace(cfg)
+    ws: WorkspaceBackend = workspace or SandboxWorkspace(settings=cfg)
     state = ws.reset(
         args.seed,
         preserve_skill_memory=not args.reset_skill_memory,
@@ -252,14 +352,17 @@ def _cmd_reset(
 def _verify_notion_database(api_key: str, db_id: str) -> tuple[bool, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Notion-Version": NOTION_API_VERSION,
+        "Notion-Version": NOTION_VERSION,
     }
     try:
-        resp = httpx.get(f"https://api.notion.com/v1/databases/{db_id}", headers=headers, timeout=10.0)
+        resp = httpx.get(f"{NOTION_API_BASE}/databases/{db_id}", headers=headers, timeout=NOTION_TIMEOUT_S)
     except httpx.HTTPError as exc:
         return False, f"network error: {exc}"
     if resp.status_code == 200:
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            return False, "invalid JSON response"
         title_parts = data.get("title") or []
         title = "".join(part.get("plain_text", "") for part in title_parts) or db_id
         return True, title
@@ -270,7 +373,7 @@ def _cmd_init_notion(
     args: argparse.Namespace,
     *,
     settings: RuntimeSettings | None = None,
-    out: Any = sys.stdout,
+    out: TextIO = sys.stdout,
 ) -> int:
     ids_path = Path(args.ids_file)
     cfg = settings or RuntimeSettings.from_env(notion_ids_file=ids_path)
@@ -281,14 +384,7 @@ def _cmd_init_notion(
                 "Error: NOTION_API_KEY is not set in .env; cannot provision live Notion databases.",
                 file=sys.stderr,
             )
-            return 1
-        try:
-            from no_quiz_no_prod.backend.notion_sync import (
-                provision_notion_databases,  # type: ignore[import-not-found]
-            )
-        except ImportError as exc:
-            print(f"Error: Notion sync module unavailable ({exc}).", file=sys.stderr)
-            return 1
+            return EXIT_ERROR
 
         provisioned = provision_notion_databases(
             args.parent_page_id,
@@ -343,7 +439,7 @@ def _cmd_init_notion(
     return 0
 
 
-def _print_git_failure(label: str, error: WorkspaceError, out: Any) -> None:
+def _print_git_failure(label: str, error: WorkspaceError, out: TextIO) -> None:
     """One failed check: the typed message, plus git's (already redacted) output when there is some."""
     print(f"  ✗ {label}: {error.payload.message}", file=out)
     if output := str(error.payload.details.get("git_output", "")).strip():
@@ -354,7 +450,7 @@ def _cmd_init_github(
     args: argparse.Namespace,
     *,
     settings: RuntimeSettings | None = None,
-    out: Any = sys.stdout,
+    out: TextIO = sys.stdout,
 ) -> int:
     """Inspect or verify the release remote (``--verify``), or push the seed as the first commit of its branch.
 
@@ -431,7 +527,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # 1. run
-    run_p = sub.add_parser("run", help="Run an interactive terminal HITL coding & quiz session.")
+    run_p = sub.add_parser(
+        "run",
+        help="Run an interactive terminal HITL coding & quiz session.",
+        epilog=_exit_code_help(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run_p.add_argument("task", nargs="?", default="", help="Developer task prompt.")
     run_p.add_argument(
         "--topology",
@@ -442,9 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--model", default=None, help="Override LLM model identifier.")
     run_p.add_argument(
         "--max-steps",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_MAX_STEPS,
-        help=f"Maximum LLM-initiated MCP tool calls (default: {DEFAULT_MAX_STEPS}).",
+        help=f"Maximum LLM-initiated MCP tool calls, at least 1 (default: {DEFAULT_MAX_STEPS}).",
     )
     run_p.add_argument("--thread-id", default=None, help="Explicit thread_id for multi-turn continuation.")
     run_p.add_argument("--user-id", default=DEFAULT_USER_ID, help=f"Developer user_id (default: {DEFAULT_USER_ID}).")
@@ -470,6 +571,13 @@ def build_parser() -> argparse.ArgumentParser:
     ui_p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     ui_p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     ui_p.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
+    ui_p.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Extra host name the Studio answers to, besides loopback and --host (repeatable).",
+    )
 
     # 4. init-notion
     notion_p = sub.add_parser(
@@ -510,24 +618,39 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point for ``no-quiz-no-prod``."""
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    """Entry point for ``no-quiz-no-prod``: anticipated failures end as one line on stderr and a non-zero exit code."""
+    args = build_parser().parse_args(argv)
+    try:
+        return _dispatch(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except WorkspaceError as error:
+        print(f"Error ({error.code}): {error.payload.message}", file=sys.stderr)
+    except (NotionSyncError, LLMError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+    return EXIT_ERROR
 
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "reset":
         return _cmd_reset(args)
     if args.command == "ui":
+        from no_quiz_no_prod.ui.server import main as run_ui_server
+
         ui_args = ["--host", args.host, "--port", str(args.port)]
         if args.reload:
             ui_args.append("--reload")
+        for host in args.allowed_host:
+            ui_args.extend(["--allowed-host", host])
         return run_ui_server(ui_args)
     if args.command == "init-notion":
         return _cmd_init_notion(args)
     if args.command == "init-github":
         return _cmd_init_github(args)
-    return 2
+    return EXIT_USAGE
 
 
 if __name__ == "__main__":
