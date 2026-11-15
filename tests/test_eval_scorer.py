@@ -978,6 +978,8 @@ def test_comparison_prints_intervals_and_does_not_rank_indistinguishable_cohorts
     significant = generate_comparison_markdown({"a (dual)": repeated_a, "b (dual)": repeated_b})
     assert "`p = 0.0312`" in significant and "statistically significant" in significant
     assert "does not rank" not in significant and "One repeat per scenario" not in significant
+    three_way = generate_comparison_markdown({"a (dual)": cohort_a, "b (dual)": cohort_b, "c (single)": cohort_b})
+    assert "### `b (dual)` vs `c (single)`" in three_way
 
 
 @pytest.mark.parametrize(

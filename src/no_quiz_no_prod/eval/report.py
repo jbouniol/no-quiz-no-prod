@@ -8,6 +8,7 @@ It also stores what the judge said (``write_judge_artifacts``), so every judge f
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -428,12 +429,9 @@ def generate_comparison_markdown(
 
     all_runs = [r for runs in cohort_results.values() for r in runs]
     summaries = {label: summarize_cohort(cohort_results[label], label=label) for label in labels}
-    baseline_label = labels[0]
     comparisons: list[CohortComparison] = [
-        compare_cohorts(
-            cohort_results[baseline_label], cohort_results[challenger], label_a=baseline_label, label_b=challenger
-        )
-        for challenger in labels[1:]
+        compare_cohorts(cohort_results[label_a], cohort_results[label_b], label_a=label_a, label_b=label_b)
+        for label_a, label_b in itertools.combinations(labels, 2)
     ]
     lines: list[str] = [
         f"# {title}",
@@ -478,7 +476,7 @@ def generate_comparison_markdown(
     lines.extend(
         [
             "",
-            "## 2. Paired Scenario Sign Tests (`pass^k` Discordant Pairs, each cohort against the first)",
+            "## 2. Paired Scenario Sign Tests (`pass^k` Discordant Pairs, all cohort pairs)",
             "",
         ]
     )
