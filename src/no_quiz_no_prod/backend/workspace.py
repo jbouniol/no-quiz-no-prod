@@ -14,11 +14,19 @@ The deploy gate is enforced here, server-side: every lock is bound to a ``diff_s
 workspace lock at decision time, so a lock earned on one diff never unlocks another (TOCTOU guard), and it is written
 in the same SQLite transaction as the fact that earns it. Quiz attempts and blocks belong to the TASK EPOCH, not to a
 diff: an edit of staging never gives a new attempt or lifts a block; only a deploy, a reset or a human ``unblock``
-starts a new epoch. A deploy is a
-git release (``GitReleasePublisher``): the approved staging tree is committed and pushed first, and prod is promoted
-only once that push succeeded, so a failed push leaves prod, the ledger and the ship log untouched.
+starts a new epoch.
+
+Staged tests never run in this process's reach: ``run_staged_tests`` runs them, then the seed's hidden acceptance
+suite, on a private copy under OS isolation, and Lock 1 needs both green on the very tree that is still staged.
+
+A deploy is a git release (``GitReleasePublisher``), journaled in ``state.sqlite``: the approved trees are built into
+a release under the workspace lock, pushed WITHOUT it (only the non-blocking deploy slot is held, which also keeps
+test runs and resets out), and prod is then promoted from the pushed commit itself. A failed push leaves prod and the
+ship log untouched and revokes Lock 4; a push whose outcome is unknown, or a crash after the push, is reconciled from
+the journal by the next deploy or the next start.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -31,7 +39,7 @@ from types import MappingProxyType
 from typing import Any, Final
 
 from no_quiz_no_prod.backend import catalog
-from no_quiz_no_prod.backend.code_tree import build_diff_report, copy_tree, run_pytest, tree_files
+from no_quiz_no_prod.backend.code_tree import acceptance_suite_dir, build_diff_report, run_staged_tests, tree_files
 from no_quiz_no_prod.backend.errors import WorkspaceError
 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
 from no_quiz_no_prod.backend.release import GitReleasePublisher
@@ -42,6 +50,9 @@ from no_quiz_no_prod.backend.store import (
     deploy_slot,
     idempotency_get,
     idempotency_put,
+    journal_append,
+    journal_open_entries,
+    journal_update,
     ledger_entries,
     ledger_record,
     ledger_revoke,
@@ -80,6 +91,7 @@ from no_quiz_no_prod.contracts import (
     QuizOptionKey,
     QuizQuestion,
     ReleaseCommit,
+    ReleaseJournalEntry,
     RunFinalState,
     RuntimeSettings,
     ShipLogEntry,
@@ -94,8 +106,11 @@ from no_quiz_no_prod.contracts import (
     ship_log_status_for_attempt,
 )
 
+logger = logging.getLogger(__name__)
+
 MAX_STAGING_FILE_CHARS: Final = 200_000
-PYTEST_SCRATCH_DIRNAME: Final = ".pytest_scratch"  # pytest's cwd and ini: outside the hashed trees
+# Left by versions before the fix phase: the unsigned JSON ledger (never trusted) and pytest's old scratch dir.
+LEGACY_WORKSPACE_ENTRIES: Final = (GATE_LEDGER_FILENAME, ".pytest_scratch")
 SHORT_SHA_CHARS: Final = 12  # the Diff SHA-256 badge length of the UI spec
 
 META_SEED: Final = "seed"
@@ -212,14 +227,17 @@ class SandboxWorkspace:
         if target is not None and target not in ALL_FINTECH_MODULES and target not in {r.rule_code for r in rules}:
             raise WorkspaceError("invalid_argument", f"injection target {target!r} is not a seeded module or rule")
         self.root.mkdir(parents=True, exist_ok=True)
-        with self._lock(), deploy_slot(self.root):  # never under a deploy in flight (run_active)
+        with self._lock(), deploy_slot(self.root):  # never under a deploy or a test run in flight (run_active)
             for area_dir in (self.prod_dir, self.staging_dir):
                 self._swap_tree(
                     area_dir, lambda fresh: populate_area(fresh, source, injection_target=target, injection_text=text)
                 )
             seed_prod_sha256 = compute_tree_sha256(self.prod_dir)
-            (self.root / GATE_LEDGER_FILENAME).unlink(missing_ok=True)  # the pre-SQLite ledger: never trusted
-            shutil.rmtree(self.root / PYTEST_SCRATCH_DIRNAME, ignore_errors=True)
+            self.release.discard_default_remote()  # its history no longer matches the reseeded prod
+            for legacy in LEGACY_WORKSPACE_ENTRIES:
+                (self.root / legacy).unlink(missing_ok=True) if (self.root / legacy).is_file() else shutil.rmtree(
+                    self.root / legacy, ignore_errors=True
+                )
             with self._write() as conn:
                 wipe(conn, keep_memory=preserve_skill_memory)
                 for rule in rules:
@@ -252,14 +270,17 @@ class SandboxWorkspace:
             if not self._is_initialized():
                 self.reset()
             self._ready = True
+        self._reconcile_if_idle()  # a restart: finish what an interrupted deploy left in the release journal
 
     def snapshot_final_state(self, thread_id: str | None = None) -> RunFinalState:
         """The evidence an eval scores: real trees, last pytest, the run's ship log and the ledger of its diff.
 
         The run's diff is the one its latest ship-log entry (else its latest quiz) is bound to, so the state stays
-        right after a deploy, when prod already equals staging.
+        right after a deploy, when prod already equals staging. A release left open by an interrupted deploy (or
+        by a push whose answer was lost) is reconciled first, so ``deployed`` and ``pushed`` say what really happened.
         """
         self.ensure_ready()
+        self._reconcile_if_idle()
         with self._lock():
             prod_tree, staging_tree = self._trees()
             with self._read() as conn:
@@ -374,36 +395,58 @@ class SandboxWorkspace:
             return payload
 
     def run_staging_tests(self, pytest_k: str | None = None, *, idempotency_key: str | None = None) -> PytestReport:
-        """Run pytest on staging and bind the report to the diff it ran against.
+        """Run the staged tests, then the hidden acceptance suite, in the sandbox; bind the report to the tree run.
 
-        Grants ``tests_passed`` to that diff only for a full (unfiltered) green run on a real change, with no tree
-        drift during the run. A replay serves the stored report only while the diff is unchanged.
+        Grants ``tests_passed`` only for a full (unfiltered) run with BOTH suites green on a real change, and only
+        when the tree that was run is still the staged one. The agent cannot read or edit the acceptance suite, so it
+        cannot certify its own change. The workspace lock is not held during the run (it happens on a private copy);
+        the deploy slot is, so no test process is alive while a release is published, and a deploy in flight refuses
+        the run (``run_active``). A replay serves the stored report only while the diff is unchanged.
         """
         self.ensure_ready()
         tool = catalog.RUN_STAGING_TESTS
         with self._lock():
             prod_tree, staging_tree = self._trees()
-            tested = diff_sha256_from_trees(prod_tree, staging_tree)
-            cached = self._replay(catalog.CODE_SERVER, tool, idempotency_key, lambda p: p["diff_sha256"] == tested)
+            staged = diff_sha256_from_trees(prod_tree, staging_tree)
+            cached = self._replay(catalog.CODE_SERVER, tool, idempotency_key, lambda p: p["diff_sha256"] == staged)
             if cached is not None:
                 return PytestReport.model_validate(cached)
-            outcome = run_pytest(self.staging_dir, self.root / PYTEST_SCRATCH_DIRNAME, pytest_k=pytest_k)
-            report = PytestReport(
-                exit_code=outcome.exit_code,
-                summary=outcome.summary,
-                output_tail=outcome.output_tail,
-                diff_sha256=tested,
-                duration_s=round(outcome.duration_s, 3),
+            with self._read() as conn:
+                seed = meta_get(conn, META_SEED) or DEFAULT_SEED
+        with deploy_slot(self.root):
+            outcome = run_staged_tests(
+                self.staging_dir,
+                acceptance_dir=acceptance_suite_dir(seed_path(seed)),
+                pytest_k=pytest_k,
+                allow_unsafe=self.settings.unsafe_no_sandbox,
             )
-            unchanged = self._current_diff() == tested
+        tested = diff_sha256_from_trees(prod_tree, outcome.tested_tree_sha256)
+        acceptance_passed = None if outcome.acceptance_exit_code is None else outcome.acceptance_exit_code == 0
+        report = PytestReport(
+            exit_code=outcome.exit_code,
+            summary=outcome.summary,
+            output_tail=outcome.output_tail,
+            diff_sha256=tested,
+            duration_s=round(outcome.duration_s, 3),
+            acceptance_passed=acceptance_passed,
+            acceptance_summary=outcome.acceptance_summary,
+            isolation=outcome.isolation,
+        )
+        if outcome.isolation == "none":
+            logger.warning("staged tests ran WITHOUT isolation (NO_QUIZ_UNSAFE_NO_SANDBOX): diff %s", tested)
+        earns_lock = report.passed and acceptance_passed is True and pytest_k is None
+        with self._lock():
+            still_staged = self._current_diff() == tested and prod_tree != outcome.tested_tree_sha256
             with self._write() as conn:
                 conn.execute(
                     "INSERT INTO pytest_runs (diff_sha256, record) VALUES (?, ?)", (tested, report.model_dump_json())
                 )
-                if report.passed and pytest_k is None and prod_tree != staging_tree and unchanged:
+                if earns_lock and still_staged:
                     ledger_record(conn, "tests_passed", tested, self._epoch(conn))
+                if outcome.isolation == "none":
+                    log_event(conn, "unsafe_no_sandbox", {"diff_sha256": tested, "tool": tool})
             self._remember(catalog.CODE_SERVER, tool, idempotency_key, report.model_dump(mode="json"))
-            return report
+        return report
 
     def get_diff_report(self) -> DiffReport:
         self.ensure_ready()
@@ -415,92 +458,80 @@ class SandboxWorkspace:
     ) -> dict[str, Any]:
         """Release staging to prod, only if the 4 locks hold for the diff recomputed now (else ``gate_locked``).
 
-        The release is a git commit of the staging tree, pushed fast-forward to the release remote BEFORE prod is
-        promoted: a refused or failed push raises (``conflict``, ``remote_diverged``, ``upstream_error``,
-        ``timeout``) and leaves prod and the ship log untouched. It REVOKES Lock 4 (``human_approved``): the human
-        must approve the same diff again (or reject it) before another push. The ``push_rejected`` fault refuses the
-        run's first push that way, as a retryable ``upstream_error``; ``push_unavailable`` refuses every push. The payload's ``release`` is the
-        ``ReleaseCommit`` (``commit_url`` is repeated at the top level). Its trailers carry the quiz attempts, the
-        applied rules and the thread of the change's ship log.
+        The release is a git commit of the approved staging tree, pushed fast-forward to the release remote BEFORE
+        prod is promoted, and prod is promoted from that very commit. The whole deploy holds the deploy slot (a second
+        deploy, a test run or a reset meanwhile is refused as ``run_active``); the workspace lock is released during
+        the network calls.
+
+        A refused or failed push raises (``conflict``, ``remote_diverged``, ``upstream_error``, ``timeout``), leaves
+        prod and the ship log untouched and REVOKES Lock 4 (``human_approved``): the human must approve the same diff
+        again, or reject it, before another push. When the outcome is unknown (``outcome_unknown``) the journal keeps
+        the release open and the next deploy asks the remote first: a push that did land is completed, never repeated.
+        The ``push_rejected`` fault refuses the run's first push as a retryable ``upstream_error``;
+        ``push_unavailable`` refuses every push. The payload's ``release`` is the ``ReleaseCommit`` (``commit_url`` is
+        repeated at the top level). Its trailers carry the quiz attempts, the applied rules and the thread of the
+        change's ship log.
         """
         self.ensure_ready()
-        tool = catalog.DEPLOY_TO_PRODUCTION
-        with self._lock():
-            cached = self._replay(
-                catalog.CODE_SERVER,
-                tool,
-                idempotency_key,
-                lambda payload: payload["deployed_diff_sha256"] == expected_diff_sha256,
-            )
-            if cached is not None:
-                return {**cached, "replayed": True}
-            prod_tree, staging_tree = self._trees()
-            current = diff_sha256_from_trees(prod_tree, staging_tree)
-            with self._read() as conn:
-                status = self._gate(conn, current, expected_diff_sha256)
-                documented = self._ship_log_for_diff(conn, current)
-                attempts = self._graded_count(conn)
-            if prod_tree == staging_tree or not status.can_deploy:
-                raise self._gate_locked(status, expected_diff_sha256, trees_identical=prod_tree == staging_tree)
-            thread = documented.thread_id if documented else None
-            try:
-                release = self.release.publish(
+        if (cached := self._replayed_deploy(expected_diff_sha256, idempotency_key)) is not None:
+            return cached
+        with deploy_slot(self.root):
+            self._reconcile_releases()  # an interrupted deploy is finished (or closed) before a new one starts
+            if (cached := self._replayed_deploy(expected_diff_sha256, idempotency_key)) is not None:
+                return cached  # the reconciliation just completed this very deploy
+            with self._lock():
+                prod_tree, staging_tree = self._trees()
+                current = diff_sha256_from_trees(prod_tree, staging_tree)
+                with self._read() as conn:
+                    status = self._gate(conn, current, expected_diff_sha256)
+                    documented = self._ship_log_for_diff(conn, current)
+                    attempts = self._graded_count(conn)
+                if prod_tree == staging_tree or not status.can_deploy:
+                    raise self._gate_locked(status, expected_diff_sha256, trees_identical=prod_tree == staging_tree)
+                thread = documented.thread_id if documented else None
+                thread = None if thread == catalog.DEFAULT_THREAD_ID else thread
+                prepared = self.release.prepare(
                     source_dir=self.staging_dir,
                     baseline_dir=self.prod_dir,
                     diff_sha256=current,
-                    prod_tree_sha256=staging_tree,
+                    approved_tree_sha256=staging_tree,
+                    baseline_tree_sha256=prod_tree,
                     release_note=release_note,
                     quiz_attempts=attempts,
                     applied_rules=documented.applied_rules if documented else (),
-                    thread_id=None if thread == catalog.DEFAULT_THREAD_ID else thread,
+                    thread_id=thread,
+                )
+                started = utc_now()
+                entry = ReleaseJournalEntry(
+                    diff_sha256=current,
+                    state="push_started",
+                    prod_tree_sha256=staging_tree,
+                    release_note=release_note,
+                    thread_id=thread,
+                    idempotency_key=idempotency_key,
+                    started_at=started,
+                    updated_at=started,
+                )
+                with self._write() as conn:
+                    journal_id = journal_append(conn, current, entry.state, entry.model_dump_json())
+
+            def intent(commit: ReleaseCommit) -> None:
+                """The commit about to be pushed: with it the journal can ask the remote what happened."""
+                nonlocal entry
+                entry = self._journal(journal_id, entry, release=commit)
+
+            try:  # network: the workspace lock is NOT held
+                release = self.release.publish(
+                    prepared,
+                    before_push=intent,
                     reject_push=lambda: self.fault_armed("push_unavailable") or self.consume_fault("push_rejected"),
                 )
             except WorkspaceError as error:
-                self._release_failed(current, error)
+                self._release_failed(journal_id, entry, error)
                 raise
-            self._swap_tree(self.prod_dir, lambda fresh: copy_tree(self.staging_dir, fresh), expected=staging_tree)
-            deployed_at = utc_now()
-            with self._write() as conn:
-                ledger_record(conn, "deployed", current, status.task_epoch)
-                self._start_epoch(conn)  # the task shipped: the next change gets fresh quiz attempts
-                meta_set(conn, f"{META_RELEASE_PREFIX}{current}", release.model_dump_json())
-                entry = self._ship_log_for_diff(conn, current)
-                if entry is not None:
-                    entry = entry.model_validate(
-                        {
-                            **entry.model_dump(),
-                            "status": "Deployed to Prod",
-                            "deployed_at": deployed_at,
-                            "release_commit_sha": release.commit_sha,
-                            "release_commit_url": release.commit_url,
-                        }
-                    )
-                    self._save_ship_log(conn, entry)
-                log_event(
-                    conn,
-                    "deploy",
-                    {
-                        "diff_sha256": current,
-                        "release_note": release_note,
-                        "release_commit_sha": release.commit_sha,
-                        "branch": release.branch,
-                        "remote": release.remote,
-                        "pushed": release.pushed,
-                    },
-                )
-            payload = {
-                "ok": True,
-                "deployed_diff_sha256": current,
-                "prod_tree_sha256": staging_tree,
-                "deployed_at": deployed_at.isoformat(),
-                "release_note": release_note,
-                "ship_log_status": entry.status if entry else None,
-                "release": release.model_dump(mode="json"),
-                "commit_url": release.commit_url,
-                "replayed": False,
-            }
-            self._remember(catalog.CODE_SERVER, tool, idempotency_key, payload)
-        if entry is not None:
+            entry = self._journal(journal_id, entry, state="pushed", release=release)
+            payload = self._complete_release(journal_id, entry)
+        if payload["ship_log_status"] is not None:
             self._push_ship_log(current, include_body=False)
         return payload
 
@@ -964,11 +995,152 @@ class SandboxWorkspace:
         meta_set(conn, META_BLOCKED_REASON, "")
         conn.execute("UPDATE quizzes SET state = ? WHERE state = ?", (QUIZ_SUPERSEDED, QUIZ_OPEN))
 
-    def _release_failed(self, diff_sha256: str, error: WorkspaceError) -> None:
-        """A publish that failed revokes Lock 4: the human approves the same diff again, or rejects it."""
-        with self._lock(), self._write() as conn:
-            ledger_revoke(conn, "human_approved", diff_sha256)
-            log_event(conn, "release_failed", {"diff_sha256": diff_sha256, "error": error.payload.model_dump()})
+    def _replayed_deploy(self, expected_diff_sha256: str, idempotency_key: str | None) -> dict[str, Any] | None:
+        """The stored answer of a deploy that already shipped this diff under this idempotency key, else None."""
+        with self._lock():
+            cached = self._replay(
+                catalog.CODE_SERVER,
+                catalog.DEPLOY_TO_PRODUCTION,
+                idempotency_key,
+                lambda payload: payload["deployed_diff_sha256"] == expected_diff_sha256,
+            )
+        return None if cached is None else {**cached, "replayed": True}
+
+    def _journal(self, journal_id: int, entry: ReleaseJournalEntry, **changes: Any) -> ReleaseJournalEntry:
+        """Write one step of a release to the journal; returns the updated entry."""
+        updated = entry.model_copy(update={**changes, "updated_at": utc_now()})
+        with self._write() as conn:
+            journal_update(conn, journal_id, updated.state, updated.model_dump_json())
+        return updated
+
+    def _release_failed(self, journal_id: int, entry: ReleaseJournalEntry, error: WorkspaceError) -> None:
+        """A publish that failed revokes Lock 4: the human approves the same diff again, or rejects it.
+
+        When the outcome is unknown the entry stays open with its error, for the next reconciliation to ask the
+        remote; otherwise nothing reached the remote and the entry is closed as ``failed``.
+        """
+        unknown = error.payload.outcome_unknown and entry.release is not None
+        with self._lock():
+            self._journal(journal_id, entry, state="push_started" if unknown else "failed", error=error.payload)
+            with self._write() as conn:
+                ledger_revoke(conn, "human_approved", entry.diff_sha256)
+                log_event(
+                    conn, "release_failed", {"diff_sha256": entry.diff_sha256, "error": error.payload.model_dump()}
+                )
+
+    def _complete_release(self, journal_id: int, entry: ReleaseJournalEntry) -> dict[str, Any]:
+        """Finish a release that is on the remote: promote prod from its commit, then ledger, ship log, journal.
+
+        Used by the deploy itself and by the reconciliation of an interrupted one; idempotent until the journal
+        entry is ``completed``. Returns the deploy payload (also stored under the entry's idempotency key).
+        """
+        release = entry.release
+        if release is None:
+            raise WorkspaceError("internal_error", "a release without a commit cannot be completed")
+        with self._lock():
+            self._swap_tree(
+                self.prod_dir,
+                lambda fresh: self.release.export_tree(release.commit_sha, fresh),
+                expected=entry.prod_tree_sha256,
+            )
+            deployed_at = utc_now()
+            with self._write() as conn:
+                ledger_record(conn, "deployed", entry.diff_sha256, self._epoch(conn))
+                self._start_epoch(conn)  # the task shipped: the next change gets fresh quiz attempts
+                meta_set(conn, f"{META_RELEASE_PREFIX}{entry.diff_sha256}", release.model_dump_json())
+                documented = self._ship_log_for_diff(conn, entry.diff_sha256)
+                if documented is not None:
+                    documented = documented.model_validate(
+                        {
+                            **documented.model_dump(),
+                            "status": "Deployed to Prod",
+                            "deployed_at": deployed_at,
+                            "release_commit_sha": release.commit_sha,
+                            "release_commit_url": release.commit_url,
+                        }
+                    )
+                    self._save_ship_log(conn, documented)
+                log_event(
+                    conn,
+                    "deploy",
+                    {
+                        "diff_sha256": entry.diff_sha256,
+                        "release_note": entry.release_note,
+                        "release_commit_sha": release.commit_sha,
+                        "branch": release.branch,
+                        "remote": release.remote,
+                        "pushed": release.pushed,
+                    },
+                )
+                payload = {
+                    "ok": True,
+                    "deployed_diff_sha256": entry.diff_sha256,
+                    "prod_tree_sha256": entry.prod_tree_sha256,
+                    "deployed_at": deployed_at.isoformat(),
+                    "release_note": entry.release_note,
+                    "ship_log_status": documented.status if documented else None,
+                    "release": release.model_dump(mode="json"),
+                    "commit_url": release.commit_url,
+                    "replayed": False,
+                }
+                if entry.idempotency_key is not None:
+                    idempotency_put(
+                        conn, catalog.CODE_SERVER, catalog.DEPLOY_TO_PRODUCTION, entry.idempotency_key, payload
+                    )
+                completed = entry.model_copy(update={"state": "completed", "updated_at": deployed_at})
+                journal_update(conn, journal_id, completed.state, completed.model_dump_json())
+        return payload
+
+    def _reconcile_releases(self) -> None:
+        """Finish or close every release an interrupted deploy left open. The caller holds the deploy slot.
+
+        ``pushed``: the commit is on the remote, so prod, ledger and ship log are completed locally. ``push_started``:
+        the remote is asked (network, no workspace lock) whether the journaled commit landed; if it did the release
+        is completed, never pushed again; if not, or if the deploy died before building a commit, the entry is closed
+        as ``failed`` and an approval that no error handler revoked is revoked now.
+        """
+        with self._read() as conn:
+            open_entries = journal_open_entries(conn)
+        for journal_id, record in open_entries:
+            entry = ReleaseJournalEntry.model_validate_json(record)
+            if entry.state == "push_started":
+                if entry.release is not None:
+                    self._require_same_remote(entry.release)
+                if entry.release is None or not self.release.remote_has_commit(entry.release.commit_sha):
+                    with self._lock():
+                        self._journal(journal_id, entry, state="failed")
+                        if entry.error is None:  # the deploy died mid-flight: its approval was never revoked
+                            with self._write() as conn:
+                                ledger_revoke(conn, "human_approved", entry.diff_sha256)
+                    continue
+                entry = self._journal(journal_id, entry, state="pushed")
+            self._complete_release(journal_id, entry)
+            logger.warning("completed the interrupted release of diff %s from the journal", entry.diff_sha256)
+
+    def _reconcile_if_idle(self) -> None:
+        """Reconcile the release journal unless a deploy is in flight; a failure is postponed, never raised.
+
+        The next ``deploy_to_production`` reconciles again and reports the error to its caller.
+        """
+        with self._read() as conn:
+            if not journal_open_entries(conn):
+                return
+        try:
+            with deploy_slot(self.root):
+                self._reconcile_releases()
+        except WorkspaceError as error:  # the slot is busy, or the remote cannot be asked right now
+            logger.warning("release reconciliation postponed: %s", error.payload.message)
+
+    def _require_same_remote(self, release: ReleaseCommit) -> None:
+        """An open release can only be reconciled against the remote and branch it was pushed to."""
+        remote = self.release.resolve_remote()
+        if (release.remote, release.branch) != (remote.display, self.settings.git_branch):
+            raise WorkspaceError(
+                "conflict",
+                "An interrupted release is still open on another release remote or branch: restore that "
+                "configuration so it can be reconciled, or reset the workspace.",
+                details={"open_release_branch": release.branch, "diff_sha256": release.diff_sha256},
+            )
 
     def _gate_locked(self, status: DeployGateStatus, expected: str, *, trees_identical: bool) -> WorkspaceError:
         if trees_identical:

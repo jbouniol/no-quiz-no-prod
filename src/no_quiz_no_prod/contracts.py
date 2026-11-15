@@ -871,7 +871,7 @@ class PytestReport(ContractModel):
     run, or the agent's tests already failed). Its output never includes the suite's source.
     """
 
-    exit_code: int  # 0 only if every suite that ran passed (the sandbox folds a red acceptance suite into it)
+    exit_code: int  # the agent's suite (staging/test_fintech.py)
     summary: str  # pytest's final summary line, e.g. "14 passed in 0.31s"
     output_tail: str = ""  # bounded tail of the agent suite's output, for the model and the UI banner
     diff_sha256: Sha256Hex  # the workspace diff the tests ran against
