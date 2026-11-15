@@ -1,7 +1,8 @@
-"""CLI entry point for the 30-scenario No-Quiz-No-Prod Golden Set evaluation harness.
+"""CLI entry point of the No-Quiz-No-Prod evaluation harness (see eval/README.md).
 
 Usage:
-    uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/
+    uv run python eval/run_eval.py --dry-run
+    uv run python eval/run_eval.py --scenario-set heldout
 """
 
 from __future__ import annotations

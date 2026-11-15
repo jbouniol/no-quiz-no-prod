@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "03_git_release_dual_deepseek",
+  "description": "Primary cohort re-run on the 31-scenario set after deploys became git releases (pushed is scored). Not judged. Formerly eval/results.jsonl and eval/summary.md.",
+  "created_at": null,
+  "git_commit": null,
+  "git_dirty": null,
+  "recorded_in_commit": "9c7ed2d",
+  "scenario_set": "dev",
+  "scenario_file_sha256": "4af669e8adb0ab5937121fb6d35c2ebce892967a4b2843b83c8d27fcaa709595",
+  "scenario_count": 31,
+  "repeats": 1,
+  "dry_run": false,
+  "push_scored": true,
+  "stop_reason_scored": false,
+  "cohorts": [
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results.jsonl",
+      "rows": 31
+    }
+  ],
+  "judge": null,
+  "cli_args": [],
+  "stale": true,
+  "stale_reason": "Recorded with the system prompts that enumerated the scenario classes, before the stop reason was scored, and on an earlier scenario file (see scenario_file_sha256). Not comparable with a run of the current harness; kept as a historical record only."
+}
