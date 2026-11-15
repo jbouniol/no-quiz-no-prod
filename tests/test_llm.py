@@ -33,7 +33,7 @@ from no_quiz_no_prod.llm import (
     tool_result_message,
 )
 
-SETTINGS = RuntimeSettings(openrouter_api_key="sk-or-test", anthropic_api_key="sk-ant-test")  # type: ignore[arg-type]
+SETTINGS = RuntimeSettings(openrouter_api_key="sk-or-test", anthropic_api_key="sk-ant-test")
 MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Hi"}]
 TOOL = function_tool("read_code_file", "Read a file.", {"type": "object", "properties": {"path": {"type": "string"}}})
 

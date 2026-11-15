@@ -174,6 +174,7 @@ class FakeBackend:
         self.ledger = GateLedger()
         self.idem: dict[tuple[str, str], dict[str, Any]] = {}
         self.ship_logs: dict[str, ShipLogEntry] = {}
+        self.synced_ship_logs: set[str] = set()
         self.quizzes: dict[str, QuizQuestion] = {}
         self.latest_quiz: dict[str, str] = {}
         self.pytest: PytestReport | None = None
@@ -229,6 +230,10 @@ class FakeBackend:
         if thread_id is not None:
             return self.ship_logs.get(thread_id)
         return next(reversed(self.ship_logs.values()), None)
+
+    def sync_ship_log(self, diff_sha256: str) -> ShipLogEntry | None:
+        self.synced_ship_logs.add(diff_sha256)
+        return next((log for log in self.ship_logs.values() if log.diff_sha256 == diff_sha256), None)
 
     def get_latest_private_quiz(
         self, thread_id: str | None = None, diff_sha256: str | None = None
@@ -295,7 +300,7 @@ class FakeBackend:
         return len(keys)
 
     def _skill(self, user_id: str, tag: str) -> SkillProfileRecord:
-        return self.skills.get((user_id, tag)) or SkillProfileRecord(skill_tag=tag, user_id=user_id)  # type: ignore[arg-type]
+        return self.skills.get((user_id, tag)) or SkillProfileRecord(skill_tag=tag, user_id=user_id)
 
     # -- the 11 MCP tools (#14 §3), dispatched in process ------------------------------------------------------------
     def __call__(self, server: str, tool: str, args: dict[str, Any]) -> Any:
@@ -407,8 +412,10 @@ class FakeBackend:
             approved = [sha for sha in self.ledger.human_approved if sha != diff.diff_sha256]
             self.ledger = self.ledger.model_copy(update={"human_approved": approved})
             raise ToolCallError(self.push_error)
-        if self.fault == "push_rejected" and not self.fault_fired:  # refused once, retryable, nothing pushed
+        if self.fault == "push_unavailable" or (self.fault == "push_rejected" and not self.fault_fired):
             self.fault_fired = True
+            approved = [sha for sha in self.ledger.human_approved if sha != diff.diff_sha256]
+            self.ledger = self.ledger.model_copy(update={"human_approved": approved})
             payload = ToolErrorPayload(code="upstream_error", message="push rejected (injected)", retryable=True)
             raise ToolCallError(payload)
         shutil.copytree(self.root / "staging", self.root / "prod", dirs_exist_ok=True)
@@ -616,6 +623,7 @@ def test_happy_path_pass_first_try_completes(tmp_path: Path, backend: FakeBacken
     )
     assert {"step", "artifact_updated"} <= {event.type for event in events}
     assert sum(event.type == "run_completed" for event in events) == 3  # quiz pause, deploy pause, terminal
+    assert gated.interrupt.gate.diff_sha256 in backend.synced_ship_logs
 
 
 def test_run_scenario_pass_first_try_scores_pass(tmp_path: Path, backend: FakeBackend) -> None:
@@ -763,6 +771,7 @@ def test_an_unanswered_deploy_is_reconciled_with_the_workspace_before_concluding
     done = workflow.submit_deploy_decision("t-lost", approve(sha))
     assert done.stop_reason == "completed" and done.final_state.deployed and done.pending_release is None
     assert "workspace confirms" in done.final_answer and done.trace[-1].error is not None
+    assert sha in backend.synced_ship_logs
 
 
 def test_an_unanswered_deploy_that_did_not_land_asks_the_human_again(tmp_path: Path, backend: FakeBackend) -> None:
@@ -1022,14 +1031,17 @@ def test_rate_limit_is_retried_transparently(tmp_path: Path, backend: FakeBacken
 
 
 def test_a_rejected_push_is_retried_by_the_harness_with_the_same_key(tmp_path: Path, backend: FakeBackend) -> None:
+    # Under C8 a failed push revokes Lock 4 (no silent retry on the first approval): release_gate asks the human again
+    # and the re-approved call carries the SAME idempotency key.
     workflow = make_workflow(tmp_path, backend, ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A")))
     result = workflow.run_scenario(scenario(fault="push_rejected", max_steps=14))
     assert result.passed and result.stop_reason == "completed" and result.final_state.deployed, result.why
-    (deploy,) = [entry for entry in result.trace if entry.tool == "deploy_to_production"]
-    assert deploy.agent == "system" and deploy.ok and deploy.attempts == 2 and deploy.idempotency_key
-    assert [entry.agent for entry in result.trace].count("human") == 2  # quiz + one approval: no new human action
+    first, second = [entry for entry in result.trace if entry.tool == "deploy_to_production"]
+    assert not first.ok and first.error is not None and first.error.code == "upstream_error"
+    assert second.agent == "system" and second.ok and second.idempotency_key == first.idempotency_key
+    assert [entry.agent for entry in result.trace].count("human") == 3  # quiz + initial approval + release re-approval
     keys = [args["idempotency_key"] for tool, args in backend.calls if tool == "deploy_to_production"]
-    assert keys == [deploy.idempotency_key] * 2 and len(backend.ledger.deployed) == 1  # deployed once
+    assert keys == [second.idempotency_key] * 2 and len(backend.ledger.deployed) == 1  # deployed once
 
 
 def test_hallucinated_deploy_is_refused_by_the_harness(tmp_path: Path, backend: FakeBackend) -> None:
@@ -1468,23 +1480,29 @@ def test_a_broken_release_configuration_stops_the_run_before_any_agent(tmp_path:
 def test_each_stdio_server_gets_only_its_own_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "NOTION_API_KEY", "NO_QUIZ_GITHUB_TOKEN"):
         monkeypatch.setenv(name, f"parent-{name}")  # whatever the harness process holds must not be inherited
+    monkeypatch.setenv("NO_QUIZ_ENV_FILE", str(tmp_path / "custom.env"))
     settings = RuntimeSettings(
         workspace_dir=tmp_path,
-        openrouter_api_key="sk-or-llm",  # type: ignore[arg-type]
-        anthropic_api_key="sk-ant-llm",  # type: ignore[arg-type]
-        notion_api_key="ntn-notion",  # type: ignore[arg-type]
-        github_token="ghp-release",  # type: ignore[arg-type]
+        openrouter_api_key="sk-or-llm",
+        anthropic_api_key="sk-ant-llm",
+        notion_api_key="ntn-notion",
+        github_token="ghp-release",
         git_remote_url="https://github.com/acme/releases.git",
     )
     bridge = StdioMCPBridge(settings)
     code, notion = (bridge.server_parameters(server).env or {} for server in ("code-mcp", "notion-quiz-mcp"))
     for env in (code, notion):
         assert env["OPENROUTER_API_KEY"] == "" and env["ANTHROPIC_API_KEY"] == ""  # set EMPTY: .env cannot refill
-        assert not any(value.startswith(("parent-", "sk-")) for value in env.values())
+        assert not any(value.startswith(("parent-", "sk-", "ntn-", "ghp-")) for value in env.values())
         assert env["NO_QUIZ_WORKSPACE_DIR"] == str(tmp_path)
-    assert notion["NOTION_API_KEY"] == "ntn-notion" and code["NOTION_API_KEY"] == ""
-    assert notion["NO_QUIZ_GITHUB_TOKEN"] == "" and notion["NO_QUIZ_GIT_REMOTE_URL"] == ""
-    assert code["NO_QUIZ_GIT_REMOTE_URL"] == "https://github.com/acme/releases.git"
+        assert env["NO_QUIZ_ENV_FILE"] == str(tmp_path / "custom.env")
+    # Held allow-listed secrets are omitted from launch env (read from .env at runtime); non-allowed ones are blanked.
+    assert "NOTION_API_KEY" not in notion and code["NOTION_API_KEY"] == ""
+    assert "NO_QUIZ_GITHUB_TOKEN" not in code and notion["NO_QUIZ_GITHUB_TOKEN"] == ""
+    assert (
+        notion["NO_QUIZ_GIT_REMOTE_URL"] == ""
+        and code["NO_QUIZ_GIT_REMOTE_URL"] == "https://github.com/acme/releases.git"
+    )
     assert "ghp-release" not in " ".join(bridge.server_parameters("code-mcp").args)
 
 

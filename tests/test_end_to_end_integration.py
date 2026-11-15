@@ -20,6 +20,7 @@ import signal
 import subprocess
 import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -44,7 +45,7 @@ from no_quiz_no_prod.contracts import ALL_DEPLOY_LOCKS, RuntimeSettings, Topolog
 from no_quiz_no_prod.graph.mcp_bridge import MCP_SERVER_LOG_FILENAME, StdioMCPBridge
 from no_quiz_no_prod.graph.workflow import NoQuizWorkflow
 from no_quiz_no_prod.llm import ChatTurnResponse
-from no_quiz_no_prod.ui.server import create_app
+from no_quiz_no_prod.ui.server import create_app, same_origin_client_kwargs
 
 USER: Final = "dev_e2e"
 THREAD: Final = "thr_e2e_remediation"
@@ -125,6 +126,7 @@ class LiveStudio:
     client: TestClient
     llm: ScriptedLLM
     settings: RuntimeSettings
+    workspace: SandboxWorkspace
     workflows: list[NoQuizWorkflow]
 
     @property
@@ -153,29 +155,41 @@ class LiveStudio:
         listing = self.remote_git("for-each-ref", "--format=%(objectname)", ref)  # reads the bare remote's own refs
         return listing or None
 
-    def stream_run(self) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
-        payload = {"prompt": TASK, "thread_id": THREAD, "user_id": USER, "model": SCRIPTED_MODEL, "topology": "dual"}
+    def stream_run(self, thread_id: str = THREAD) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+        payload = {"prompt": TASK, "thread_id": thread_id, "user_id": USER, "model": SCRIPTED_MODEL, "topology": "dual"}
         response = self.client.post("/api/runs/stream", json=payload)
         assert response.status_code == 200 and response.headers["content-type"].startswith("text/event-stream")
         return response.text, parse_sse_events(response.text)
 
-    def answer(self, option: str) -> dict[str, Any]:
-        response = self.client.post(f"/api/runs/{THREAD}/quiz", json={"selected_option": option, "user_id": USER})
+    def answer(self, option: str, *, thread_id: str = THREAD) -> dict[str, Any]:
+        response = self.client.post(f"/api/runs/{thread_id}/quiz", json={"selected_option": option, "user_id": USER})
         assert response.status_code == 200, response.text
         return response.json()
 
-    def approve(self, expected_diff_sha256: str | None = None) -> httpx2.Response:
-        body = {"action": "approve", "user_id": USER, "reason": "e2e reviewer"}
-        if expected_diff_sha256 is not None:
-            body["expected_diff_sha256"] = expected_diff_sha256
-        return self.client.post(f"/api/runs/{THREAD}/deploy", json=body)
+    def approve(self, expected_diff_sha256: str, *, thread_id: str = THREAD) -> httpx2.Response:
+        body = {
+            "action": "approve",
+            "expected_diff_sha256": expected_diff_sha256,
+            "user_id": USER,
+            "reason": "e2e reviewer",
+        }
+        return self.client.post(f"/api/runs/{thread_id}/deploy", json=body)
+
+    def reject(self, expected_diff_sha256: str, *, thread_id: str = THREAD) -> httpx2.Response:
+        body = {
+            "action": "reject",
+            "expected_diff_sha256": expected_diff_sha256,
+            "user_id": USER,
+            "reason": "e2e rejector",
+        }
+        return self.client.post(f"/api/runs/{thread_id}/deploy", json=body)
 
 
-@pytest.fixture
-def live_studio(tmp_path: Path) -> Iterator[LiveStudio]:
+@contextmanager
+def open_studio(tmp_path: Path, llm: ScriptedLLM) -> Iterator[LiveStudio]:
     settings = RuntimeSettings(workspace_dir=tmp_path / "workspace")  # no Notion key: no live DB write-through
-    llm = ScriptedLLM(coder=coder_script(), examiner=examiner_script(1, QUIZ_1) + examiner_script(2, QUIZ_2))
     workflows: list[NoQuizWorkflow] = []
+    workspace = SandboxWorkspace(settings)
 
     def workflow_factory(run_settings: RuntimeSettings, topology: Topology, model: str) -> NoQuizWorkflow:
         workflow = NoQuizWorkflow(
@@ -184,13 +198,20 @@ def live_studio(tmp_path: Path) -> Iterator[LiveStudio]:
         workflows.append(workflow)
         return workflow
 
-    app = create_app(settings=settings, workspace=SandboxWorkspace(settings), workflow_factory=workflow_factory)
+    app = create_app(settings=settings, workspace=workspace, workflow_factory=workflow_factory)
     try:
-        with TestClient(app) as client:
-            yield LiveStudio(client=client, llm=llm, settings=settings, workflows=workflows)
+        with TestClient(app, **same_origin_client_kwargs(app)) as client:
+            yield LiveStudio(client=client, llm=llm, settings=settings, workspace=workspace, workflows=workflows)
     finally:
         for workflow in workflows:  # both stdio MCP servers stop before tmp_path is removed
             workflow.close()
+
+
+@pytest.fixture
+def live_studio(tmp_path: Path) -> Iterator[LiveStudio]:
+    llm = ScriptedLLM(coder=coder_script(), examiner=examiner_script(1, QUIZ_1) + examiner_script(2, QUIZ_2))
+    with open_studio(tmp_path, llm) as studio:
+        yield studio
 
 
 def skill_record(records: list[dict[str, Any]], tag: str = SKILL) -> dict[str, Any]:
@@ -241,8 +262,10 @@ def test_studio_drives_remediation_to_production_over_real_stdio_mcp(live_studio
     assert isinstance(live_studio.workflow.bridge, StdioMCPBridge)
     assert (live_studio.settings.workspace_dir / MCP_SERVER_LOG_FILENAME).is_file()
 
-    # 2. A premature approval is refused server-side: Lock 3 (quiz) is missing
-    assert_gate_locked(live_studio.approve(), "quiz_passed")
+    # 2. A missing diff hash gets 422; a premature approval is refused server-side because Lock 3 (quiz) is missing
+    missing_hash = client.post(f"/api/runs/{THREAD}/deploy", json={"action": "approve", "user_id": USER})
+    assert missing_hash.status_code == 422
+    assert_gate_locked(live_studio.approve(diff_sha), "quiz_passed")
     assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
 
     # 3. Wrong answer -> Layer 4 "Weakness Detected" -> a fresh Examiner publishes doc v2 + a new quiz 2
@@ -333,12 +356,71 @@ def test_gate_answers_409_when_nothing_is_staged_or_resumable(live_studio: LiveS
     client = live_studio.client
     seed_prod = client.post("/api/reset", json={"user_id": USER, "reset_skill_memory": True}).json()["prod_tree_sha256"]
 
-    assert_gate_locked(live_studio.approve(), "tests_passed")  # staging == prod: nothing to ship
+    assert_gate_locked(live_studio.approve(WRONG_SHA), "tests_passed")  # staging == prod: nothing to ship
     unknown_quiz = client.post(f"/api/runs/{THREAD}/quiz", json={"selected_option": "A", "user_id": USER})
-    assert_gate_locked(unknown_quiz)  # no paused quiz interrupt on this thread
+    assert unknown_quiz.status_code == 409 and unknown_quiz.json()["code"] == "conflict"
+    unknown_reject = live_studio.reject(WRONG_SHA)
+    assert unknown_reject.status_code == 409 and unknown_reject.json()["code"] == "conflict"
 
     assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
     assert live_studio.llm.calls == []  # refused before any agent ran
+
+
+def test_failed_push_revokes_approval_and_supports_reapproval_or_rejection_over_stdio(tmp_path: Path) -> None:
+    """C8 / AG-08 / AG-37D / AG-40D over real stdio MCP + SandboxWorkspace:
+    1) ``push_rejected`` revokes Lock 4 and pauses on ``release_retry`` (409 ``upstream_error``, never ``gate_locked``);
+       a second human approval ships the same diff.
+    2) ``push_unavailable`` pauses on ``release_retry``; a human rejection blocks the task epoch cleanly.
+    """
+    llm = ScriptedLLM(
+        coder=coder_script() + coder_script(),
+        examiner=examiner_script(1, QUIZ_1) + examiner_script(1, QUIZ_1),
+    )
+    with open_studio(tmp_path, llm) as studio:
+        # Part 1: failed push -> Lock 4 revoked -> re-approve -> deployed
+        t_retry = "thr_e2e_push_retry"
+        studio.client.post("/api/reset", json={"user_id": USER, "reset_skill_memory": True})
+        seed_prod = studio.workspace.reset(fault="push_rejected").prod_tree_sha256
+        _, frames = studio.stream_run(t_retry)
+        diff_sha = frames[-1][1]["interrupt"]["quiz"]["diff_sha256"]
+        assert studio.answer("A", thread_id=t_retry)["interrupt"]["kind"] == "deploy_approval"
+
+        failed = studio.approve(diff_sha, thread_id=t_retry)
+        assert failed.status_code == 409, failed.text
+        failed_body = failed.json()
+        assert failed_body["code"] == "upstream_error" and failed_body["retryable"] is True
+        assert failed_body["deployed"] is False and failed_body["interrupt"]["kind"] == "release_retry"
+        assert failed_body["pending_release"]["attempts"] == 1
+        assert failed_body["locks"]["missing_locks"] == ["human_approved"]  # Lock 4 was revoked on the server
+        assert studio.prod_tree() == seed_prod and studio.release_tip() is None
+
+        shipped = studio.approve(diff_sha, thread_id=t_retry)
+        assert shipped.status_code == 200, shipped.text
+        shipped_body = shipped.json()
+        assert shipped_body["deployed"] is True and shipped_body["stop_reason"] == "completed"
+        first_tip = studio.release_tip()
+        assert first_tip is not None and studio.prod_tree() != seed_prod
+
+        # Part 2: failed push -> human rejects on release_retry -> epoch blocked
+        t_reject = "thr_e2e_push_reject"
+        studio.client.post("/api/reset", json={"user_id": USER, "reset_skill_memory": True})
+        reset_prod = studio.workspace.reset(fault="push_unavailable").prod_tree_sha256
+        _, frames_2 = studio.stream_run(t_reject)
+        diff_sha_2 = frames_2[-1][1]["interrupt"]["quiz"]["diff_sha256"]
+        assert studio.answer("A", thread_id=t_reject)["interrupt"]["kind"] == "deploy_approval"
+
+        unavailable = studio.approve(diff_sha_2, thread_id=t_reject)
+        assert unavailable.status_code == 409 and unavailable.json()["interrupt"]["kind"] == "release_retry"
+
+        rejected = studio.reject(diff_sha_2, thread_id=t_reject)
+        assert rejected.status_code == 200, rejected.text
+        rejected_body = rejected.json()
+        assert rejected_body["deployed"] is False and rejected_body["stop_reason"] == "human_rejected"
+        assert rejected_body["locks"]["blocked"] is True
+        assert rejected_body["locks"]["blocked_reason"] == "human_rejected"
+        assert rejected_body["ship_log"]["status"] == "Blocked"
+        assert_gate_locked(studio.approve(diff_sha_2, thread_id=t_reject))
+        assert studio.prod_tree() == reset_prod
 
 
 def test_a_killed_mcp_server_is_respawned_and_the_run_goes_on(tmp_path: Path) -> None:

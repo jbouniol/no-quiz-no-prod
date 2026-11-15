@@ -312,18 +312,16 @@ class StdioMCPBridge(_SessionBridge):
     def server_parameters(self, server: McpServerName) -> StdioServerParameters:
         """``python -m <module>`` bound to this run's workspace, with a least-privilege environment.
 
-        ``settings.environment_for(server)`` gives each server only its allow-listed variables and sets every other
-        project variable EMPTY, which also stops the server from reading it back from ``.env``: no LLM key for
-        either server, the release remote and token only for the one that publishes, the Notion key only for the
-        Notion server. Values always follow the harness settings (e.g. updated by the Studio), never the parent's
-        environment; the token travels in the child's environment only, never in argv. ``NO_QUIZ_ENV_FILE`` (which
-        ``.env`` to load, not a secret) is inherited when set.
+        ``settings.environment_for(server)`` passes non-secret allow-listed settings explicitly, blanks every
+        non-allowed variable so the server cannot read it back from ``.env``, omits held allow-listed secrets so no
+        secret appears in the child's launch environment or argv (the server reads its own secret from ``.env`` at
+        runtime), and forwards ``NO_QUIZ_ENV_FILE`` when set.
         """
-        env = self.settings.environment_for(server)
-        if env_file := os.environ.get(EnvVar.NO_QUIZ_ENV_FILE.value):
-            env[EnvVar.NO_QUIZ_ENV_FILE.value] = env_file
         return StdioServerParameters(
-            command=sys.executable, args=["-m", MCP_SERVER_MODULES[server]], env=env, cwd=str(PROJECT_ROOT)
+            command=sys.executable,
+            args=["-m", MCP_SERVER_MODULES[server]],
+            env=self.settings.environment_for(server),
+            cwd=str(PROJECT_ROOT),
         )
 
     async def _open(self, stack: AsyncExitStack, server: McpServerName) -> ClientSession:

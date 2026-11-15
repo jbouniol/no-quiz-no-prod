@@ -225,6 +225,8 @@ class WorkspaceHarness(Protocol):
 
     def get_latest_ship_log(self, thread_id: str | None = None) -> ShipLogEntry | None: ...
 
+    def sync_ship_log(self, diff_sha256: str) -> ShipLogEntry | None: ...
+
     def get_latest_private_quiz(
         self, thread_id: str | None = None, diff_sha256: str | None = None
     ) -> QuizQuestion | None: ...
@@ -428,7 +430,7 @@ def _parse_quiz_answer(value: Any) -> QuizAnswer:
     option = value.get("selected_option") if isinstance(value, Mapping) else value
     if not isinstance(option, str):
         raise ValueError("a quiz answer needs selected_option")
-    return QuizAnswer(selected_option=option.strip().upper())  # type: ignore[arg-type]
+    return QuizAnswer(selected_option=option.strip().upper())
 
 
 def _release_suffix(result: Any) -> str:
@@ -929,7 +931,9 @@ class NoQuizWorkflow:
         args = {"expected_diff_sha256": release.expected_diff_sha256, "release_note": release.release_note}
         key = release.idempotency_key or idem_key(thread_id, "deploy_to_production", args)
         started = time.perf_counter()
-        outcome, attempts = self._call_with_retry("deploy_to_production", args, key)
+        # One call per human sign-off (C8): a failed release revokes Lock 4 on the server, so any retry goes through
+        # release_gate for a fresh human approval with the same idempotency key, never a silent loop here.
+        outcome = self.bridge.call("deploy_to_production", {**args, IDEMPOTENCY_ARG: key})
         system = ToolCallTrace(
             step=human.step + 1,
             agent="system",
@@ -940,20 +944,23 @@ class NoQuizWorkflow:
             error=outcome.error,
             latency_s=time.perf_counter() - started,
             idempotency_key=key,
-            attempts=attempts,
+            attempts=1,
             replayed=outcome.replayed,
         )
         self._emit(thread_id, "step", step=system, budget=budget)
-        self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=locks)
         trace = [human.model_dump(mode="json"), system.model_dump(mode="json")]
         error = outcome.error
-        if error is None:
-            answer = DEPLOYED.format(sha=sha) + _release_suffix(outcome.result)
-            return _finish("completed", answer, trace=trace, pending_release=None)
-        if error.outcome_unknown and self.workspace.snapshot_final_state(thread_id).deployed:
-            return _finish(
-                "completed", DEPLOYED.format(sha=sha) + CONFIRMED_AFTER_LOST_ANSWER, trace=trace, pending_release=None
-            )
+        reconciled = (
+            error is not None and error.outcome_unknown and self.workspace.snapshot_final_state(thread_id).deployed
+        )
+        if error is None or reconciled:
+            self.workspace.sync_ship_log(release.expected_diff_sha256)
+            self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=locks)
+            suffix = CONFIRMED_AFTER_LOST_ANSWER if reconciled else _release_suffix(outcome.result)
+            return _finish("completed", DEPLOYED.format(sha=sha) + suffix, trace=trace, pending_release=None)
+        post_locks = self.workspace.get_gate_status(release.expected_diff_sha256)
+        self._emit_artifacts(thread_id, budget, ("diff", "ship_log"), locks=post_locks)
+        assert error is not None
         if error.code not in RELEASE_RETRY_CODES:  # a lock no longer holds (or the call itself was invalid)
             return _finish("refused", GATE_REFUSED.format(message=error.message), trace=trace, pending_release=None)
         failed = release.model_copy(update={"error": error, "idempotency_key": key})
