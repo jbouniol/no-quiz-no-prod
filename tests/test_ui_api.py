@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1654,14 +1654,14 @@ def _raw_asgi_request(
         chunks: list[bytes] = []
         delivered = False
 
-        async def receive() -> dict[str, Any]:
+        async def receive() -> MutableMapping[str, Any]:
             nonlocal delivered
             if not delivered:
                 delivered = True
                 return {"type": "http.request", "body": body, "more_body": False}
             return {"type": "http.disconnect"}
 
-        async def send(message: dict[str, Any]) -> None:
+        async def send(message: MutableMapping[str, Any]) -> None:
             nonlocal sent_status
             if message["type"] == "http.response.start":
                 sent_status = int(message["status"])
