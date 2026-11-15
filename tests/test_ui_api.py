@@ -1453,7 +1453,7 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
     def workflow_factory(run_settings: RuntimeSettings, topology: Topology, model: str) -> NoQuizWorkflow:
         workflow = NoQuizWorkflow(
             settings=run_settings,
-            llm_client=llm,  # type: ignore[arg-type]
+            llm_client=llm,
             topology=topology,
             model=model,
             mcp_transport="inprocess",
@@ -1815,7 +1815,7 @@ def test_reject_after_failed_push_blocks_epoch_and_keeps_prod_untouched(tmp_path
     def workflow_factory(run_settings: RuntimeSettings, topology: Topology, model: str) -> NoQuizWorkflow:
         workflow = NoQuizWorkflow(
             settings=run_settings,
-            llm_client=llm,  # type: ignore[arg-type]
+            llm_client=llm,
             topology=topology,
             model=model,
             mcp_transport="inprocess",
@@ -1944,3 +1944,22 @@ def test_run_stream_validates_release_config_before_starting_workflow(tmp_path: 
     assert resp.json()["code"] == "invalid_argument"
     assert called == []
     assert studio_of(client).busy is None
+
+
+def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(tmp_path: Path) -> None:
+    """With eval/results*.jsonl moved into eval/campaigns/, default create_app() loads LATEST_CAMPAIGN_DIR and manifest."""
+    settings = RuntimeSettings(workspace_dir=tmp_path / "ws")
+    app = create_app(
+        settings=settings,
+        workspace=StubSandboxWorkspace(settings),
+        env_file=tmp_path / ".env",
+    )
+    client = page_client(app)
+    res = client.get("/api/eval/results")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["available"] is True
+    assert body["summary"]["total_runs"] == 31
+    assert body["stale"] is True
+    assert isinstance(body["stale_reason"], str) and len(body["stale_reason"]) > 20
+    assert any("eval/campaigns/03_git_release_dual_deepseek/" in src for src in body["source_files"])

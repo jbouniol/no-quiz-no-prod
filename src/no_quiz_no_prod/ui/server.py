@@ -74,6 +74,8 @@ from no_quiz_no_prod.contracts import (
     pass_at_k,
     pass_hat_k,
 )
+from no_quiz_no_prod.eval.manifest import load_manifest
+from no_quiz_no_prod.eval.paths import LATEST_CAMPAIGN_DIR, RUNS_DIR
 from no_quiz_no_prod.eval.scorer import is_hidden_failure
 from no_quiz_no_prod.ui.security import (
     ALLOWED_HOSTS_ENV,
@@ -495,6 +497,15 @@ def _pending_release_of(outcome: WorkflowOutcomeLike) -> PendingRelease | None:
     return outcome.pending_release
 
 
+def _resolve_default_eval_dir() -> Path:
+    """Newest run directory under ``eval/runs/`` that holds result rows, else ``LATEST_CAMPAIGN_DIR``."""
+    if RUNS_DIR.is_dir():
+        for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
+            if run_dir.is_dir() and ((run_dir / "results.jsonl").is_file() or any(run_dir.glob("results_*.jsonl"))):
+                return run_dir
+    return LATEST_CAMPAIGN_DIR
+
+
 def _sse_frame(event: RunEvent) -> str:
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
@@ -541,7 +552,8 @@ class StudioManager:
         self.settings = settings or RuntimeSettings.from_env()
         self._workspace = workspace
         self._workflow_factory = workflow_factory or _default_workflow_factory
-        self.eval_dir = eval_dir or (PROJECT_ROOT / "eval")
+        self._explicit_eval_dir = eval_dir
+        self.eval_dir = eval_dir or _resolve_default_eval_dir()
         self.notion_ids_file = notion_ids_file or NOTION_IDS_FILE
         self.env_file = env_file or ENV_FILE
         self.sessions: dict[str, _ThreadSession] = {}
@@ -747,12 +759,23 @@ class StudioManager:
         }
 
     def load_eval_results(self) -> dict[str, Any]:
+        target_dir = self._explicit_eval_dir or _resolve_default_eval_dir()
+        self.eval_dir = target_dir
+        manifest = None
+        if target_dir.is_dir():
+            try:
+                manifest = load_manifest(target_dir)
+            except (OSError, ValidationError, ValueError):
+                manifest = None
+        stale = bool(manifest.stale) if manifest is not None else False
+        stale_reason = manifest.stale_reason if manifest is not None else None
+
         candidate_files: list[Path] = []
-        if self.eval_dir.is_dir():
-            primary = self.eval_dir / "results.jsonl"
+        if target_dir.is_dir():
+            primary = target_dir / "results.jsonl"
             if primary.is_file():
                 candidate_files.append(primary)
-            for extra in sorted(self.eval_dir.glob("results_*.jsonl")):
+            for extra in sorted(target_dir.glob("results_*.jsonl")):
                 if extra.is_file() and extra != primary:
                     candidate_files.append(extra)
 
@@ -789,6 +812,8 @@ class StudioManager:
                 "available": False,
                 "source_files": [],
                 "invalid_rows": invalid_rows,
+                "stale": stale,
+                "stale_reason": stale_reason,
                 "summary": {
                     "total_runs": 0,
                     "passed_runs": 0,
@@ -870,7 +895,7 @@ class StudioManager:
                 (
                     r.key
                     for r in runs
-                    if r.stop_reason in ("quiz_failed", "human_rejected", "refused")
+                    if r.stop_reason in ("quiz_failed", "human_rejected", "refused", "release_failed")
                     or r.final_state.ship_log_status == "Blocked"
                 ),
                 None,
@@ -881,6 +906,8 @@ class StudioManager:
             "available": True,
             "source_files": used_sources,
             "invalid_rows": invalid_rows,
+            "stale": stale,
+            "stale_reason": stale_reason,
             "summary": {
                 "total_runs": total_runs,
                 "passed_runs": passed_runs,

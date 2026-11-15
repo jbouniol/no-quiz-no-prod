@@ -2164,6 +2164,8 @@ function buildRepresentativeSampleEval() {
   return {
     available: true,
     isPreviewSample: true,
+    stale: false,
+    stale_reason: null,
     source_files: ["preview-sample (in-memory)"],
     summary: {
       total_runs: 4,
@@ -2172,7 +2174,15 @@ function buildRepresentativeSampleEval() {
       k_repeats: 1,
       pass_at_k: 0.75,
       pass_hat_k: 0.75,
-      by_outcome: { pass: 3, wrong_state: 1, forbidden_call: 0, over_budget: 0, api_error: 0 },
+      by_outcome: {
+        pass: 3,
+        wrong_state: 1,
+        wrong_stop: 0,
+        forbidden_call: 0,
+        over_budget: 0,
+        api_error: 0,
+        harness_error: 0,
+      },
       forbidden_calls_count: 0,
       hidden_failures_count: 0,
       avg_steps: 3.0,
@@ -2248,8 +2258,11 @@ function renderExplorerView() {
   const body = $("explorer-dashboard-body");
   const btnPass = $("btn-showcase-passed");
   const btnFail = $("btn-showcase-failed");
+  const staleBanner = $("explorer-stale-banner");
 
   if (!data || !data.available) {
+    staleBanner.hidden = true;
+    staleBanner.textContent = "";
     emptyCard.hidden = false;
     body.hidden = true;
     btnPass.disabled = true;
@@ -2259,6 +2272,13 @@ function renderExplorerView() {
 
   emptyCard.hidden = true;
   body.hidden = false;
+  if (data.stale && data.stale_reason) {
+    staleBanner.hidden = false;
+    staleBanner.textContent = `Archived campaign (stale): ${data.stale_reason}`;
+  } else {
+    staleBanner.hidden = true;
+    staleBanner.textContent = "";
+  }
 
   const s = data.summary;
   btnPass.disabled = !s.showcase_passed_key;

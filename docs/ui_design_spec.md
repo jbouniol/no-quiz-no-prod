@@ -872,7 +872,7 @@ Loads `eval/results.jsonl` (plus any companion comparison `.jsonl` files in `eva
   ]
 }
 ```
-*(Every answer also carries `invalid_rows`: the number of lines that are not a valid `EvalRunResult`. They are skipped, never fatal; the page shows `N invalid rows skipped` next to the source chip.)*
+*(When no `eval_dir` override is passed, `StudioManager` resolves the newest run under `eval/runs/` containing result rows, falling back to `LATEST_CAMPAIGN_DIR` (`eval/campaigns/03_git_release_dual_deepseek/`). Every answer also carries `invalid_rows` (invalid JSONL lines skipped, never fatal) plus `stale: bool` and `stale_reason: str | null` read from `manifest.json`; when `stale` is `true`, the Eval view displays a banner naming `stale_reason`.)*
 
 *(Graceful Empty State: If `eval/results.jsonl` has not been generated yet, return `"available": false, "runs": []` with HTTP `200 OK` — never `500` — and Mode 2 renders a clean command card showing `uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/` with a click-to-copy button.)*
 

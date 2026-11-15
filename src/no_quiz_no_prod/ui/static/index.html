@@ -570,10 +570,12 @@
           </div>
         </header>
 
+        <div id="explorer-stale-banner" class="drawer-why-banner" hidden></div>
+
         <section id="explorer-empty-card" class="explorer-empty-card" hidden>
           <h2 class="explorer-empty-card__title">No evaluation results yet</h2>
           <div class="command-copy-bar">
-            <code id="eval-cli-command">uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/</code>
+            <code id="eval-cli-command">uv run python eval/run_eval.py --workers 4</code>
             <button type="button" id="btn-copy-eval-cmd" class="header-btn">Copy</button>
           </div>
           <div class="explorer-empty-card__actions">
