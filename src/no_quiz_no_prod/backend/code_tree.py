@@ -262,13 +262,3 @@ def run_staged_tests(
         acceptance_exit_code=acceptance_exit_code,
         acceptance_summary=acceptance_summary,
     )
-
-
-def run_pytest(staging_dir: Path, scratch_dir: Path, *, pytest_k: str | None = None) -> StagedTestOutcome:
-    """Transitional entry point of the pre-sandbox ``workspace.py``: already sandboxed, without the acceptance suite.
-
-    ``scratch_dir`` is ignored (the run happens on a private copy). Removed once ``workspace.py`` calls
-    ``run_staged_tests``.
-    """
-    del scratch_dir
-    return run_staged_tests(staging_dir, acceptance_dir=None, pytest_k=pytest_k)

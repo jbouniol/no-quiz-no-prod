@@ -13,9 +13,11 @@
 
 Isolation backends (``IsolationLevel``):
 
-- ``sandbox-exec`` (macOS): a deny-default Seatbelt profile. Enforced: filesystem, network, other processes'
-  information. Not enforced: a memory cap (macOS ignores ``RLIMIT_AS``), and a process that leaves the process group
-  with ``setsid`` survives the kill (it stays inside the sandbox and under the CPU limit).
+- ``sandbox-exec`` (macOS): a deny-default Seatbelt profile. Enforced: filesystem, network (loopback included) and
+  Mach/IPC lookups. Not enforced: ``sysctl(KERN_PROCARGS2)`` still exposes the initial launch environment and argv of
+  same-user processes (secrets must therefore never be placed in a process's launch environment), a memory cap (macOS
+  ignores ``RLIMIT_AS``), and a process that leaves the process group with ``setsid`` survives the ``SIGKILL`` (it
+  stays inside the sandbox and under ``RLIMIT_CPU``).
 - ``bubblewrap`` (Linux): new user, mount, PID, network, IPC and UTS namespaces; only the allow-listed paths are
   mounted. The PID namespace dies with the run, so nothing survives it. ``RLIMIT_AS`` caps memory.
 - ``none``: no isolation exists on this platform. ``require_isolation`` then refuses (``sandbox_unavailable``) unless
@@ -176,8 +178,8 @@ def seatbelt_profile(root: Path) -> str:
     Metadata (``stat``) is allowed on the ancestors of the readable paths only: resolving a path needs it, and it
     reveals no file content.
     """
-    readable = [*MACOS_SYSTEM_READ_PATHS, *_interpreter_roots(), root]
-    trail = _resolution_trail(Path(sys.executable)) | {Path(path) for path in readable}
+    readable = [*(Path(path) for path in MACOS_SYSTEM_READ_PATHS), *_interpreter_roots(), root]
+    trail = _resolution_trail(Path(sys.executable)) | set(readable)
     return "\n".join(
         [
             "(version 1)",
