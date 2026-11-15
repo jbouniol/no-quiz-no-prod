@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 from typing import Annotated, Any, Final
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -11,7 +12,15 @@ from pydantic import Field, ValidationError
 
 from no_quiz_no_prod import __version__
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError
-from no_quiz_no_prod.contracts import McpServerName, RuntimeSettings, ToolErrorPayload, project_environment
+from no_quiz_no_prod.contracts import (
+    MCP_SERVER_ENV_ALLOWLIST,
+    SECRET_ENV_VARS,
+    EnvVar,
+    McpServerName,
+    RuntimeSettings,
+    ToolErrorPayload,
+    project_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,14 +99,36 @@ def create_server(name: McpServerName, instructions: str) -> NoQuizMCPServer:
     return NoQuizMCPServer(name, instructions=instructions, version=__version__)
 
 
+_LAUNCH_SECRETS: dict[EnvVar, str] = {}
+
+
+def scrub_server_environment(server: McpServerName) -> None:
+    """Scrub ``os.environ`` at server start: blank disallowed vars and move allowed secrets into process memory.
+
+    Every project variable outside ``MCP_SERVER_ENV_ALLOWLIST[server]`` (except ``NO_QUIZ_ENV_FILE``) is set to ``""``
+    so ``.env`` cannot restore it. Any non-empty allowed secret present in ``os.environ`` is moved into
+    ``_LAUNCH_SECRETS`` and deleted from ``os.environ``, so no child process can inherit a secret.
+    """
+    allowed = MCP_SERVER_ENV_ALLOWLIST[server] | {EnvVar.NO_QUIZ_ENV_FILE}
+    for var in EnvVar:
+        if var not in allowed:
+            os.environ[var.value] = ""
+    for var in SECRET_ENV_VARS & MCP_SERVER_ENV_ALLOWLIST[server]:
+        raw = os.environ.get(var.value)
+        if raw:
+            _LAUNCH_SECRETS[var] = raw
+            del os.environ[var.value]
+
+
 def server_settings(server: McpServerName) -> RuntimeSettings:
     """Settings of a launched server, read at call time and reduced to what that server may hold.
 
-    They come from ``project_environment()`` (the project ``.env`` overlaid by the process environment), which
-    exports nothing to ``os.environ``: a secret never enters the environment a test child could inherit or read
-    back. ``restricted_to`` then drops every secret outside the server's allow-list.
+    They come from ``project_environment()`` (the project ``.env`` overlaid by the process environment, plus any
+    launch secret scrubbed out of ``os.environ``), which exports nothing to ``os.environ``: a secret never enters the
+    environment a test child could inherit. ``restricted_to`` then drops every secret outside the server's allow-list.
     """
-    return RuntimeSettings.from_env(project_environment()).restricted_to(server)
+    env = {var.value: value for var, value in _LAUNCH_SECRETS.items()} | project_environment()
+    return RuntimeSettings.from_env(env).restricted_to(server)
 
 
 class WorkspaceBinding:
