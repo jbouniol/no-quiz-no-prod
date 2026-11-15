@@ -3,12 +3,23 @@
     "code-mcp": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.code_server"]
+      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.code_server"],
+      "env": {
+        "OPENROUTER_API_KEY": "",
+        "ANTHROPIC_API_KEY": "",
+        "NOTION_API_KEY": ""
+      }
     },
     "notion-quiz-mcp": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.notion_quiz_server"]
+      "args": ["run", "python", "-m", "no_quiz_no_prod.mcp_servers.notion_quiz_server"],
+      "env": {
+        "OPENROUTER_API_KEY": "",
+        "ANTHROPIC_API_KEY": "",
+        "NO_QUIZ_GITHUB_TOKEN": "",
+        "NO_QUIZ_GIT_REMOTE_URL": ""
+      }
     }
   }
 }
