@@ -243,7 +243,10 @@ def _trailers(message: str) -> dict[str, str]:
 
     Parsed here rather than by git, so text in the release note above it can never pass for a trailer.
     """
-    block = message.rstrip("\n").rsplit("\n\n", 1)[-1]
+    trimmed = message.rstrip("\n")
+    if "\n\n" not in trimmed:
+        return {}
+    block = trimmed.rsplit("\n\n", 1)[-1]
     return dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
 
 
@@ -342,11 +345,10 @@ class GitReleasePublisher:
 
     def publish(
         self,
-        prepared: PreparedRelease | None = None,
+        prepared: PreparedRelease,
         *,
         before_push: Callable[[ReleaseCommit], None] | None = None,
         reject_push: Callable[[], bool] | None = None,
-        **directories: Any,
     ) -> ReleaseCommit:
         """Push ``prepared`` to the release branch (network: call it WITHOUT the workspace lock).
 
@@ -360,12 +362,6 @@ class GitReleasePublisher:
         ``reject_push`` is the eval's ``push_rejected`` fault hook: asked once the release commit is built, a True
         answer refuses that push as a retryable ``upstream_error`` before anything reaches the remote.
         """
-        if prepared is None:  # TRANSITION: workspace.py still passes the directories; goes away with its migration
-            prepared = self.prepare(
-                approved_tree_sha256=directories.pop("prod_tree_sha256"),
-                baseline_tree_sha256=compute_tree_sha256(directories["baseline_dir"]),
-                **directories,
-            )
         deadline = time.monotonic() + RELEASE_DEADLINE_S
         config = self.validate()
         remote, branch = config.remote, config.branch
@@ -472,11 +468,14 @@ class GitReleasePublisher:
     def inspect_remote(self) -> RemoteHead:
         """Read-only check of the configuration and of the remote (``init-github --verify``): git version, remote
         URL, branch name, then ``ls-remote`` (access + tip). Nothing is fetched, committed or pushed."""
+        deadline = time.monotonic() + RELEASE_DEADLINE_S
         config = self.validate()
         remote, branch, version = config.remote, config.branch, config.git_version
         if remote.create and not (Path(remote.target) / "HEAD").is_file():
             return RemoteHead(remote=remote, branch=branch, tip=None, git_version=version, remote_exists=False)
-        return RemoteHead(remote=remote, branch=branch, tip=self._advertised_tip(remote, branch), git_version=version)
+        return RemoteHead(
+            remote=remote, branch=branch, tip=self._advertised_tip(remote, branch, deadline), git_version=version
+        )
 
     def initialize_branch(self, source_dir: Path, *, message: str) -> RemoteHead:
         """Push ``source_dir`` as the root commit of the release branch if the remote does not have it yet.
@@ -484,16 +483,17 @@ class GitReleasePublisher:
         An existing branch is left exactly as it is (``created=False``); a new one is created by a plain
         fast-forward push (``conflict`` if someone created it meanwhile, never forced).
         """
+        deadline = time.monotonic() + RELEASE_DEADLINE_S
         config = self.validate()
         remote, branch, version = config.remote, config.branch, config.git_version
         self._ensure_git_dir()
         if remote.create:
             self._ensure_bare_remote(Path(remote.target))
-        tip = self._advertised_tip(remote, branch)
+        tip = self._advertised_tip(remote, branch, deadline)
         if tip is not None:
             return RemoteHead(remote=remote, branch=branch, tip=tip, git_version=version)
         commit = self._commit_tree(self._write_tree(source_dir), None, message)
-        self._push(remote, commit, branch)
+        self._push(remote, commit, branch, deadline)
         self._git("update-ref", f"refs/heads/{branch}", commit)
         return RemoteHead(remote=remote, branch=branch, tip=commit, git_version=version, created=True)
 
@@ -507,6 +507,8 @@ class GitReleasePublisher:
         if url is None:
             path = self.settings.default_release_remote_dir
             return ReleaseRemote(target=str(path), display=str(path), kind="local", create=True)
+        if any(char.isspace() or ord(char) < 32 for char in url):
+            raise WorkspaceError("invalid_argument", "NO_QUIZ_GIT_REMOTE_URL must not contain spaces or control bytes.")
         parts = urlsplit(url)
         if parts.scheme == "https":
             if "@" in parts.netloc or parts.username is not None or parts.password is not None:
@@ -526,7 +528,7 @@ class GitReleasePublisher:
                 )
             return ReleaseRemote(target=url, display=url, kind="https")
         local = Path(parts.path) if parts.scheme == "file" and not parts.netloc else Path(url)
-        if parts.scheme not in ("", "file") or not local.is_absolute():
+        if parts.scheme not in ("", "file") or parts.query or parts.fragment or not local.is_absolute():
             raise WorkspaceError(
                 "invalid_argument",
                 "NO_QUIZ_GIT_REMOTE_URL must be an https:// URL or an absolute path to a local git repository.",
@@ -608,6 +610,8 @@ class GitReleasePublisher:
         Built from a private copy, so a write that lands in ``directory`` after the check cannot change the tree;
         then read back from git and hashed again, so nothing but the approved bytes can be pushed.
         """
+        if any(entry.is_symlink() for entry in (directory, *directory.rglob("*"))):
+            raise WorkspaceError("forbidden", f"the {what} tree contains a symbolic link: nothing was committed")
         with self._scratch_dir() as scratch:
             snapshot, readback = scratch / "snapshot", scratch / "readback"
             snapshot.mkdir()
