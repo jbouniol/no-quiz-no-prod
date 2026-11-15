@@ -1,5 +1,14 @@
 """State-based evaluation harness, 3-lens scorer, cross-family judge, and report builders."""
 
+from no_quiz_no_prod.eval.acceptance import (
+    ACCEPTANCE_DIR,
+    SUPPORT_MODULE,
+    AcceptanceReport,
+    check_path,
+    run_acceptance,
+    run_acceptance_on_files,
+    with_acceptance_verdict,
+)
 from no_quiz_no_prod.eval.judge import (
     DEFAULT_JUDGE_RUBRIC,
     DEFAULT_LABELING_BATCH_SIZE,
@@ -58,6 +67,8 @@ from no_quiz_no_prod.eval.manifest import (
     write_manifest,
 )
 from no_quiz_no_prod.eval.paths import (
+    ACCEPTANCE_CHECKS_DIR,
+    ACCEPTANCE_REPLAY_PATH,
     CAMPAIGNS_DIR,
     COHORT_RESULTS_GLOB,
     COMPARISON_FILENAME,
@@ -100,6 +111,7 @@ from no_quiz_no_prod.eval.runner import (
     CohortConfig,
     build_arg_parser,
     run_cohort,
+    score_acceptance,
     simulate_dry_run_scenario,
 )
 from no_quiz_no_prod.eval.scorer import (
@@ -140,6 +152,14 @@ from no_quiz_no_prod.eval.scorer import (
 )
 
 __all__ = [
+    "ACCEPTANCE_CHECKS_DIR",
+    "ACCEPTANCE_DIR",
+    "ACCEPTANCE_REPLAY_PATH",
+    "SUPPORT_MODULE",
+    "AcceptanceReport",
+    "check_path",
+    "run_acceptance",
+    "run_acceptance_on_files",
     "DEFAULT_JUDGE_RUBRIC",
     "DEFAULT_LABELING_BATCH_SIZE",
     "DEFAULT_LABELING_SEED",
@@ -231,6 +251,7 @@ __all__ = [
     "CohortConfig",
     "build_arg_parser",
     "run_cohort",
+    "score_acceptance",
     "simulate_dry_run_scenario",
     "READ_MCP_TOOLS",
     "WILSON_Z_95",
@@ -265,5 +286,6 @@ __all__ = [
     "summarize_cohort",
     "turn_recovery_report",
     "wilson_ci",
+    "with_acceptance_verdict",
     "write_results",
 ]

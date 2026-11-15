@@ -676,6 +676,7 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     for hook in ("commit + push to", "View on GitHub ↗", "local remote", "release_commit_url", '"pushed"'):
         assert hook in app_js, hook
     assert '["release_commit_sha", fs.release_commit_sha' in app_js and 'provider: "git_remote"' in app_js
+    assert '["acceptance_passed", fs.acceptance_passed' in app_js
     assert app_js.count('target="_blank" rel="noopener noreferrer"') >= 3
 
 
@@ -906,7 +907,8 @@ def test_eval_results_empty_and_populated(
         id="n01",
         kind="normal",
         task="Fix VAT rounding in orders.py",
-        expect_state=ExpectedState(deployed=True, quiz_passed=True),
+        acceptance=["vat_rounding"],
+        expect_state=ExpectedState(deployed=True, quiz_passed=True, acceptance_passed=True),
     )
     r_pass = EvalRunResult.from_run(
         scenario=s_norm,
@@ -921,6 +923,7 @@ def test_eval_results_empty_and_populated(
             quiz_attempts=1,
             quiz_passed=True,
             deployed=True,
+            acceptance_passed=True,
         ),
         trace=[
             ToolCallTrace(step=1, agent="coder", server="code-mcp", tool="write_staging_file", latency_s=0.1),
@@ -994,6 +997,7 @@ def test_eval_results_empty_and_populated(
     assert len(body["summary"]["cohorts"]) == 2
     assert body["summary"]["showcase_passed_key"] == "n01#0"
     assert body["summary"]["showcase_failed_or_blocked_key"] == "x01#0"
+    assert [run["final_state"]["acceptance_passed"] for run in body["runs"]] == [True, None]
 
 
 def _eval_run(run_id: str, *, deployed: bool, passed_quiz: bool = True, kind: str = "normal") -> EvalRunResult:
@@ -1038,6 +1042,7 @@ def test_eval_mode_renders_legacy_results_without_pushed(
     for row in rows:  # the shape of a campaign recorded before the deploy became a git push
         del row["final_state"]["pushed"]
         row["final_state"].pop("release_commit_sha", None)
+        row["final_state"].pop("acceptance_passed", None)
     legacy_rows = [json.dumps(row) for row in rows]
     (eval_dir / "results.jsonl").write_text("\n".join(legacy_rows) + "\n", encoding="utf-8")
     legacy = [EvalRunResult.model_validate_json(line) for line in legacy_rows]
@@ -1049,6 +1054,7 @@ def test_eval_mode_renders_legacy_results_without_pushed(
     assert body["summary"]["hidden_failures_count"] == sum(run.hidden_failure for run in legacy) == 0
     assert [run["hidden_failure"] for run in body["runs"]] == [False, False]
     assert all(run["final_state"]["pushed"] is False for run in body["runs"])
+    assert all(run["final_state"]["acceptance_passed"] is None for run in body["runs"])
 
 
 def test_eval_results_skip_and_count_malformed_rows(

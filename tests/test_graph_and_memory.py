@@ -87,13 +87,16 @@ from no_quiz_no_prod.graph.mcp_bridge import (
     decode_call_result,
 )
 from no_quiz_no_prod.graph.workflow import (
+    FORGET_RECURSION_LIMIT,
     MAX_RELEASE_REAPPROVALS,
+    RECURSION_HEADROOM,
     NoQuizWorkflow,
     ThreadStateError,
     WorkflowOutcome,
     _parse_deploy_decision,
     close_studio_workflows,
     make_graph,
+    recursion_limit,
 )
 from no_quiz_no_prod.llm import ChatTurnResponse
 from no_quiz_no_prod.memory import SkillMemory, redact_sensitive
@@ -899,6 +902,7 @@ def test_max_steps_budget_gives_up(tmp_path: Path, backend: FakeBackend) -> None
     workflow = make_workflow(tmp_path, backend, llm)
     done = workflow.start_run(TASK, thread_id="t-budget", max_steps=3)
     assert done.stop_reason == "max_steps"
+    assert "step budget is exhausted" in done.final_answer and "recursion_limit" not in done.final_answer
     assert done.budget.steps == 3 == done.budget.max_steps and done.budget.in_budget
     assert len(backend.calls) == 3  # the 4th proposed call never ran
     assert not llm.briefs()
@@ -1571,3 +1575,100 @@ def test_studio_factory_reuses_one_workflow_and_closes_it(monkeypatch: pytest.Mo
     assert sorted(closed) == ["dual", "single"] and not workflow_module._studio_workflows
     close_studio_workflows()  # idempotent
     assert len(closed) == 2
+
+
+# ---- LangGraph recursion_limit safety net --------------------------------------------------------------------------
+def test_recursion_limit_formula_and_router_precedence(tmp_path: Path, backend: FakeBackend) -> None:
+    assert recursion_limit(3) == 2 * 3 + workflow_module.RECURSION_HEADROOM
+    assert recursion_limit(0) == 2 * 1 + workflow_module.RECURSION_HEADROOM
+    assert recursion_limit(-5) == 2 * 1 + RECURSION_HEADROOM
+
+    # Exhausting max_steps=3 stops cleanly via the router (give_up) before recursion_limit is ever approached.
+    llm = ScriptedLLM(coder=[turn(call("read_code_file", path="orders.py")) for _ in range(10)])
+    workflow = make_workflow(tmp_path, backend, llm)
+    events: list[Any] = []
+    done = workflow.start_run(TASK, thread_id="t-rec-budget", max_steps=3, on_event=events.append)
+    assert done.stop_reason == "max_steps" and done.interrupt is None
+    assert "step budget is exhausted" in done.final_answer
+    assert "recursion_limit" not in done.final_answer
+    assert events[-1].type == "run_completed" and events[-1].stop_reason == "max_steps"
+
+
+def test_recursion_limit_safety_net_reports_harness_error(
+    tmp_path: Path, backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workflow_module, "recursion_limit", lambda _max_steps: 4)
+    llm = ScriptedLLM(
+        coder=[turn(call("read_code_file", path="orders.py")) for _ in range(12)],
+        examiner=doc_and_quiz(1, "A"),
+    )
+    workflow = make_workflow(tmp_path, backend, llm)
+    events: list[Any] = []
+
+    crashed = workflow.start_run(TASK, thread_id="t-rec-net", max_steps=9, on_event=events.append)
+    assert crashed.stop_reason == "harness_error"
+    assert crashed.interrupt is None
+    assert "recursion_limit safety net after 4 graph steps" in crashed.final_answer
+    assert events[-1].type == "run_error" and events[-1].stop_reason == "harness_error"
+    assert events[-1].text is not None and "recursion_limit safety net after 4 graph steps" in events[-1].text
+    assert len(backend.calls) < 9 and crashed.budget.steps < 9
+    assert "deploy_to_production" not in tools_called(backend)
+
+    # A routing bug caught by recursion_limit scores as harness_error in run_scenario as well.
+    eval_llm = ScriptedLLM(coder=[turn(call("read_code_file", path="orders.py")) for _ in range(12)])
+    result = make_workflow(tmp_path / "eval_ws", backend, eval_llm).run_scenario(scenario(max_steps=9))
+    assert result.stop_reason == "harness_error" and result.outcome == "harness_error"
+    assert not result.passed and "recursion_limit safety net after 4 graph steps" in result.why
+    assert len(backend.calls) < 9 and "deploy_to_production" not in tools_called(backend)
+
+
+def test_resume_entrypoints_pass_remaining_steps_and_forget_is_bounded(
+    tmp_path: Path, backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen_steps: list[int] = []
+    real_limit = workflow_module.recursion_limit
+
+    def record_limit(max_steps: int) -> int:
+        seen_steps.append(max_steps)
+        return real_limit(max_steps)
+
+    monkeypatch.setattr(workflow_module, "recursion_limit", record_limit)
+
+    # 1. With headroom (max_steps=12): coder (5) + examiner v1 (2) = 7 steps -> 5 left; v2 (2) -> 9 steps -> 3 left.
+    llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A") + doc_and_quiz(2, "C"))
+    workflow = make_workflow(tmp_path, backend, llm)
+    paused = workflow.start_run(TASK, thread_id="t-rem-steps", max_steps=12)
+    assert paused.budget.steps == 7 and paused.interrupt is not None
+    _grade1, remediated = workflow.submit_quiz("t-rem-steps", QuizAnswer(selected_option="B"))
+    assert remediated.budget.steps == 9 and remediated.interrupt is not None
+    _grade2, gated = workflow.submit_quiz("t-rem-steps", QuizAnswer(selected_option="C"))
+    assert gated.interrupt is not None and gated.interrupt.gate is not None
+    done = workflow.submit_deploy_decision("t-rem-steps", approve(gated.interrupt.gate.diff_sha256))
+    assert done.stop_reason == "completed"
+    assert seen_steps == [12, 5, 3, 3]
+
+    # 2. Exact budget (max_steps=7 -> 0 remaining at quiz/deploy): remaining steps are floored at 1.
+    seen_steps.clear()
+    workflow.reset_workspace()
+    tight_llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A"))
+    tight_wf = make_workflow(tmp_path / "tight", backend, tight_llm)
+    tight_paused = tight_wf.start_run(TASK, thread_id="t-floor", max_steps=7)
+    assert tight_paused.budget.steps == 7 == tight_paused.budget.max_steps
+    _grade3, tight_gated = tight_wf.submit_quiz("t-floor", QuizAnswer(selected_option="A"))
+    assert tight_gated.interrupt is not None and tight_gated.interrupt.gate is not None
+    tight_done = tight_wf.submit_deploy_decision("t-floor", approve(tight_gated.interrupt.gate.diff_sha256))
+    assert tight_done.stop_reason == "completed"
+    assert seen_steps == [7, 1, 1]
+
+    # 3. request_forget and confirm_forget bound forget_app with FORGET_RECURSION_LIMIT.
+    forget_limits: list[int | None] = []
+    real_forget_invoke = tight_wf.forget_app.invoke
+
+    def spy_forget_invoke(payload: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
+        forget_limits.append((config or {}).get("recursion_limit"))
+        return real_forget_invoke(payload, config, **kwargs)
+
+    monkeypatch.setattr(tight_wf.forget_app, "invoke", spy_forget_invoke)
+    tight_wf.request_forget(DEFAULT_USER_ID, thread_id="t-forget-bound")
+    tight_wf.confirm_forget("t-forget-bound", approve=False)
+    assert forget_limits == [FORGET_RECURSION_LIMIT, FORGET_RECURSION_LIMIT]

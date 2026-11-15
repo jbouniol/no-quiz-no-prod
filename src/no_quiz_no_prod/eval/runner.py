@@ -25,6 +25,7 @@ from typing import Final, Literal, get_args
 
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
+    ERROR_STOP_REASONS,
     LLM_AGENT_ROLES,
     AgentRole,
     EvalRunResult,
@@ -40,6 +41,7 @@ from no_quiz_no_prod.contracts import (
     idem_key,
     sha256_hex,
 )
+from no_quiz_no_prod.eval.acceptance import run_acceptance, with_acceptance_verdict
 from no_quiz_no_prod.eval.judge import (
     DEFAULT_LABELING_BATCH_SIZE,
     JudgeCalibrationReport,
@@ -425,6 +427,9 @@ def simulate_dry_run_scenario(
             answer = f"Applied {rule_code} fix to {primary_module}, passed staging tests and quiz v1, and deployed."
             stop_reason = "completed"
 
+    if scenario.acceptance and final_state.deployed:
+        final_state = final_state.model_copy(update={"acceptance_passed": True})
+
     effective_model = model if model.startswith("dry-run:") else f"dry-run:{model}"
     steps_count = sum(t.agent in LLM_AGENT_ROLES for t in trace)
     tokens_in = 650 * steps_count
@@ -449,6 +454,20 @@ def simulate_dry_run_scenario(
 
 
 # ---- live execution in isolated per-run workspaces -----------------------------------------------------------------
+def score_acceptance(
+    result: EvalRunResult,
+    scenario: ScenarioSpec,
+    prod_dir: Path,
+    *,
+    allow_unsafe: bool = False,
+) -> EvalRunResult:
+    """Run ``scenario.acceptance`` against ``prod_dir`` and rebuild ``result`` with ``acceptance_passed``."""
+    if not scenario.acceptance or result.stop_reason in ERROR_STOP_REASONS:
+        return result
+    report = run_acceptance(prod_dir, scenario.acceptance, allow_unsafe=allow_unsafe)
+    return with_acceptance_verdict(result, scenario, passed=report.passed)
+
+
 def _execute_live_scenario(
     scenario: ScenarioSpec,
     *,
@@ -482,11 +501,17 @@ def _execute_live_scenario(
                 model=cohort.model,
                 mcp_transport=mcp_transport,
             ) as workflow:
-                return workflow.run_scenario(
+                result = workflow.run_scenario(
                     scenario,
                     repeat=repeat,
                     user_id=f"eval_{cohort.slug}_{scenario.id}_r{repeat}",
                 )
+            return score_acceptance(
+                result,
+                scenario,
+                isolated_settings.area_dir("prod"),
+                allow_unsafe=isolated_settings.unsafe_no_sandbox,
+            )
         except LLMError as exc:  # the provider failed outside a scored turn (e.g. while the workflow started)
             return _unscored_run(scenario, repeat, cohort, "api_error", exc, time.perf_counter() - started)
         except Exception as exc:
@@ -976,5 +1001,6 @@ __all__ = [
     "build_arg_parser",
     "main",
     "run_cohort",
+    "score_acceptance",
     "simulate_dry_run_scenario",
 ]

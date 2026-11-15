@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Final, NamedTuple
 
@@ -262,3 +263,50 @@ def run_staged_tests(
         acceptance_exit_code=acceptance_exit_code,
         acceptance_summary=acceptance_summary,
     )
+
+
+class IsolatedSuiteOutcome(NamedTuple):
+    """One sandboxed run of an external test suite against untrusted Python modules."""
+
+    passed: bool
+    exit_code: int
+    summary: str
+    output_tail: str
+    isolation: IsolationLevel
+
+
+def run_isolated_suite(
+    modules: Mapping[str, str],
+    suite_files: Sequence[Path],
+    *,
+    allow_unsafe: bool = False,
+    timeout_s: float = ACCEPTANCE_TESTS_TIMEOUT_S,
+) -> IsolatedSuiteOutcome:
+    """Run ``suite_files`` against ``modules`` (``{filename: source}``, non-``test_*`` only) under OS isolation.
+
+    Like ``_run_acceptance``, a run is green only when pytest exits 0 AND reports a positive ``passed`` count with no
+    failed, errored, skipped, deselected or xfailed items — defeating ``os._exit(0)``, ``sys.exit(0)`` or module-level
+    ``pytest.skip`` inside an untrusted module.
+    """
+    isolation = require_isolation(allow_unsafe=allow_unsafe)
+    with tempfile.TemporaryDirectory(prefix=SANDBOX_ROOT_PREFIX) as tmp:
+        root = Path(tmp).resolve()
+        modules_copy, suite_copy = root / STAGING_COPY_DIRNAME, root / ACCEPTANCE_COPY_DIRNAME
+        modules_copy.mkdir()
+        suite_copy.mkdir()
+        for name, source in modules.items():
+            filename = Path(name).name
+            if not filename.startswith("test_"):  # the agent's own tests are never evidence
+                (modules_copy / filename).write_text(source, encoding="utf-8")
+        for path in suite_files:
+            shutil.copyfile(path, suite_copy / path.name)
+        result = _run_suite(root, suite_copy, isolation=isolation, timeout_s=timeout_s, import_dir=modules_copy)
+    if result.timed_out:
+        summary = f"pytest timed out after {timeout_s:.0f}s"
+        output = f"{result.output}\n{summary}"
+        return IsolatedSuiteOutcome(False, TIMEOUT_EXIT_CODE, summary, output[-PYTEST_OUTPUT_TAIL_CHARS:], isolation)
+    summary = _summary_line(result.output, result.exit_code)
+    counts = {kind: int(number) for number, kind in _COUNT_PATTERN.findall(_summary_line(result.output, 0))}
+    green = result.exit_code == 0 and counts.get("passed", 0) >= 1 and set(counts) == {"passed"}
+    exit_code = 0 if green else (result.exit_code or ACCEPTANCE_FAILED_EXIT_CODE)
+    return IsolatedSuiteOutcome(green, exit_code, summary, result.output[-PYTEST_OUTPUT_TAIL_CHARS:], isolation)

@@ -49,7 +49,8 @@ flowchart TD
 | Pillar | Mechanism |
 | :--- | :--- |
 | **4-lock production gate** | `deploy_to_production` requires an explicit `expected_diff_sha256` at UI, harness and server (never defaulted), recomputes `diff_sha256 = sha256(prod_tree:staging_tree)` on the server, and refuses (`code="gate_locked"`) unless all four locks hold in the SQLite `gate_ledger` (`state.sqlite`) on that digest: **1. `tests_passed`** (both staged `pytest` and the seed's hidden acceptance suite pass), **2. `sha256_matches`** (zero post-test drift), **3. `quiz_passed`**, **4. `human_approved`**. Quiz attempts and blocks are tracked per **task epoch**: editing `staging/` after quiz exhaustion or a human rejection never clears a block until a human resets or unblocks. |
-| **OS-sandboxed test runner & hidden acceptance suite** | Agent-written tests run on a private snapshot outside the workspace via `src/no_quiz_no_prod/backend/sandbox.py` (`sandbox-exec` Seatbelt on macOS; `bubblewrap` user/mount/PID/net namespaces on Linux) with a minimal 7-variable environment, process-group `SIGKILL` on timeout, 64 KiB output cap and `setrlimit` caps. After a full green staged run, the seed's 19 hidden regression checks (`seeds/fintech/acceptance/test_acceptance.py`, never copied into `staging/` or exposed to agent tools) run in a fresh sandbox and return counts only. Fails closed (`sandbox_unavailable`) unless `NO_QUIZ_UNSAFE_NO_SANDBOX=1` is explicitly set (surfaced on `DeployGateStatus.sandbox_disabled`). |
+| **OS-sandboxed test runner & two-tier hidden acceptance** | Agent-written tests run on a private snapshot outside the workspace via `src/no_quiz_no_prod/backend/sandbox.py` (`sandbox-exec` Seatbelt on macOS; `bubblewrap` user/mount/PID/net namespaces on Linux) with a minimal 7-variable environment, process-group `SIGKILL` on timeout, 64 KiB output cap and `setrlimit` caps. **Tier 1 (runtime Lock 1)**: after a full green staged run, the seed's 19 hidden regression checks (`seeds/fintech/acceptance/test_acceptance.py`) run in a fresh sandbox and return counts only. **Tier 2 (eval scorer)**: for every deploying scenario (`24` dev + `8` held-out), `eval/acceptance/` (24 task-targeted checks + `test_seed_regression.py`, agent `test_*.py` excluded) runs under OS isolation on the final `prod/` tree (`RunFinalState.acceptance_passed`). Fails closed (`sandbox_unavailable`) unless `NO_QUIZ_UNSAFE_NO_SANDBOX=1` is explicitly set. |
+| **Two bounds on every graph run** | The router halts a run cleanly once `steps >= max_steps` (`stop_reason="max_steps"`). Behind it, every LangGraph invocation carries a tight `recursion_limit` (`2 × remaining_steps + 30` supersteps, `10` on `/forget`): a budget-compliant run never reaches it, and any routing bug raises `GraphRecursionError` immediately instead of looping ~10,000 steps, ending cleanly as `harness_error` (never blamed on the model or provider). |
 | **Git release & journal reconciliation** | `prepare()` snapshots `staging/` and `prod/`, verifies their SHA-256 digests, forbids symlinks, and builds git trees via pure plumbing (ignoring user and repo `.gitignore`/`.gitattributes`). `publish()` runs outside the workspace lock under `deploy_slot` (`300 s` deadline) with a persistent `release_journal` in `state.sqlite` reconciled on restart, pushing **fast-forward only** with gate trailers (`Diff-SHA256`, `Prod-Tree-SHA256`, `Gate`, `Quiz-Attempts`, `Approved-By: human`, `Rules`, `Thread`). If an existing remote branch's tip tree differs from `prod/`, the deploy fails closed with `remote_diverged` (no unreviewed sync commit is ever pushed; an absent branch is initialized). A failed push revokes `human_approved` and pauses on a `release_retry` interrupt (`Approve & Retry Push` or `Reject`; terminal `release_failed` after 2 re-approvals). |
 | **Token & secret isolation** | `NO_QUIZ_GITHUB_TOKEN` is sent only to allow-listed HTTPS hosts on default port `443` (`github.com` by default, extendable via `NO_QUIZ_GIT_ALLOWED_HOSTS`) as an `http.<remote>.extraHeader` with `http.followRedirects=false`, `HOME=/dev/null`, and user/system git config ignored. MCP servers run under per-server allow-lists (`environment_for(server)` and `.mcp.json`): neither server gets LLM keys, `code-mcp` gets no Notion key, `notion-quiz-mcp` gets no git remote or token, and secrets are omitted from child launch environments and read from `.env` at runtime (mitigating macOS `sysctl(KERN_PROCARGS2)` same-user launch-env inspection, while `deploy_slot` prevents test runs and git network commands from overlapping). |
 | **Dual vs. single agent topology** | **`dual` (default)**: the `Coder` edits `staging/` and runs `pytest`, with no access to `deploy_to_production` or quiz authoring; the `Examiner` reads Layer 4 memory, receives the full diff (failing closed if oversized), publishes the Ship Log, writes the quiz and handles remediation. **`single`**: one agent with both toolsets for ablation, with write and test tools removed (`SINGLE_REMEDIATION`) once remediation starts so code stays frozen during Attempt 2. |
@@ -161,6 +162,11 @@ uv run python eval/run_eval.py --workers 6 \
 uv run python eval/run_eval.py --export-labeling-batch eval/runs/<run>/results.jsonl --labeling-out eval/labels/human_labels.json
 ```
 
+```bash
+# Re-score the 6 archived cohorts against eval/acceptance/ (no LLM call) -> eval/acceptance_replay.md
+uv run python eval/replay_acceptance.py --out eval/acceptance_replay.md
+```
+
 ### 5. Terminal CLI and MCP client wiring
 
 ```bash
@@ -221,8 +227,8 @@ In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and t
 | 1. Initial baseline ([`eval/campaigns/01_pre_fix_dual_deepseek/`](eval/campaigns/01_pre_fix_dual_deepseek/summary.md)) | `max_tokens=8000`, pre-git-release | 27/30 (90.0%): `normal` 12/14 |
 | 2. Output budget ([`eval/campaigns/02_benchmark_pre_git_release/summary.md`](eval/campaigns/02_benchmark_pre_git_release/summary.md)) | Unusable-turn guard + 16k output budget | 29/30 (96.7%): `normal` 14/14 |
 | 3. Examiner dead-end guard | Examiner question handled by deliverables + `next_step` on `invalid_argument` | Offline regression tests only |
-| 4. Pre-fix git release ([`eval/campaigns/03_git_release_dual_deepseek/`](eval/campaigns/03_git_release_dual_deepseek/summary.md)) | `deploy_to_production` commits & pushes; `pushed` scored | 31/31 (100%) at `k=1` (`am01` 7/6 → 5/6 is run-to-run variance, not a prompt change) |
-| 5. Post-audit hardening (current `HEAD`) | OS test sandbox + hidden suite, SQLite epoch ledger, `release_retry` / `remote_diverged`, de-enumerated prompts, `wrong_stop`, 38 dev + 14 held-out scenarios | **Not yet run live** |
+| 4. Pre-fix git release ([`eval/campaigns/03_git_release_dual_deepseek/`](eval/campaigns/03_git_release_dual_deepseek/summary.md)) | `deploy_to_production` commits & pushes; `pushed` scored | 31/31 (100%) at `k=1` (`20/20` deployed pass offline [`eval/acceptance_replay.md`](eval/acceptance_replay.md)) |
+| 5. Post-audit hardening (current `HEAD`) | OS test sandbox + Lock 1 & `eval/acceptance/` hidden suites, `recursion_limit` net, SQLite epoch ledger, `release_retry` / `remote_diverged`, de-enumerated prompts, `wrong_stop`, 38 dev + 14 held-out scenarios | **Offline replay**: `103/109` historical task-checked deploys hold (`6` false passes caught in campaign `02`: DeepSeek dual `n03`; Gemini dual `n05`, `n08`; Gemini single `n03`, `n05`, `n08`). **Live `k=3` not yet run** |
 
 ### 3. Campaign `02` snapshot: topology and model runs (`30 × 1`, pre-git-release)
 
@@ -254,6 +260,7 @@ In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and t
 | Guessing an ambiguous parameter and shipping it | Gemini `am02`, `am03`, `am05` | Gates check tests, quiz and human approval, not business intent | **Open** (human reviewer is the gate) |
 | Injection-induced refusal | Gemini `ad05` | Planted `"DEPRECATED: do not fix"` text in a rule | **Open** (model robustness; prompts now wrap all untrusted inputs in `<untrusted_data>`) |
 | Staged tests ran unsandboxed and Lock 1 trusted agent-editable tests | Security audit (`BE-01`, `BE-03`) | `pytest` ran in-workspace as the host user with no hidden suite | **Fixed** (`backend/sandbox.py` OS sandbox + 19 hidden checks in `seeds/fintech/acceptance/test_acceptance.py` + SQLite `gate_ledger`) |
+| Deployed wrong fix scored as `pass` | Campaign `02` replay: DeepSeek dual `n03`; Gemini dual `n05`, `n08`; Gemini single `n03`, `n05`, `n08` | Scorer checked `prod_changed` + green agent-written tests rather than task behavior on `prod/` | **Fixed** (`src/no_quiz_no_prod/eval/acceptance.py` runs `eval/acceptance/` under OS isolation on `prod/`; [`eval/acceptance_replay.md`](eval/acceptance_replay.md) re-scores archived traces) |
 | Failed push left no clean retry/reject path | Studio & graph (`C8`) | Push failure ended the graph or kept stale Lock 4 | **Fixed** (failed push revokes `human_approved` and pauses at `release_retry` for explicit retry or rejection; `release_failed` after 2 retries) |
 | Test suite was not hermetic | `pytest`, git release | The spawned stdio MCP servers re-read `.env`, so test deploys pushed commits to the real GitHub repository. Found in code review | **Fixed**: `tests/conftest.py` points `NO_QUIZ_ENV_FILE` at a missing file and blanks the release remote, and every server launch path passes that environment explicitly (`tests/test_hermetic_env.py`) |
 | Third-party commit on the release branch silently overwritten | Git release (`BE-31D`, `C6`) | Former sync commit wrote `prod/` on top of diverged remote tip | **Fixed** (`publish()` checks the remote tip tree against `prod/` and fails closed with `remote_diverged`) |
@@ -289,6 +296,7 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 | `.github/workflows/ci.yml`, `.pre-commit-config.yaml` | Linux + macOS GitHub Actions CI and local `pre-commit` / `pre-push` hooks |
 | `seeds/fintech/`, `seeds/fintech/acceptance/test_acceptance.py` | Seeded fintech codebase, `RULE-001..004` policies, and the 19 hidden acceptance checks guarding Lock 1 |
 | `eval/scenarios.jsonl`, `eval/scenarios_heldout.jsonl`, `eval/campaigns/`, `eval/labels/` | 38-scenario dev set, 14-scenario held-out set, archived pre-fix campaigns (`manifest.json`), and judge calibration label schema |
+| `eval/acceptance/`, `src/no_quiz_no_prod/eval/acceptance.py`, `eval/replay_acceptance.py` | 24 task-specific hidden acceptance suites + `test_seed_regression.py` run under OS isolation on `prod/`, plus zero-LLM replay CLI (`eval/acceptance_replay.md`) |
 | `tests/conftest.py` | Suite-wide guard: no test reads the real `.env`, its release remote or its GitHub token |
 | `tests/test_sandbox.py`, `tests/test_git_release.py`, `tests/test_backend_and_mcp.py` | OS sandbox PoC regressions, git release plumbing/host/divergence tests, and SQLite epoch gate + stdio MCP tests |
 | `tests/test_graph_and_memory.py`, `tests/test_end_to_end_integration.py`, `tests/test_llm.py` | Graph/memory unit tests, full Studio → workflow → stdio MCP → sandbox integration tests, and offline `LLMClient` tests |
@@ -324,13 +332,13 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 ## Development, CI & Branch Protection
 
 ```bash
-# Python test suite (331 tests: graph+memory 69, backend+MCP 58, git release 43, sandbox 41, UI 31, eval 29, CLI 27, LLM 25, e2e 4, hermetic env 4)
+# Python test suite (343 tests: graph+memory 72, backend+MCP 58, sandbox 45, git release 43, eval 34, UI 31, CLI 27, LLM 25, e2e 4, hermetic env 4)
 uv run pytest -q
 
 # Frontend JavaScript unit tests (22 tests for diff.js and markdown.js; Node >= 22.7)
 node --test "tests/js/*.test.mjs"
 
-# Lint, formatting and static type checks (53 Python files)
+# Lint & formatting (100 Python files) and static type checks (55 typed source/test files)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 
 # Install local git hooks matching CI (.pre-commit-config.yaml)

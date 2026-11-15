@@ -2535,6 +2535,7 @@ function openTraceDrawer(run) {
     ["deployed", String(Boolean(fs.deployed))],
     ["pushed", String(Boolean(fs.pushed))],
     ["release_commit_sha", fs.release_commit_sha || "null"],
+    ["acceptance_passed", fs.acceptance_passed === null || fs.acceptance_passed === undefined ? "null" : String(fs.acceptance_passed)],
     ["forbidden_called", JSON.stringify(run.forbidden_called || [])],
     ["hidden_failure", String(Boolean(run.hidden_failure))],
   ];

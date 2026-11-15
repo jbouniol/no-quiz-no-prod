@@ -26,6 +26,7 @@ from no_quiz_no_prod.backend.code_tree import (
     ACCEPTANCE_TEST_GLOB,
     StagedTestOutcome,
     acceptance_suite_dir,
+    run_isolated_suite,
     run_staged_tests,
 )
 from no_quiz_no_prod.backend.seeds import populate_area, seed_path
@@ -521,3 +522,46 @@ def test_the_acceptance_suite_is_never_copied_into_an_area(tmp_path: Path) -> No
     assert sorted(path.name for path in tmp_path.iterdir()) == sorted(ALL_FINTECH_MODULES)
     assert json.loads((SEED_DIR / "rules" / "index.json").read_text(encoding="utf-8"))  # the seed is otherwise intact
     assert ACCEPTANCE_DIR.is_dir() and ACCEPTANCE_DIR.parent == SEED_DIR
+
+
+# ---- run_isolated_suite (external acceptance suite against untrusted modules) ----------------------------------------
+@needs_isolation
+def test_run_isolated_suite_passes_valid_modules_and_ignores_untrusted_test_files(tmp_path: Path) -> None:
+    suite_file = tmp_path / "test_external_check.py"
+    suite_file.write_text(
+        "from calc import double\n\n\ndef test_double():\n    assert double(21) == 42\n",
+        encoding="utf-8",
+    )
+    outcome = run_isolated_suite(
+        {
+            "calc.py": "def double(x: int) -> int:\n    return x * 2\n",
+            "test_sabotage.py": "def test_always_fails():\n    assert False, 'must never be collected'\n",
+        },
+        [suite_file],
+    )
+    assert outcome.passed and outcome.exit_code == 0
+    assert outcome.isolation == sandbox.detect_isolation().level != "none"
+    assert outcome.summary.startswith("1 passed")
+
+
+@needs_isolation
+@pytest.mark.parametrize(
+    "sabotage",
+    [
+        "import os\nos._exit(0)\n",
+        "import sys\nsys.exit(0)\n",
+        "import pytest\npytest.skip('skip whole module', allow_module_level=True)\n",
+    ],
+    ids=["os._exit(0)", "sys.exit(0)", "module-level skip"],
+)
+def test_run_isolated_suite_defeats_early_exit_and_skip_sabotage(tmp_path: Path, sabotage: str) -> None:
+    suite_file = tmp_path / "test_external_check.py"
+    suite_file.write_text(
+        "from calc import double\n\n\ndef test_double():\n    assert double(21) == 42\n",
+        encoding="utf-8",
+    )
+    outcome = run_isolated_suite(
+        {"calc.py": sabotage + "def double(x: int) -> int:\n    return 0\n"},
+        [suite_file],
+    )
+    assert not outcome.passed and outcome.exit_code != 0

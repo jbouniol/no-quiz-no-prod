@@ -53,7 +53,7 @@ asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests", "eval/run_eval.py"]
+files = ["src", "tests", "eval/run_eval.py", "eval/replay_acceptance.py"]
 mypy_path = ["tests"]  # tests import the shared kit as a top-level module (`from testkit import ...`)
 plugins = ["pydantic.mypy"]
 check_untyped_defs = true

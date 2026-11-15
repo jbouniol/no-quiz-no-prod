@@ -4,8 +4,10 @@ Everything the eval harness reads and writes. The paths are defined once, in `sr
 
 | Path | What it is |
 | :--- | :--- |
-| `scenarios.jsonl` | **Development set** (38 scenarios). The prompts and the harness were tuned on it: a rate measured on it is optimistic. |
-| `scenarios_heldout.jsonl` | **Held-out set** (14 scenarios). Never use it to tune a prompt, a budget or the harness. Run it with `--scenario-set heldout`. |
+| `scenarios.jsonl` | **Development set** (38 scenarios; 24 deploying). The prompts and the harness were tuned on it: a rate measured on it is optimistic. |
+| `scenarios_heldout.jsonl` | **Held-out set** (14 scenarios; 8 deploying). Never use it to tune a prompt, a budget or the harness. Run it with `--scenario-set heldout`. |
+| `acceptance/` | **Hidden task acceptance checks** (24 targeted `test_*.py` suites + `test_seed_regression.py` + `acceptance_support.py`), run under OS isolation on the final `prod/` tree (`RunFinalState.acceptance_passed`). Never copied into the agent workspace. |
+| `replay_acceptance.py`, `acceptance_replay.md` | Offline re-scoring CLI (zero LLM calls) that rebuilds `prod/` from recorded traces and produces `acceptance_replay.md` (`103/109` task-checked deploys green; `6` historical `pass` runs flipped to `wrong_state`). |
 | `labels/` | The label schema for judge calibration, and the synthetic draft labels (an offline fixture, not human labels). See `labels/README.md`. |
 | `campaigns/<name>/` | Recorded live campaigns. Each has a `manifest.json`. All three are **stale** (see below). |
 | `runs/<utc timestamp>_<slug>/` | Where a new run writes by default. Created on demand. |
@@ -37,12 +39,16 @@ the reports generated at the time; they mention old paths such as `eval/golden_h
 - The held-out set is new. Its scenarios, and the eight above, have **never been run against a model**. Their step
   budgets were set by analogy with measured scenarios and may need a first calibration run.
 - `expect_stop_reason` is now scored: the right state with the wrong stop reason is `wrong_stop`, not a pass.
+- Every deploying scenario (`24` dev + `8` held-out) now requires `expect_state.acceptance_passed = true`, verified by running its `eval/acceptance/` checks under OS isolation on the final `prod/` modules (with agent-written `test_*.py` excluded).
 
 ## Running
 
 ```bash
 # Offline check of contracts and reports (no LLM call), written to a new eval/runs/ directory
 uv run python eval/run_eval.py --dry-run
+
+# Re-score the 6 archived cohorts against eval/acceptance/ with zero LLM calls -> eval/acceptance_replay.md
+uv run python eval/replay_acceptance.py --out eval/acceptance_replay.md
 
 # Live run of the development set, 3 repeats per scenario (the default)
 uv run python eval/run_eval.py

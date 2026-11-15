@@ -22,6 +22,8 @@ from no_quiz_no_prod.contracts import PROJECT_ROOT
 ScenarioSetName = Literal["dev", "heldout"]
 
 EVAL_DIR: Final = PROJECT_ROOT / "eval"
+ACCEPTANCE_CHECKS_DIR: Final = EVAL_DIR / "acceptance"
+ACCEPTANCE_REPLAY_PATH: Final = EVAL_DIR / "acceptance_replay.md"
 DEFAULT_SCENARIOS_PATH: Final = EVAL_DIR / "scenarios.jsonl"
 HELDOUT_SCENARIOS_PATH: Final = EVAL_DIR / "scenarios_heldout.jsonl"
 SCENARIO_SET_PATHS: Final[Mapping[ScenarioSetName, Path]] = {
@@ -68,6 +70,8 @@ def display_path(path: Path) -> str:
 
 
 __all__ = [
+    "ACCEPTANCE_CHECKS_DIR",
+    "ACCEPTANCE_REPLAY_PATH",
     "CAMPAIGNS_DIR",
     "COHORT_RESULTS_GLOB",
     "COMPARISON_FILENAME",

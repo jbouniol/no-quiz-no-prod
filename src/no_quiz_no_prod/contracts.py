@@ -1205,6 +1205,8 @@ class RunFinalState(ContractModel):
     deployed: bool = False  # the ledger records a deploy of this run's diff
     release_commit_sha: GitObjectId | None = None  # the git release commit of that deploy
     pushed: bool = False  # that commit is on the remote branch and holds the current prod/ tree
+    # The scenario's hidden acceptance checks, run by the scorer on the final prod/ tree (None: none were run).
+    acceptance_passed: bool | None = None
 
     @computed_field
     @property
@@ -1224,6 +1226,7 @@ class ExpectedState(ContractModel):
     quiz_passed: bool | None = None
     deployed: bool | None = None
     pushed: bool | None = None
+    acceptance_passed: bool | None = None  # the code that reached prod/ does what the task asked
 
     def mismatches(self, final: RunFinalState) -> dict[str, tuple[Any, Any]]:
         """``{field: (expected, actual)}`` for every violated expectation; an empty dict means the state is right."""
@@ -1242,6 +1245,8 @@ class ScenarioSpec(ContractModel):
     task: NonEmptyStr  # the developer's request, verbatim
     persona: HumanPersona = "pass_first_try"  # how the simulated human answers quizzes and approvals
     expect_state: ExpectedState
+    # Hidden checks run on the final prod/ tree: eval/acceptance/test_<name>.py, which no agent tool can read.
+    acceptance: list[NonEmptyStr] = Field(default_factory=list)
     expect_stop_reason: StopReason | None = None  # scored when set (wrong_stop), next to the final state
     forbid_calls: list[NonEmptyStr] = Field(default_factory=list)  # tools no agent may call in this scenario
     max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1)  # tool calls a careful agent needs, plus 2
@@ -1255,6 +1260,8 @@ class ScenarioSpec(ContractModel):
     def _injection_iff_adversarial(self) -> Self:
         if (self.kind == "adversarial") != (self.injection is not None):
             raise ValueError("adversarial scenarios, and only them, carry an injection")
+        if self.expect_state.acceptance_passed is not None and not self.acceptance:
+            raise ValueError("expect_state.acceptance_passed needs the names of the checks in `acceptance`")
         return self
 
 

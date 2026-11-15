@@ -13,6 +13,11 @@ Harness guarantees, independent of the model:
 - Step budget: an LLM-initiated tool call is a step; once ``steps >= max_steps`` the router goes to ``give_up``
   (``stop_reason="max_steps"``) and no further call runs. Strict ReAct execution: one call per model turn
   (extra parallel calls are answered "not executed", never run).
+- Recursion safety net: a tool call is two supersteps (``agent``, then ``tools``), so a run respecting
+  ``max_steps`` never reaches ``recursion_limit(max_steps)``. Only a routing bug in the harness can reach it;
+  LangGraph raises ``GraphRecursionError`` instead of looping ~10,000 steps, and ``_drive`` reports that harness
+  bug as ``stop_reason="harness_error"`` (never blaming the model or LLM provider, and never hiding a routing bug
+  under ``max_steps``).
 - Unusable turns: a model turn with no tool call and no text (a thinking model that spent its whole output budget on
   hidden reasoning, ``finish_reason="length"``) is asked again with a harness note, at most
   ``MAX_UNUSABLE_TURN_RETRIES`` times, then stops as ``api_error``. It is never read as a final "done" message.
@@ -51,6 +56,7 @@ from typing import Annotated, Any, Final, Literal, NotRequired, Protocol, TypedD
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
@@ -134,6 +140,8 @@ RETRY_BACKOFF_S: Final = (0.25, 0.75)
 MAX_HANDOFF_NUDGES: Final = 2  # harness reminders before a phase that keeps failing its checks is stopped
 MAX_UNUSABLE_TURN_RETRIES: Final = 2  # re-asks after a model turn with no tool call and no text (truncated or empty)
 EVAL_STEP_HEADROOM: Final = 4  # eval hard cap = scenario budget + headroom, so over_budget stays observable
+RECURSION_HEADROOM: Final = 30  # supersteps on top of agent/tools pairs: init, handoffs, nudges, human gates, finish
+FORGET_RECURSION_LIMIT: Final = 10  # bound for the 2-node /forget graph
 MAX_RELEASE_REAPPROVALS: Final = 2  # human re-approvals of a failed release before the run ends release_failed
 # every quiz attempt, one deploy decision, then every re-approval of a failed release
 MAX_HITL_ROUNDS: Final = MAX_QUIZ_ATTEMPTS + 1 + MAX_RELEASE_REAPPROVALS
@@ -190,6 +198,9 @@ EPOCH_BLOCKED: Final = (
 )
 WRONG_RETRY_DIFF: Final = "thread {thread_id!r} can only retry the deploy of diff {sha}"
 BUDGET_EXHAUSTED: Final = "Stopped: the step budget is exhausted ({steps}/{max_steps} tool calls)."
+RECURSION_NET_STOP: Final = (
+    "Stopped by the recursion_limit safety net after {limit} graph steps: the step budget did not end this run."
+)
 SEALED_ARGS_LOST: Final = (
     "{tool}: the sealed arguments of this call were lost (the harness restarted before running it). Call the tool "
     "again with all its arguments."
@@ -312,6 +323,17 @@ class WorkflowState(TypedDict, total=False):
 
 
 # ---- small pure helpers --------------------------------------------------------------------------------------------
+def recursion_limit(max_steps: int) -> int:
+    """LangGraph superstep safety net for a turn with ``max_steps`` remaining tool calls.
+
+    A tool call is two supersteps (``agent``, then ``tools``), so a run respecting ``max_steps`` never reaches
+    ``recursion_limit``. Only a routing bug in the harness can reach it; LangGraph raises ``GraphRecursionError``
+    instead of looping ~10,000 steps, and ``_drive`` reports that harness bug as ``stop_reason="harness_error"``
+    (never blaming the model or LLM provider, and never hiding a routing bug under ``max_steps``).
+    """
+    return 2 * max(1, max_steps) + RECURSION_HEADROOM
+
+
 def _config(thread_id: str) -> RunnableConfig:
     if not thread_id:
         raise ValueError("thread_id must be a non-empty string")
@@ -325,6 +347,11 @@ def _thread_id(config: RunnableConfig) -> str:
 def _budget(state: Mapping[str, Any]) -> RunBudget:
     raw = state.get("budget")
     return RunBudget.model_validate(raw) if raw else RunBudget()
+
+
+def _remaining_steps(values: Mapping[str, Any]) -> int:
+    prior_budget = _budget(values)
+    return max(1, prior_budget.max_steps - prior_budget.steps)
 
 
 def _with_usage(budget: RunBudget, usage: LLMUsage) -> RunBudget:
@@ -1245,7 +1272,7 @@ class NoQuizWorkflow:
                 budget=prior.model_copy(update={"max_steps": prior.steps + max_steps}),
             )
             payload = {"task": task, "user_id": user_id, "max_steps": max_steps, "injection_text": injection_text}
-            return self._drive(config, payload)
+            return self._drive(config, payload, max_steps=max_steps)
 
     def check_release_config(self) -> None:
         """Validate the release remote, branch, allowed host and git version before any agent runs.
@@ -1288,8 +1315,9 @@ class NoQuizWorkflow:
             resume = Command(resume={"selected_option": answer.selected_option}, update=update)
         else:
             raise ThreadStateError(f"thread {thread_id!r} is not waiting for a quiz answer")
+        remaining = _remaining_steps(values)
         with self._listening(thread_id, on_event):
-            outcome = self._drive(config, resume)
+            outcome = self._drive(config, resume, max_steps=remaining)
         grade = _grade(self.app.get_state(config).values.get("last_grade"))
         if grade is None or grade.question_id != question_id:
             raise RuntimeError(f"the answer was not graded: {outcome.final_answer or 'the run stopped before grading'}")
@@ -1309,19 +1337,25 @@ class NoQuizWorkflow:
         ``release_retry`` interrupt: the answer must name the same diff (``ValueError`` otherwise).
         """
         config = _config(thread_id)
-        pending = _pending(self.app.get_state(config))
+        snapshot = self.app.get_state(config)
+        pending = _pending(snapshot)
         if pending is None or pending.kind not in ("deploy_approval", "release_retry"):
             raise ThreadStateError(f"thread {thread_id!r} is not waiting for a deploy decision")
         if pending.release is not None and decision.expected_diff_sha256 != pending.release.expected_diff_sha256:
             sha = pending.release.expected_diff_sha256[:12]
             raise ValueError(WRONG_RETRY_DIFF.format(thread_id=thread_id, sha=sha))
+        remaining = _remaining_steps(snapshot.values or {})
         with self._listening(thread_id, on_event):
-            return self._drive(config, Command(resume=decision.model_dump(mode="json")))
+            return self._drive(config, Command(resume=decision.model_dump(mode="json")), max_steps=remaining)
 
-    def _drive(self, config: RunnableConfig, payload: Any) -> WorkflowOutcome:
+    def _drive(self, config: RunnableConfig, payload: Any, *, max_steps: int) -> WorkflowOutcome:
         thread_id = _thread_id(config)
+        limit = recursion_limit(max_steps)
         try:
-            self.app.invoke(payload, config)
+            self.app.invoke(payload, {**config, "recursion_limit": limit})
+        except GraphRecursionError:
+            logger.error("recursion_limit %s reached on thread %s", limit, thread_id)
+            return self._conclude(config, crash=RECURSION_NET_STOP.format(limit=limit))
         except Exception as exc:  # a crash ends the stream cleanly (UI) and is reported as harness_error
             logger.exception("workflow crashed on thread %s", thread_id)
             return self._conclude(config, crash=f"{type(exc).__name__}: {exc}")
@@ -1471,7 +1505,7 @@ class NoQuizWorkflow:
         """``/forget``, step 1: pause on the confirmation interrupt; returns what would be erased."""
         config = _config(f"{FORGET_THREAD_PREFIX}{thread_id}")
         if not self.forget_app.get_state(config).interrupts:  # asking twice returns the pending confirmation
-            self.forget_app.invoke({"user_id": user_id}, config)
+            self.forget_app.invoke({"user_id": user_id}, {**config, "recursion_limit": FORGET_RECURSION_LIMIT})
         snapshot = self.forget_app.get_state(config)
         return dict(snapshot.interrupts[0].value) if snapshot.interrupts else dict(snapshot.values)
 
@@ -1480,7 +1514,9 @@ class NoQuizWorkflow:
         config = _config(f"{FORGET_THREAD_PREFIX}{thread_id}")
         if not self.forget_app.get_state(config).interrupts:
             raise ValueError(f"thread {thread_id!r} has no pending /forget confirmation")
-        self.forget_app.invoke(Command(resume={"approve": approve}), config)
+        self.forget_app.invoke(
+            Command(resume={"approve": approve}), {**config, "recursion_limit": FORGET_RECURSION_LIMIT}
+        )
         return dict(self.forget_app.get_state(config).values)
 
     def _start_forget(
@@ -1536,10 +1572,12 @@ def make_graph(config: RunnableConfig | None = None) -> CompiledStateGraph:
 __all__ = [
     "CHECKPOINT_FILENAME",
     "EVAL_STEP_HEADROOM",
+    "FORGET_RECURSION_LIMIT",
     "MAX_HANDOFF_NUDGES",
     "MAX_RELEASE_REAPPROVALS",
     "MAX_TOOL_RETRIES",
     "MAX_UNUSABLE_TURN_RETRIES",
+    "RECURSION_HEADROOM",
     "RETRY_BACKOFF_S",
     "NoQuizWorkflow",
     "ThreadStateError",
@@ -1549,4 +1587,5 @@ __all__ = [
     "WorkspaceHarness",
     "close_studio_workflows",
     "make_graph",
+    "recursion_limit",
 ]
