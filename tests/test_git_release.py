@@ -193,8 +193,7 @@ def test_successive_deploys_fast_forward_and_a_reset_starts_the_default_remote_a
     )
     assert second.parent_sha == first.commit_sha  # prod == remote tip: nothing in between
     assert git("--git-dir", str(remote), "rev-list", "--count", second.commit_sha) == "3"
-    sandbox.reset()  # prod is back to the seed
-    sandbox.release.discard_default_remote()  # what a reset does with the workspace's own remote
+    sandbox.reset()  # prod is back to the seed and the workspace's own bare remote is discarded
     third = ReleaseCommit.model_validate(sandbox.deploy_to_production(ship(sandbox), "Release 3")["release"])
     assert git("--git-dir", str(remote), "rev-list", "--count", third.commit_sha) == "2"  # baseline + release
     assert git("--git-dir", str(remote), "diff", "--name-only", str(third.parent_sha), third.commit_sha) == "orders.py"
@@ -286,8 +285,11 @@ def test_a_moved_remote_is_never_force_pushed_and_prod_waits(tmp_path: Path, mon
     assert theirs != first.commit_sha and "HOTFIX.md" in remote_files(remote, str(theirs))  # nothing overwritten
     final = sandbox.snapshot_final_state()
     assert not final.prod_changed or final.prod_tree_sha256 == first.prod_tree_sha256  # release 2 never promoted
-    assert sandbox.get_gate_status(diff).can_deploy  # the locks still hold: a retry is allowed
+    gate = sandbox.get_gate_status(diff)
+    assert gate.missing_locks == ["human_approved"] and gate.ready_for_approval  # failed push revokes Lock 4
+    assert refusal(lambda: sandbox.deploy_to_production(diff, "Release 2")).code == "gate_locked"
 
+    sandbox.apply_deploy_decision(DeployDecision(action="approve", expected_diff_sha256=diff))
     monkeypatch.undo()  # the retry now sees their commit: the branch no longer holds prod, a human must reconcile
     assert refusal(lambda: sandbox.deploy_to_production(diff, "Release 2")).code == "remote_diverged"
     assert tip(remote) == theirs
@@ -363,6 +365,10 @@ def test_a_tree_that_changed_after_approval_is_never_committed(tmp_path: Path) -
     stale = {"approved_tree_sha256": approved, "diff_sha256": diff_sha256_from_trees(prod, approved)}
     error = refusal(lambda: prepared_release(sandbox, **stale))
     assert error.code == "conflict" and error.details["tree"] == "staging"
+    outside = tmp_path / "outside.txt"
+    outside.write_text("never follow a symlink out of staging\n")
+    (sandbox.staging_dir / "escape.py").symlink_to(outside)
+    assert refusal(lambda: prepared_release(sandbox)).code == "forbidden"
     assert not sandbox.settings.default_release_remote_dir.exists()  # nothing was even started
     assert not list(sandbox.settings.release_git_dir.glob("snapshot-*"))  # no private copy is left behind
 
@@ -600,9 +606,11 @@ def test_the_push_rejected_fault_refuses_one_push_then_ships_a_single_release_co
     assert tip(remote) is None  # nothing reached the remote
     before = sandbox.snapshot_final_state()
     assert before.prod_tree_sha256 == seed_prod and not before.deployed and not before.pushed
-    assert sandbox.get_gate_status().can_deploy  # the 4 locks still hold for the same diff
+    gate = sandbox.get_gate_status(diff)
+    assert gate.missing_locks == ["human_approved"] and gate.ready_for_approval  # failed push revokes Lock 4
+    sandbox.apply_deploy_decision(DeployDecision(action="approve", expected_diff_sha256=diff))
 
-    payload = sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="deploy-1")  # the harness retry
+    payload = sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="deploy-1")  # re-approved retry
     release = ReleaseCommit.model_validate(payload["release"])
     assert release.pushed and tip(remote) == release.commit_sha
     subjects = git("--git-dir", str(remote), "log", "--format=%s", release.commit_sha).splitlines()
@@ -726,7 +734,12 @@ def test_the_token_is_never_sent_to_a_host_outside_the_allow_list(
     assert len(fake.calls) == 0  # git never even started (a count only: never print a recorded environment)
     assert not sandbox.snapshot_final_state().prod_changed
     assert refusal(lambda: release_module.validate_release_config(sandbox.settings)).code == "invalid_argument"
-    for url in ("https://github.com:8443/acme/r.git", "https://github.com.attacker.example/acme/r.git"):
+    for url in (
+        "https://github.com:8443/acme/r.git",
+        "https://github.com.attacker.example/acme/r.git",
+        "https://github.com/acme/r.git\nhttp.evil.extraHeader=x",
+        "file:///tmp/repo.git?x=1",
+    ):
         other = RuntimeSettings(workspace_dir=tmp_path / "w", git_remote_url=url, github_token=SecretStr(TOKEN))
         assert refusal(release_module.GitReleasePublisher(other).resolve_remote).code == "invalid_argument"
     # defence in depth: even a remote object built around the check gets no header
