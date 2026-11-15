@@ -409,6 +409,18 @@ def load_project_env(*, override: bool = False) -> bool:
     return True
 
 
+def project_environment() -> dict[str, str]:
+    """The project variables a process may read: the project ``.env`` overlaid by the process environment.
+
+    Nothing is exported to ``os.environ``, so a secret that only lives in ``.env`` never enters this process's
+    environment (nor the one its children inherit), and a ``.env`` rewritten while the process runs is followed.
+    The process environment wins, even with an empty value (that is how a harness blanks a secret for a server).
+    """
+    path = project_env_file()
+    file_values = dotenv_values(path) if path.is_file() else {}
+    return {key: value for key, value in file_values.items() if value is not None} | dict(os.environ)
+
+
 def _read_notion_ids(path: Path | None) -> dict[str, str]:
     if path is None or not path.is_file():
         return {}
@@ -512,23 +524,33 @@ class RuntimeSettings(ContractModel):
         return self.model_copy(update=dropped)
 
     def environment_for(self, server: McpServerName) -> dict[str, str]:
-        """The explicit environment of a spawned MCP server: allow-listed variables carry this settings' values,
-        every other project variable is set EMPTY (an empty variable wins over any ``.env`` the server could load)."""
+        """The explicit launch environment of a spawned MCP server.
+
+        Allow-listed settings carry this settings' values; every other project variable is set EMPTY (an empty
+        variable wins over any ``.env`` the server could read). A SECRET is never put in a launch environment, which
+        any same-user process can read back (macOS ``KERN_PROCARGS2``): when the server may have it and these
+        settings hold one, the variable is simply left out and the server reads it itself, at run time, from the
+        project ``.env`` (``project_environment``); otherwise it is blanked. ``NO_QUIZ_ENV_FILE`` is forwarded.
+        """
         allowed = MCP_SERVER_ENV_ALLOWLIST[server]
         values = {
             EnvVar.NO_QUIZ_WORKSPACE_DIR: str(self.workspace_dir),
             EnvVar.NO_QUIZ_GIT_REMOTE_URL: self.git_remote_url or "",
             EnvVar.NO_QUIZ_GIT_BRANCH: self.git_branch,
-            EnvVar.NO_QUIZ_GITHUB_TOKEN: self.github_token.get_secret_value() if self.github_token else "",
             EnvVar.NO_QUIZ_GIT_ALLOWED_HOSTS: ",".join(self.git_allowed_hosts),
             EnvVar.NO_QUIZ_UNSAFE_NO_SANDBOX: "1" if self.unsafe_no_sandbox else "",
-            EnvVar.NOTION_API_KEY: self.notion_api_key.get_secret_value() if self.notion_api_key else "",
             EnvVar.NOTION_SHIP_LOG_DB_ID: self.notion_ship_log_db_id or "",
             EnvVar.NOTION_RULES_DB_ID: self.notion_rules_db_id or "",
             EnvVar.NOTION_SKILLS_DB_ID: self.notion_skills_db_id or "",
         }
-        blanked = {var.value: "" for var in EnvVar if var is not EnvVar.NO_QUIZ_ENV_FILE}
-        return blanked | {var.value: value for var, value in values.items() if var in allowed}
+        environment = {var.value: "" for var in EnvVar if var is not EnvVar.NO_QUIZ_ENV_FILE}
+        environment |= {var.value: value for var, value in values.items() if var in allowed}
+        for var in SECRET_ENV_VARS & allowed:
+            if getattr(self, _SETTINGS_FIELD_BY_ENV[var]) is not None:
+                del environment[var.value]  # held by the harness: the server reads it from .env, never from here
+        if env_file := os.environ.get(EnvVar.NO_QUIZ_ENV_FILE.value):
+            environment[EnvVar.NO_QUIZ_ENV_FILE.value] = env_file
+        return environment
 
     @property
     def providers(self) -> dict[LLMProvider, bool]:
@@ -1550,6 +1572,7 @@ __all__ = [
     "pass_at_k",
     "pass_hat_k",
     "project_env_file",
+    "project_environment",
     "sha256_hex",
     "ship_log_status_for_attempt",
 ]

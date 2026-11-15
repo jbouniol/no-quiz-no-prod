@@ -1,49 +1,77 @@
-"""Code-side primitives of the sandbox: tree listing, prod -> staging diff, tree copy and the isolated pytest run.
+"""Code-side primitives of the workspace: tree listing, prod -> staging diff, tree copy and the sandboxed test run.
 
 Everything here is pure filesystem/subprocess work with no state of its own; ``SandboxWorkspace`` adds the locking,
 the ledger and the persistence around it.
+
+``run_staged_tests`` is the only way agent-written tests are ever executed. It never runs them in place: staging is
+copied to a private temporary directory and pytest runs there under OS isolation (``backend.sandbox``). Lock 1 needs
+two suites green: the agent's own tests, then the seed's hidden acceptance suite (``seeds/<seed>/acceptance/``),
+which is never copied into an area and which no agent tool can read or edit.
 """
 
+import ast
 import difflib
-import os
 import re
 import shutil
-import subprocess
-import sys
+import tempfile
 import time
 from pathlib import Path, PurePosixPath
 from typing import Final, NamedTuple
 
+from no_quiz_no_prod.backend.sandbox import (
+    SANDBOX_ROOT_PREFIX,
+    TIMEOUT_EXIT_CODE,
+    SandboxLimits,
+    SandboxResult,
+    require_isolation,
+    run_isolated,
+)
 from no_quiz_no_prod.contracts import (
+    ACCEPTANCE_DIRNAME,
+    ACCEPTANCE_TESTS_TIMEOUT_S,
+    STAGED_TESTS_TIMEOUT_S,
     DiffReport,
     FileDiff,
+    IsolationLevel,
     _is_hash_ignored,  # the exact ignore rule of compute_tree_sha256: listing and hashing can never disagree
     compute_tree_sha256,
 )
 
 DIFF_CONTEXT_LINES: Final = 3
-PYTEST_TIMEOUT_S: Final = 60
-PYTEST_TIMEOUT_EXIT_CODE: Final = 124  # the `timeout(1)` convention: the run was killed, it did not pass
 PYTEST_OUTPUT_TAIL_CHARS: Final = 4_000
-# The agent's test code runs in this subprocess: it only gets a minimal environment, never the parent's API keys.
-PYTEST_ENV_PASSTHROUGH: Final = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT")
+PYTEST_OUTPUT_BUFFER_BYTES: Final = 64 * 1024  # most the gate ever holds of a run's output, whatever the run prints
 PYTEST_ENV_FLAGS: Final = {
-    "PYTHONDONTWRITEBYTECODE": "1",
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",  # no third-party plugin: fast, and isolated from the project's config
-    "PYTHONHASHSEED": "0",
-    "PYTHONIOENCODING": "utf-8",
     "NO_COLOR": "1",
 }
+ACCEPTANCE_FAILED_EXIT_CODE: Final = 1  # pytest's "some tests failed", also used when the suite is missing or tampered
+ACCEPTANCE_TEST_GLOB: Final = "test_*.py"
+STAGING_COPY_DIRNAME: Final = "staging"
+ACCEPTANCE_COPY_DIRNAME: Final = "acceptance"
+RUN_DIRNAME: Final = "run"  # pytest's cwd and ini file: next to the copied trees, never inside them
+PYTEST_INI_FILENAME: Final = "pytest.ini"
 _SUMMARY_PATTERN: Final = re.compile(
     r"\b\d+ (passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b|no tests ran", re.IGNORECASE
 )
+_COUNT_PATTERN: Final = re.compile(r"\b(\d+) (passed|failed|errors?|skipped|deselected|xfailed|xpassed)\b")
 
 
-class PytestOutcome(NamedTuple):
-    exit_code: int
+class StagedTestOutcome(NamedTuple):
+    """One sandboxed run of staging: the agent's suite, then (full green runs only) the hidden acceptance suite."""
+
+    exit_code: int  # the agent's suite; TIMEOUT_EXIT_CODE when it was killed
     summary: str
-    output_tail: str
+    output_tail: str  # the agent's suite only: nothing the acceptance run printed is ever returned
     duration_s: float
+    isolation: IsolationLevel
+    tested_tree_sha256: str  # compute_tree_sha256 of the private copy that was run
+    acceptance_exit_code: int | None  # None: not run (filtered run, red agent suite, or no suite requested)
+    acceptance_summary: str  # counts only, written here: never text printed by the test process
+
+    @property
+    def passed(self) -> bool:
+        """Both suites green. A filtered run can be green too, but never ran the acceptance suite."""
+        return self.exit_code == 0 and self.acceptance_exit_code in (None, 0)
 
 
 def tree_files(root: Path) -> dict[str, Path]:
@@ -106,6 +134,12 @@ def build_diff_report(prod_dir: Path, staging_dir: Path) -> DiffReport:
     )
 
 
+# ---- the sandboxed test run ------------------------------------------------------------------------------------------
+def acceptance_suite_dir(seed_dir: Path) -> Path:
+    """``seeds/<seed>/acceptance``: the hidden Lock 1 suite of a seed (``populate_area`` never copies it)."""
+    return seed_dir / ACCEPTANCE_DIRNAME
+
+
 def _summary_line(output: str, exit_code: int) -> str:
     for line in reversed(output.splitlines()):
         stripped = line.strip().strip("=").strip()
@@ -114,58 +148,127 @@ def _summary_line(output: str, exit_code: int) -> str:
     return f"pytest exited with code {exit_code}"
 
 
-def _as_text(stream: str | bytes | None) -> str:
-    if stream is None:
-        return ""
-    return stream.decode("utf-8", errors="replace") if isinstance(stream, bytes) else stream
+def _run_suite(
+    root: Path,
+    tests_dir: Path,
+    *,
+    isolation: IsolationLevel,
+    timeout_s: float,
+    pytest_k: str | None = None,
+    import_dir: Path | None = None,
+) -> SandboxResult:
+    """Run pytest on ``tests_dir`` inside the sandbox root, isolated from the repository's pytest config and plugins.
 
-
-def run_pytest(staging_dir: Path, scratch_dir: Path, *, pytest_k: str | None = None) -> PytestOutcome:
-    """Run the staging test suite in a subprocess, isolated from the repository's pytest config and plugins.
-
-    The run uses an empty ini file in ``scratch_dir`` (outside the hashed trees) and runs from there, so a test that
-    writes files never changes the staging tree. stdin is closed: a stdio MCP server's protocol stream is never
-    inherited.
+    ``import_dir`` is put on ``sys.path`` (the staged modules, for a suite that lives elsewhere).
     """
-    scratch_dir.mkdir(parents=True, exist_ok=True)
-    ini_path = scratch_dir / "pytest.ini"
-    ini_path.write_text("[pytest]\n", encoding="utf-8")
-    command = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-q",
-        "-p",
-        "no:cacheprovider",
-        "-c",
-        str(ini_path),
-        "--rootdir",
-        str(staging_dir),
-        str(staging_dir),
-    ]
+    run_dir = root / RUN_DIRNAME
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ini_path = run_dir / PYTEST_INI_FILENAME
+    ini_path.write_text("[pytest]\n" + (f"pythonpath = {import_dir}\n" if import_dir else ""), encoding="utf-8")
+    args = ["-m", "pytest", "-q", "-p", "no:cacheprovider", "-c", str(ini_path), "--rootdir", str(tests_dir)]
+    args.append(str(tests_dir))
     if pytest_k:
-        command += ["-k", pytest_k]
-    env = {key: os.environ[key] for key in PYTEST_ENV_PASSTHROUGH if key in os.environ} | PYTEST_ENV_FLAGS
+        args += ["-k", pytest_k]
+    limits = SandboxLimits(timeout_s=timeout_s, output_tail_bytes=PYTEST_OUTPUT_BUFFER_BYTES)
+    return run_isolated(args, root=root, cwd=run_dir, limits=limits, isolation=isolation, env=PYTEST_ENV_FLAGS)
+
+
+def _acceptance_test_count(acceptance_dir: Path) -> int:
+    """How many tests the hidden suite holds, counted from its source here, outside the sandbox: the count a green
+    run must report. The suite keeps to plain module-level ``test_*`` functions so that this is exact."""
+    count = 0
+    for path in sorted(acceptance_dir.glob(ACCEPTANCE_TEST_GLOB)):
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        count += sum(isinstance(node, ast.FunctionDef) and node.name.startswith("test_") for node in module.body)
+    return count
+
+
+def _run_acceptance(
+    staging_dir: Path, acceptance_dir: Path, *, tested: str, isolation: IsolationLevel, timeout_s: float
+) -> tuple[int, str]:
+    """``(exit code, counts-only summary)`` of the hidden suite against a fresh private copy of staging.
+
+    A fresh sandbox root: nothing the agent's suite left behind (files or a stray process) can reach this run. The
+    staged modules are imported by the suite, so they run in its process: the verdict is green only when pytest
+    exits 0 AND reports exactly the expected number of passed tests and nothing else. That defeats an early exit, a
+    module-level skip or a deselection; a staged module written to forge that exact report would be visible in the
+    diff the human reviews.
+    """
+    expected = _acceptance_test_count(acceptance_dir) if acceptance_dir.is_dir() else 0
+    if expected == 0:
+        return ACCEPTANCE_FAILED_EXIT_CODE, "this seed has no hidden acceptance suite: Lock 1 cannot be earned"
+    with tempfile.TemporaryDirectory(prefix=SANDBOX_ROOT_PREFIX) as tmp:
+        root = Path(tmp).resolve()
+        staging_copy, suite_copy = root / STAGING_COPY_DIRNAME, root / ACCEPTANCE_COPY_DIRNAME
+        staging_copy.mkdir()
+        copy_tree(staging_dir, staging_copy)
+        if compute_tree_sha256(staging_copy) != tested:
+            return ACCEPTANCE_FAILED_EXIT_CODE, "staging changed during the test run: run the tests again"
+        shutil.copytree(acceptance_dir, suite_copy, ignore=shutil.ignore_patterns("__pycache__"))
+        result = _run_suite(root, suite_copy, isolation=isolation, timeout_s=timeout_s, import_dir=staging_copy)
+    if result.timed_out:
+        return TIMEOUT_EXIT_CODE, f"the hidden acceptance suite timed out after {timeout_s:.0f}s"
+    counts = {kind: int(number) for number, kind in _COUNT_PATTERN.findall(_summary_line(result.output, 0))}
+    passed = counts.get("passed", 0)
+    green = result.exit_code == 0 and counts == {"passed": expected}
+    summary = f"{min(passed, expected)} of {expected} hidden acceptance checks passed"
+    if green:
+        return 0, summary
+    hint = "the public behaviour of the seed modules must keep working (functions, signatures, results)"
+    return result.exit_code or ACCEPTANCE_FAILED_EXIT_CODE, f"{summary}: {hint}"
+
+
+def run_staged_tests(
+    staging_dir: Path,
+    *,
+    acceptance_dir: Path | None,
+    pytest_k: str | None = None,
+    allow_unsafe: bool = False,
+    timeout_s: float = STAGED_TESTS_TIMEOUT_S,
+    acceptance_timeout_s: float = ACCEPTANCE_TESTS_TIMEOUT_S,
+) -> StagedTestOutcome:
+    """Run the staged test suite, then the hidden acceptance suite, on private copies under OS isolation.
+
+    The acceptance suite runs only after a full (unfiltered) green run of the agent's suite. Without a working
+    isolation backend this raises ``sandbox_unavailable`` before running anything, unless ``allow_unsafe``
+    (``RuntimeSettings.unsafe_no_sandbox``); the level used is reported in the outcome.
+    """
+    isolation = require_isolation(allow_unsafe=allow_unsafe)
     started = time.perf_counter()
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=scratch_dir,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=PYTEST_TIMEOUT_S,
-            check=False,
+    with tempfile.TemporaryDirectory(prefix=SANDBOX_ROOT_PREFIX) as tmp:
+        root = Path(tmp).resolve()
+        staging_copy = root / STAGING_COPY_DIRNAME
+        staging_copy.mkdir()
+        copy_tree(staging_dir, staging_copy)
+        tested = compute_tree_sha256(staging_copy)
+        result = _run_suite(root, staging_copy, isolation=isolation, timeout_s=timeout_s, pytest_k=pytest_k)
+    if result.timed_out:
+        summary = f"pytest timed out after {timeout_s:.0f}s"
+        output = f"{result.output}\n{summary}"
+    else:
+        summary, output = _summary_line(result.output, result.exit_code), result.output
+    acceptance_exit_code, acceptance_summary = None, ""
+    if result.exit_code == 0 and pytest_k is None and acceptance_dir is not None:
+        acceptance_exit_code, acceptance_summary = _run_acceptance(
+            staging_dir, acceptance_dir, tested=tested, isolation=isolation, timeout_s=acceptance_timeout_s
         )
-        exit_code, output = completed.returncode, completed.stdout + completed.stderr
-    except subprocess.TimeoutExpired as timeout:
-        exit_code = PYTEST_TIMEOUT_EXIT_CODE
-        output = f"{_as_text(timeout.stdout)}{_as_text(timeout.stderr)}\npytest timed out after {PYTEST_TIMEOUT_S}s"
-    duration_s = time.perf_counter() - started
-    summary = (
-        f"pytest timed out after {PYTEST_TIMEOUT_S}s"
-        if exit_code == PYTEST_TIMEOUT_EXIT_CODE
-        else _summary_line(output, exit_code)
+    return StagedTestOutcome(
+        exit_code=result.exit_code,
+        summary=summary,
+        output_tail=output[-PYTEST_OUTPUT_TAIL_CHARS:],
+        duration_s=time.perf_counter() - started,
+        isolation=isolation,
+        tested_tree_sha256=tested,
+        acceptance_exit_code=acceptance_exit_code,
+        acceptance_summary=acceptance_summary,
     )
-    return PytestOutcome(exit_code, summary, output[-PYTEST_OUTPUT_TAIL_CHARS:], duration_s)
+
+
+def run_pytest(staging_dir: Path, scratch_dir: Path, *, pytest_k: str | None = None) -> StagedTestOutcome:
+    """Transitional entry point of the pre-sandbox ``workspace.py``: already sandboxed, without the acceptance suite.
+
+    ``scratch_dir`` is ignored (the run happens on a private copy). Removed once ``workspace.py`` calls
+    ``run_staged_tests``.
+    """
+    del scratch_dir
+    return run_staged_tests(staging_dir, acceptance_dir=None, pytest_k=pytest_k)

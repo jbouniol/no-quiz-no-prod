@@ -13,14 +13,18 @@ while every premature, mismatched or replayed approval gets ``409 gate_locked``,
 nothing.
 """
 
+import json
 import os
+import shutil
+import signal
 import subprocess
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-import httpx
+import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from testkit import (
@@ -160,7 +164,7 @@ class LiveStudio:
         assert response.status_code == 200, response.text
         return response.json()
 
-    def approve(self, expected_diff_sha256: str | None = None) -> httpx.Response:
+    def approve(self, expected_diff_sha256: str | None = None) -> httpx2.Response:
         body = {"action": "approve", "user_id": USER, "reason": "e2e reviewer"}
         if expected_diff_sha256 is not None:
             body["expected_diff_sha256"] = expected_diff_sha256
@@ -193,7 +197,7 @@ def skill_record(records: list[dict[str, Any]], tag: str = SKILL) -> dict[str, A
     return next(record for record in records if record["skill_tag"] == tag)
 
 
-def assert_gate_locked(response: httpx.Response, *missing: str) -> dict[str, Any]:
+def assert_gate_locked(response: httpx2.Response, *missing: str) -> dict[str, Any]:
     assert response.status_code == 409, response.text
     body = response.json()
     assert body["code"] == "gate_locked" and body.get("deployed") is not True
@@ -335,3 +339,36 @@ def test_gate_answers_409_when_nothing_is_staged_or_resumable(live_studio: LiveS
 
     assert live_studio.prod_tree() == seed_prod and live_studio.release_tip() is None  # nothing pushed
     assert live_studio.llm.calls == []  # refused before any agent ran
+
+
+def test_a_killed_mcp_server_is_respawned_and_the_run_goes_on(tmp_path: Path) -> None:
+    """AG-07 on the real stdio transport: both server processes die mid-run; the next call must not be a dead end
+    that burns the step budget with ``internal_error`` answers."""
+    pgrep = shutil.which("pgrep")
+    if pgrep is None:
+        pytest.skip("pgrep is needed to find the MCP server processes")
+    settings = RuntimeSettings(workspace_dir=tmp_path / "workspace")
+    SandboxWorkspace(settings).reset()
+
+    def server_pids() -> set[int]:
+        listing = subprocess.run([pgrep, "-P", str(os.getpid()), "-f", "mcp_servers"], capture_output=True, text=True)
+        return {int(pid) for pid in listing.stdout.split()}
+
+    before = server_pids()
+    with StdioMCPBridge(settings) as bridge:
+        assert bridge.call("list_workspace_files", {}).ok
+        first = server_pids() - before
+        assert len(first) == 2  # code-mcp and notion-quiz-mcp
+        for pid in first:
+            os.kill(pid, signal.SIGKILL)
+        for pid in first:  # reap them through the bridge's own handles: wait until they are really gone
+            while pid in server_pids():
+                time.sleep(0.02)
+
+        files = bridge.call("list_workspace_files", {})
+        rules = bridge.call("search_notion_rules", {"query": "rounding"})
+        assert files.ok and "orders.py" in json.dumps(files.result), files.error
+        assert rules.ok and "RULE-001" in json.dumps(rules.result), rules.error
+        second = server_pids() - before
+        assert len(second) == 2 and not second & first  # two fresh servers, the dead ones are not leaked
+    assert server_pids() == before  # close() stops them

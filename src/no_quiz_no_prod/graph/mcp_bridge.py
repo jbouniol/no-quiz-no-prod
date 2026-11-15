@@ -11,6 +11,11 @@
 The async MCP sessions live on one private event-loop thread; graph nodes stay synchronous and call ``call()``
 from any thread. Every failure comes back as a typed ``ToolErrorPayload`` (never an exception), so the harness can
 retry what is retryable and the model can read the rest.
+
+Least privilege: each stdio server gets ``settings.environment_for(server)`` and nothing else of the project: the
+release token and remote only reach the server that publishes, the Notion key only the Notion server, no LLM key
+reaches either. Lifecycle: a server that died is reconnected once and the call repeated (writes carry their
+idempotency key, so a repeat is a replay). The deploy call waits longer than the server's own release deadline.
 """
 
 import asyncio
@@ -28,14 +33,19 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Final, Literal, Self
 
+import anyio
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.mcpserver import MCPServer
+from mcp_types import CONNECTION_CLOSED
 from pydantic_core import to_jsonable_python
 
 from no_quiz_no_prod.agents.tools import server_for
 from no_quiz_no_prod.contracts import (
     ALL_MCP_SERVERS,
+    MCP_CALL_TIMEOUT_S,
+    MCP_CONNECT_TIMEOUT_S,
+    MCP_DEPLOY_CALL_TIMEOUT_S,
     MCP_SERVER_MODULES,
     PROJECT_ROOT,
     EnvVar,
@@ -49,11 +59,18 @@ logger = logging.getLogger(__name__)
 McpTransport = Literal["stdio", "inprocess"]
 ToolDispatcher = Callable[[McpServerName, str, dict[str, Any]], Any]
 
-MCP_CONNECT_TIMEOUT_S: Final = 60.0
-MCP_CALL_TIMEOUT_S: Final = 180.0  # a full pytest run on staging included
 MCP_SHUTDOWN_TIMEOUT_S: Final = 10.0
 MCP_SERVER_LOG_FILENAME: Final = "mcp_servers.log"
-PASSTHROUGH_ENV: Final = tuple(var.value for var in EnvVar)  # keys the servers may need when not in .env
+# How long the bridge waits for one call: the deploy runs a whole git release server-side, so its budget is above
+# the server's own deadline (a bridge timeout there would report an unknown outcome for a deploy still running).
+CALL_TIMEOUT_BY_TOOL: Final[Mapping[str, float]] = {"deploy_to_production": MCP_DEPLOY_CALL_TIMEOUT_S}
+# What a dead server looks like from the client: its streams are closed or broken.
+CONNECTION_LOST_ERRORS: Final = (
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+    anyio.EndOfStream,
+    ConnectionError,
+)
 MAX_ERROR_TEXT: Final = 500
 
 
@@ -92,6 +109,16 @@ def error_from_exception(exc: BaseException) -> ToolErrorPayload:
     return ToolErrorPayload.from_text(text) or ToolErrorPayload(
         code="internal_error", message=f"{type(exc).__name__}: {text}"[:MAX_ERROR_TEXT]
     )
+
+
+def call_timeout_s(tool: str) -> float:
+    """Seconds the bridge waits for ``tool`` (see ``CALL_TIMEOUT_BY_TOOL``)."""
+    return CALL_TIMEOUT_BY_TOOL.get(tool, MCP_CALL_TIMEOUT_S)
+
+
+def connection_lost(exc: BaseException) -> bool:
+    """True when ``exc`` means the server is gone (process died, pipe closed), not that the tool failed."""
+    return isinstance(exc, CONNECTION_LOST_ERRORS) or getattr(exc, "code", None) == CONNECTION_CLOSED
 
 
 def _maybe_json(text: str) -> Any:
@@ -218,11 +245,28 @@ class _SessionBridge(MCPToolBridge):
             return loop
 
     def _call(self, server: McpServerName, tool: str, args: dict[str, Any]) -> ToolOutcome:
-        loop = self._ensure_connected()
-        session = self._sessions[server]
+        """One call; a server found dead is reconnected ONCE and the same call repeated.
+
+        The repeat is safe: reads are pure and every write carries its idempotency key in ``args``, so a write the
+        dead server did complete is replayed, not redone. A timeout is never repeated here (the server is alive
+        and may still be working): it surfaces as ``timeout`` with ``outcome_unknown``.
+        """
+        try:
+            return self._call_once(server, tool, args)
+        except Exception as exc:
+            if not connection_lost(exc):
+                raise
+            logger.warning("MCP server %s is gone (%s): reconnecting once", server, type(exc).__name__)
+        self.restart()
+        return self._call_once(server, tool, args)
+
+    def _call_once(self, server: McpServerName, tool: str, args: dict[str, Any]) -> ToolOutcome:
+        with self._lock:
+            loop = self._ensure_connected()
+            session = self._sessions[server]
         future = asyncio.run_coroutine_threadsafe(session.call_tool(tool, args), loop)
         try:
-            return decode_call_result(future.result(timeout=MCP_CALL_TIMEOUT_S))
+            return decode_call_result(future.result(timeout=call_timeout_s(tool)))
         except concurrent.futures.TimeoutError:
             future.cancel()
             raise
@@ -266,20 +310,18 @@ class StdioMCPBridge(_SessionBridge):
     transport: McpTransport = "stdio"
 
     def server_parameters(self, server: McpServerName) -> StdioServerParameters:
-        """``python -m <module>`` bound to this run's workspace. The servers share the harness's view of Notion and
-        of the release remote: settings without a Notion key spawn them with ``NOTION_API_KEY=""`` (eval runs stay out
-        of the live DBs), and the remote URL, branch and token are always those of the settings (none: the
-        workspace's local bare remote, never a GitHub remote configured in ``.env``)."""
-        env = {name: os.environ[name] for name in PASSTHROUGH_ENV if os.environ.get(name)}
-        env[EnvVar.NO_QUIZ_WORKSPACE_DIR.value] = str(self.settings.workspace_dir)
-        if self.settings.notion_api_key is None:
-            env[EnvVar.NOTION_API_KEY.value] = ""
-        # the release remote always follows the harness settings (e.g. updated by the Studio's /api/apikey); the
-        # token travels in the child's environment only, never in argv
-        env[EnvVar.NO_QUIZ_GIT_REMOTE_URL.value] = self.settings.git_remote_url or ""
-        token = self.settings.github_token
-        env[EnvVar.NO_QUIZ_GITHUB_TOKEN.value] = token.get_secret_value() if token is not None else ""
-        env[EnvVar.NO_QUIZ_GIT_BRANCH.value] = self.settings.git_branch
+        """``python -m <module>`` bound to this run's workspace, with a least-privilege environment.
+
+        ``settings.environment_for(server)`` gives each server only its allow-listed variables and sets every other
+        project variable EMPTY, which also stops the server from reading it back from ``.env``: no LLM key for
+        either server, the release remote and token only for the one that publishes, the Notion key only for the
+        Notion server. Values always follow the harness settings (e.g. updated by the Studio), never the parent's
+        environment; the token travels in the child's environment only, never in argv. ``NO_QUIZ_ENV_FILE`` (which
+        ``.env`` to load, not a secret) is inherited when set.
+        """
+        env = self.settings.environment_for(server)
+        if env_file := os.environ.get(EnvVar.NO_QUIZ_ENV_FILE.value):
+            env[EnvVar.NO_QUIZ_ENV_FILE.value] = env_file
         return StdioServerParameters(
             command=sys.executable, args=["-m", MCP_SERVER_MODULES[server]], env=env, cwd=str(PROJECT_ROOT)
         )
@@ -335,8 +377,7 @@ def create_bridge(
 
 
 __all__ = [
-    "MCP_CALL_TIMEOUT_S",
-    "MCP_CONNECT_TIMEOUT_S",
+    "CALL_TIMEOUT_BY_TOOL",
     "MCP_SERVER_LOG_FILENAME",
     "DispatcherBridge",
     "InMemoryMCPBridge",
@@ -346,6 +387,8 @@ __all__ = [
     "ToolCallError",
     "ToolDispatcher",
     "ToolOutcome",
+    "call_timeout_s",
+    "connection_lost",
     "create_bridge",
     "decode_call_result",
     "error_from_exception",

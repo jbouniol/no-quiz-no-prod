@@ -20,7 +20,7 @@ import json
 import re
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import anthropic
 import openai
@@ -130,7 +130,7 @@ def estimate_cost_usd(model: str, tokens_in: int, tokens_out: int) -> float:
 
 def available_providers() -> dict[str, bool]:
     """Which providers have an API key configured (``.env`` included). Never returns or logs a key."""
-    return dict(RuntimeSettings.from_env().providers)
+    return {provider: has_key for provider, has_key in RuntimeSettings.from_env().providers.items()}
 
 
 def function_tool(name: str, description: str, parameters: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -283,7 +283,7 @@ class LLMClient:
         self._anthropic_client: anthropic.Anthropic | None = None
 
     def available_providers(self) -> dict[str, bool]:
-        return dict(self.settings.providers)
+        return {provider: has_key for provider, has_key in self.settings.providers.items()}
 
     # -- public API --------------------------------------------------------------------------------------------------
     def chat_with_tools(
@@ -452,7 +452,7 @@ class LLMClient:
         started = time.perf_counter()
         response = self._openrouter().chat.completions.parse(
             model=model,
-            messages=list(messages),
+            messages=cast(Any, list(messages)),  # OpenAI-format dicts: the SDK's TypedDict union is narrower
             response_format=schema,
             temperature=temperature,
             max_tokens=max_tokens,

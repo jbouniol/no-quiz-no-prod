@@ -13,21 +13,25 @@ import inspect
 import json
 import os
 import re
+import threading
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
-from urllib.parse import urlparse
 
 import uvicorn
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
 from no_quiz_no_prod import __version__
+from no_quiz_no_prod.backend.errors import WorkspaceError
+from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
+from no_quiz_no_prod.backend.release import GitReleasePublisher, describe_release_remote, validate_release_config
+from no_quiz_no_prod.backend.workspace import SandboxWorkspace
 from no_quiz_no_prod.contracts import (
     ALL_EVAL_OUTCOMES,
     ALL_SCENARIO_KINDS,
@@ -36,8 +40,10 @@ from no_quiz_no_prod.contracts import (
     DEFAULT_SEED,
     DEFAULT_USER_ID,
     ENV_FILE,
+    ERROR_STOP_REASONS,
     NOTION_IDS_FILE,
     PROJECT_ROOT,
+    RELEASE_RETRY_CODES,
     DeployAction,
     DeployDecision,
     DeployGateStatus,
@@ -45,10 +51,10 @@ from no_quiz_no_prod.contracts import (
     EnvVar,
     EvalRunResult,
     FaultKind,
-    GateLedger,
     HumanInterrupt,
     InjectionSpec,
     NotionRule,
+    PendingRelease,
     PublicQuizView,
     PytestReport,
     QuizAnswer,
@@ -58,16 +64,26 @@ from no_quiz_no_prod.contracts import (
     RunEvent,
     RunFinalState,
     RuntimeSettings,
+    Sha256Hex,
     ShipLogEntry,
     SkillProfileRecord,
     StopReason,
     ToolCallTrace,
+    ToolErrorCode,
     Topology,
-    compute_tree_sha256,
     pass_at_k,
     pass_hat_k,
 )
 from no_quiz_no_prod.eval.scorer import is_hidden_failure
+from no_quiz_no_prod.ui.security import (
+    ALLOWED_HOSTS_ENV,
+    SESSION_TOKEN_PLACEHOLDER,
+    StudioGuard,
+    allowed_hosts_from,
+    allowed_hosts_from_env,
+    new_session_token,
+    same_origin_client_kwargs,
+)
 
 STATIC_DIR: Final = Path(__file__).resolve().parent / "static"
 SERVICE_NAME: Final = "no-quiz-no-prod-ui"
@@ -110,7 +126,8 @@ class WorkspaceBackend(Protocol):
         self, question_id: str, selected_option: QuizOptionKey, *, user_id: str = DEFAULT_USER_ID
     ) -> QuizGradeResult: ...
     def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus: ...
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus: ...
+    def get_gate_status(self, expected_diff_sha256: str) -> DeployGateStatus: ...
+    def gate_status_of(self, diff_sha256: str) -> DeployGateStatus: ...
     def get_skill_profile(self, user_id: str = DEFAULT_USER_ID) -> list[SkillProfileRecord]: ...
     def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int: ...
 
@@ -132,6 +149,8 @@ class WorkflowOutcomeLike(Protocol):
     def budget(self) -> RunBudget: ...
     @property
     def final_state(self) -> RunFinalState: ...
+    @property
+    def pending_release(self) -> PendingRelease | None: ...
 
 
 class WorkflowBackend(Protocol):
@@ -169,109 +188,59 @@ class WorkflowBackend(Protocol):
 WorkflowFactory = Callable[[RuntimeSettings, Topology, str], WorkflowBackend]
 
 
-# ---- lightweight standalone workspace fallback (only when backend module is absent) --------------------------------
-class _StandaloneWorkspaceFallback:
-    """Minimal contract-faithful workspace when running in an isolated worktree without ``backend`` installed."""
-
-    def __init__(self, settings: RuntimeSettings) -> None:
-        self.settings = settings
-        self._skills: dict[str, dict[str, SkillProfileRecord]] = {}
-        self._ensure_dirs()
-
-    def _ensure_dirs(self) -> None:
-        self.settings.area_dir("prod").mkdir(parents=True, exist_ok=True)
-        self.settings.area_dir("staging").mkdir(parents=True, exist_ok=True)
-
-    def reset(
-        self,
-        seed: str = DEFAULT_SEED,
-        *,
-        fault: FaultKind | None = None,
-        injection: InjectionSpec | None = None,
-        preserve_skill_memory: bool = False,
-    ) -> RunFinalState:
-        _ = (seed, fault, injection)
-        self._ensure_dirs()
-        if self.settings.gate_ledger_path.is_file():
-            self.settings.gate_ledger_path.unlink()
-        if not preserve_skill_memory:
-            self._skills.clear()
-        diff = self.get_diff_report()
-        return RunFinalState(
-            prod_tree_sha256=diff.prod_tree_sha256,
-            staging_tree_sha256=diff.staging_tree_sha256,
-            prod_changed=False,
-        )
-
-    def get_diff_report(self) -> DiffReport:
-        self._ensure_dirs()
-        prod_sha = compute_tree_sha256(self.settings.area_dir("prod"))
-        staging_sha = compute_tree_sha256(self.settings.area_dir("staging"))
-        return DiffReport(prod_tree_sha256=prod_sha, staging_tree_sha256=staging_sha, files=[])
-
-    def get_latest_pytest(self) -> PytestReport | None:
-        return None
-
-    def get_latest_ship_log(self, thread_id: str | None = None) -> ShipLogEntry | None:
-        _ = thread_id
-        return None
-
-    def get_latest_public_quiz(
-        self, thread_id: str | None = None, diff_sha256: str | None = None
-    ) -> PublicQuizView | None:
-        _ = (thread_id, diff_sha256)
-        return None
-
-    def grade_quiz_answer(
-        self, question_id: str, selected_option: QuizOptionKey, *, user_id: str = DEFAULT_USER_ID
-    ) -> QuizGradeResult:
-        _ = (question_id, selected_option, user_id)
-        raise KeyError("No active quiz in standalone fallback workspace.")
-
-    def apply_deploy_decision(self, decision: DeployDecision, *, thread_id: str | None = None) -> DeployGateStatus:
-        _ = thread_id
-        diff = self.get_diff_report()
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
-        target_sha = decision.expected_diff_sha256 or diff.diff_sha256
-        entry = "human_approved" if decision.approved else "blocked"
-        updated = ledger.record(entry, target_sha)
-        updated.save(self.settings.gate_ledger_path)
-        return updated.status(diff.diff_sha256, decision.expected_diff_sha256)
-
-    def get_gate_status(self, expected_diff_sha256: str | None = None) -> DeployGateStatus:
-        diff = self.get_diff_report()
-        ledger = GateLedger.load(self.settings.gate_ledger_path)
-        return ledger.status(diff.diff_sha256, expected_diff_sha256)
-
-    def get_skill_profile(self, user_id: str = DEFAULT_USER_ID) -> list[SkillProfileRecord]:
-        bucket = self._skills.get(user_id, {})
-        return [bucket.get(tag, SkillProfileRecord(skill_tag=tag, user_id=user_id)) for tag in ALL_SKILL_TAGS]
-
-    def forget_user_skills(self, user_id: str = DEFAULT_USER_ID) -> int:
-        removed = len(self._skills.pop(user_id, {}))
-        return removed
-
-
 def _load_default_workspace(settings: RuntimeSettings) -> WorkspaceBackend:
-    try:
-        from no_quiz_no_prod.backend.workspace import SandboxWorkspace  # type: ignore[import-not-found]
-    except ModuleNotFoundError as exc:
-        if exc.name in {"no_quiz_no_prod.backend", "no_quiz_no_prod.backend.workspace"}:
-            return _StandaloneWorkspaceFallback(settings)
-        raise
     return SandboxWorkspace(settings=settings)
 
 
 def _default_workflow_factory(settings: RuntimeSettings, topology: Topology, model: str) -> WorkflowBackend:
-    try:
-        from no_quiz_no_prod.graph.workflow import NoQuizWorkflow  # type: ignore[import-not-found]
-    except ModuleNotFoundError as exc:
-        if exc.name in {"no_quiz_no_prod.graph", "no_quiz_no_prod.graph.workflow"}:
-            raise RuntimeError(
-                "LangGraph workflow package (`no_quiz_no_prod.graph.workflow`) is not installed in this worktree."
-            ) from exc
-        raise
+    from no_quiz_no_prod.graph.workflow import NoQuizWorkflow  # deferred: importing LangGraph is slow
+
     return NoQuizWorkflow(settings=settings, topology=topology, model=model)
+
+
+def _thread_state_error() -> type[Exception]:
+    """The workflow's "this thread is not waiting for that decision" error (deferred import, as above)."""
+    from no_quiz_no_prod.graph.workflow import ThreadStateError
+
+    return ThreadStateError
+
+
+# ---- typed errors over HTTP ------------------------------------------------------------------------------------------
+BusyKind = Literal["run", "quiz", "deploy", "reset", "settings", "memory"]
+
+
+class RunActiveError(Exception):
+    """Another operation owns the workspace: one active run per workspace, answered with 409 ``run_active``."""
+
+    def __init__(self, busy: BusyKind) -> None:
+        self.busy: BusyKind = busy
+        super().__init__(f"The workspace is busy ({busy} in progress). Retry once it is over.")
+
+
+# One status per typed error code, so a refusal of the gate, a bad argument and a broken dependency never look alike.
+_HTTP_STATUS_BY_ERROR_CODE: Final[dict[ToolErrorCode, int]] = {
+    "invalid_argument": 422,
+    "not_found": 404,
+    "forbidden": 403,
+    "gate_locked": 409,
+    "quiz_exhausted": 409,
+    "conflict": 409,
+    "remote_diverged": 409,
+    "run_active": 409,
+    "rate_limited": 429,
+    "timeout": 504,
+    "upstream_error": 502,
+    "sandbox_unavailable": 503,
+    "internal_error": 500,
+}
+
+
+def _error_response(code: ToolErrorCode, message: str, *, status: int | None = None, **extra: Any) -> JSONResponse:
+    """The one error body of the API: ``{"ok": false, "code", "message", ...}``."""
+    return JSONResponse(
+        status_code=status if status is not None else _HTTP_STATUS_BY_ERROR_CODE[code],
+        content={"ok": False, "code": code, "message": message, **extra},
+    )
 
 
 # ---- request schemas -----------------------------------------------------------------------------------------------
@@ -309,7 +278,7 @@ class DeploySubmitRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     action: DeployAction
-    expected_diff_sha256: str | None = None
+    expected_diff_sha256: Sha256Hex  # the diff the human was shown: mandatory, never defaulted server-side
     reason: str = ""
     user_id: str = DEFAULT_USER_ID
     model: str | None = None
@@ -326,30 +295,10 @@ _API_KEY_ENV_MAP: Final[dict[ApiKeyProvider, tuple[EnvVar, str]]] = {
     "git_remote": (EnvVar.NO_QUIZ_GIT_REMOTE_URL, "git_remote_url"),  # not a secret, but handled write-only too
 }
 _PLAIN_SETTINGS: Final = frozenset({"git_remote_url"})  # every other updatable setting is a SecretStr
-# deploy_to_production push errors (mirrors graph.workflow.RELEASE_RETRY_CODES; the UI also runs without the graph)
-_RELEASE_RETRY_CODES: Final = frozenset({"conflict", "upstream_error", "timeout"})
 # The env var names are accepted as provider aliases (e.g. "NO_QUIZ_GITHUB_TOKEN").
 _PROVIDER_ALIASES: Final[dict[str, ApiKeyProvider]] = {
     env_var.value: provider for provider, (env_var, _) in _API_KEY_ENV_MAP.items()
 }
-
-
-def _git_summary(settings: RuntimeSettings) -> dict[str, Any]:
-    """``{"remote_kind", "repo", "branch", "token_set"}``: the secret-free release remote view of health and state."""
-    from no_quiz_no_prod.backend.release import describe_release_remote  # local: the UI also runs without backend
-
-    return describe_release_remote(settings)
-
-
-def _check_release_remote_url(url: str) -> None:
-    """Validate a release remote URL before it is written (same rules as the deploy); never echoes the URL."""
-    from no_quiz_no_prod.backend.errors import WorkspaceError  # local: the UI also runs without backend
-    from no_quiz_no_prod.backend.release import GitReleasePublisher
-
-    try:
-        GitReleasePublisher(RuntimeSettings(git_remote_url=url)).resolve_remote()
-    except WorkspaceError as error:
-        raise ValueError(error.payload.message) from None
 
 
 class ApiKeyUpdateRequest(BaseModel):
@@ -357,6 +306,8 @@ class ApiKeyUpdateRequest(BaseModel):
 
     provider: ApiKeyProvider
     api_key: str = Field(min_length=1, repr=False)
+    # Changing where deploys are pushed must be an explicit act: the remote is saved only with this set to true.
+    confirm_remote_change: bool = False
 
     @field_validator("provider", mode="before")
     @classmethod
@@ -372,12 +323,6 @@ class ApiKeyUpdateRequest(BaseModel):
         if "\n" in cleaned or "\r" in cleaned or "\x00" in cleaned:
             raise ValueError("API key must be a single-line token.")
         return cleaned
-
-    @model_validator(mode="after")
-    def _validate_release_remote(self) -> ApiKeyUpdateRequest:
-        if self.provider == "git_remote":
-            _check_release_remote_url(self.api_key)
-        return self
 
 
 def _format_env_assignment(var_name: str, secret_value: str) -> str:
@@ -539,6 +484,17 @@ def _build_models_catalogue(settings: RuntimeSettings) -> dict[str, Any]:
     }
 
 
+def _dump_or_none(model: BaseModel | None) -> dict[str, Any] | None:
+    return model.model_dump(mode="json") if model is not None else None
+
+
+def _pending_release_of(outcome: WorkflowOutcomeLike) -> PendingRelease | None:
+    """The failed publish an outcome carries: on its ``release_retry`` interrupt, or on the outcome itself."""
+    if outcome.interrupt is not None and outcome.interrupt.release is not None:
+        return outcome.interrupt.release
+    return outcome.pending_release
+
+
 def _sse_frame(event: RunEvent) -> str:
     return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
@@ -565,6 +521,7 @@ class _ThreadSession:
     final_answer: str = ""
     expected_diff_sha256: str | None = None
     deployed_diff_sha256: str | None = None
+    pending_release: PendingRelease | None = None  # a deploy whose push failed, waiting for re-approval or rejection
     workflow: WorkflowBackend | None = None
 
 
@@ -589,6 +546,49 @@ class StudioManager:
         self.env_file = env_file or ENV_FILE
         self.sessions: dict[str, _ThreadSession] = {}
         self.latest_thread_id: str | None = None
+        self._busy: BusyKind | None = None
+        self._busy_lock = threading.Lock()
+        self._background: set[asyncio.Task[Any]] = set()
+
+    # ---- one active operation per workspace (run, quiz answer, deploy, reset, settings, memory) -------------------------
+    @property
+    def busy(self) -> BusyKind | None:
+        return self._busy
+
+    def begin(self, kind: BusyKind) -> None:
+        """Take the workspace for one operation, or raise ``RunActiveError``. Never blocks, holds no lock afterwards."""
+        with self._busy_lock:
+            if self._busy is not None:
+                raise RunActiveError(self._busy)
+            self._busy = kind
+
+    def end(self) -> None:
+        with self._busy_lock:
+            self._busy = None
+
+    @contextmanager
+    def exclusive(self, kind: BusyKind) -> Iterator[None]:
+        self.begin(kind)
+        try:
+            yield
+        finally:
+            self.end()
+
+    def keep_alive(self, task: asyncio.Task[Any]) -> None:
+        """Hold a reference to a run that must finish even when its HTTP client is gone."""
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def record_outcome(self, session: _ThreadSession, outcome: WorkflowOutcomeLike) -> None:
+        """What the thread is now waiting for (or how it ended), as every later request and reload must see it."""
+        session.interrupt = outcome.interrupt
+        session.stop_reason = outcome.stop_reason
+        session.budget = outcome.budget
+        session.final_answer = outcome.final_answer
+        session.pending_release = _pending_release_of(outcome)
+        gated = (outcome.interrupt.quiz or outcome.interrupt.gate) if outcome.interrupt else None
+        if gated is not None:
+            session.expected_diff_sha256 = gated.diff_sha256
 
     @property
     def provider_status(self) -> dict[str, bool]:
@@ -603,7 +603,8 @@ class StudioManager:
         """Persist ``api_key`` to ``self.env_file`` (0o600) and refresh ``self.settings`` in memory."""
         env_var, settings_attr = _API_KEY_ENV_MAP[provider]
         _upsert_env_secret(self.env_file, env_var, api_key)
-        if self.env_file == ENV_FILE:
+        if self.env_file == ENV_FILE and provider != "github":
+            # The release token stays out of os.environ: no child process of the Studio may inherit it.
             os.environ[env_var.value] = api_key
 
         notion_ids = _read_notion_metadata(self.notion_ids_file)
@@ -618,19 +619,15 @@ class StudioManager:
         self.settings = self.settings.model_copy(update=updates)
         if self._workspace is not None:
             if hasattr(self._workspace, "settings"):
-                self._workspace.settings = self.settings  # type: ignore[attr-defined]
+                self._workspace.settings = self.settings
             if hasattr(self._workspace, "notion"):
                 old_notion = getattr(self._workspace, "notion", None)
                 close_fn = getattr(old_notion, "close", None)
                 if callable(close_fn):
                     close_fn()
-                from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync
-
-                self._workspace.notion = NotionDatabaseSync(self.settings)  # type: ignore[attr-defined]
+                self._workspace.notion = NotionDatabaseSync(self.settings)
             if hasattr(self._workspace, "release"):
-                from no_quiz_no_prod.backend.release import GitReleasePublisher
-
-                self._workspace.release = GitReleasePublisher(self.settings)  # type: ignore[attr-defined]
+                self._workspace.release = GitReleasePublisher(self.settings)
         for session in self.sessions.values():
             session.workflow = None
         return self.provider_status
@@ -678,7 +675,7 @@ class StudioManager:
         model = model_hint or saved.get("model") or str(catalogue["default_model"])
         saved_topo = saved.get("topology")
         topology: Topology = (
-            topology_hint if topology_hint is not None else (saved_topo if saved_topo in ("dual", "single") else "dual")
+            topology_hint if topology_hint is not None else ("single" if saved_topo == "single" else "dual")
         )
         return model, topology
 
@@ -702,16 +699,11 @@ class StudioManager:
             quiz = ws.get_latest_public_quiz(thread_id=thread_id)
 
         session = self.sessions.get(thread_id) if thread_id else None
-        if (
-            session is not None
-            and session.deployed_diff_sha256
-            and diff.trees_identical
-            and self.settings.gate_ledger_path.is_file()
-        ):
-            ledger = GateLedger.load(self.settings.gate_ledger_path)
-            locks = ledger.status(session.deployed_diff_sha256, session.deployed_diff_sha256)
+        if session is not None and session.deployed_diff_sha256 and diff.trees_identical:
+            locks = ws.gate_status_of(session.deployed_diff_sha256)  # the receipt of the diff this thread shipped
         else:
-            locks = ws.get_gate_status(expected_diff_sha256=expected_diff_sha256)
+            # A read-only view: with no decision pending, the locks shown are those of what is staged right now.
+            locks = ws.get_gate_status(expected_diff_sha256 or diff.diff_sha256)
         return diff, pytest_rep, ship_log, quiz, locks
 
     def build_state_payload(self, *, user_id: str = DEFAULT_USER_ID, thread_id: str | None = None) -> dict[str, Any]:
@@ -747,9 +739,11 @@ class StudioManager:
                 "ship_log": ship_log.model_dump(mode="json") if ship_log else None,
                 "quiz": _sanitize_public_quiz(quiz),
                 "locks": locks.model_dump(mode="json"),
+                "pending_release": _dump_or_none(session.pending_release if session else None),
+                "busy": self.busy,
             },
             "skill_profile": [rec.model_dump(mode="json") for rec in skills],
-            "git": _git_summary(self.settings),
+            "git": describe_release_remote(self.settings),
         }
 
     def load_eval_results(self) -> dict[str, Any]:
@@ -765,13 +759,18 @@ class StudioManager:
         seen_keys: set[tuple[str, Topology, str, int]] = set()
         runs: list[EvalRunResult] = []
         used_sources: list[str] = []
+        invalid_rows = 0  # lines that are not a valid EvalRunResult: skipped and reported, never fatal
         for path in candidate_files:
             added = 0
             for raw_line in path.read_text(encoding="utf-8").splitlines():
                 stripped = raw_line.strip()
                 if not stripped:
                     continue
-                parsed_run = EvalRunResult.model_validate_json(stripped)
+                try:
+                    parsed_run = EvalRunResult.model_validate_json(stripped)
+                except ValidationError:
+                    invalid_rows += 1
+                    continue
                 dedupe_key = (parsed_run.model, parsed_run.topology, parsed_run.id, parsed_run.repeat)
                 if dedupe_key in seen_keys:
                     continue
@@ -789,6 +788,7 @@ class StudioManager:
             return {
                 "available": False,
                 "source_files": [],
+                "invalid_rows": invalid_rows,
                 "summary": {
                     "total_runs": 0,
                     "passed_runs": 0,
@@ -880,6 +880,7 @@ class StudioManager:
         return {
             "available": True,
             "source_files": used_sources,
+            "invalid_rows": invalid_rows,
             "summary": {
                 "total_runs": total_runs,
                 "passed_runs": passed_runs,
@@ -912,8 +913,14 @@ def create_app(
     eval_dir: Path | None = None,
     notion_ids_file: Path | None = None,
     env_file: Path | None = None,
+    allowed_hosts: Sequence[str] | None = None,
+    session_token: str | None = None,
 ) -> FastAPI:
-    """Create the FastAPI Studio server with injectable workspace/workflow backends for testing."""
+    """Create the FastAPI Studio server with injectable workspace/workflow backends for testing.
+
+    ``allowed_hosts`` defaults to the loopback names plus ``NO_QUIZ_UI_ALLOWED_HOSTS``; ``session_token`` defaults
+    to a fresh random token. Both feed ``StudioGuard``, which every request crosses before any route.
+    """
     manager = StudioManager(
         settings=settings,
         workspace=workspace,
@@ -930,11 +937,28 @@ def create_app(
         redoc_url=None,
     )
     app.state.studio = manager
+    app.state.session_token = session_token or new_session_token()
+    app.state.allowed_hosts = tuple(allowed_hosts) if allowed_hosts is not None else allowed_hosts_from_env()
+    app.add_middleware(StudioGuard, allowed_hosts=app.state.allowed_hosts, session_token=app.state.session_token)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    @app.exception_handler(RunActiveError)
+    async def on_run_active(_request: Request, error: RunActiveError) -> JSONResponse:
+        return _error_response("run_active", str(error), busy=error.busy)
+
+    @app.exception_handler(WorkspaceError)
+    async def on_workspace_error(_request: Request, error: WorkspaceError) -> JSONResponse:
+        # A typed backend refusal or failure keeps its own code and status: it is never relabelled "gate_locked".
+        return _error_response(error.payload.code, error.payload.message)
+
     @app.get("/", response_model=None)
-    async def serve_index() -> FileResponse:
-        return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
+    async def serve_index() -> HTMLResponse:
+        # The session token reaches the browser only inside this page, which another origin cannot read.
+        page = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(
+            page.replace(SESSION_TOKEN_PLACEHOLDER, app.state.session_token),
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/health")
     async def get_health() -> dict[str, Any]:
@@ -948,7 +972,7 @@ def create_app(
             "version": __version__,
             "workspace_dir": ws_rel,
             "providers": manager.settings.providers,
-            "git": _git_summary(manager.settings),
+            "git": describe_release_remote(manager.settings),
         }
 
     @app.get("/api/state")
@@ -962,39 +986,33 @@ def create_app(
     async def post_apikey(request: Request) -> JSONResponse:
         content_type = request.headers.get("content-type", "").lower()
         if not content_type.startswith("application/json"):
-            return JSONResponse(
-                status_code=415,
-                content={"ok": False, "detail": "Content-Type must be application/json."},
-            )
-        origin = request.headers.get("origin")
-        host = request.headers.get("host")
-        if origin and host and urlparse(origin).netloc.lower() != host.lower():
-            return JSONResponse(
-                status_code=403,
-                content={"ok": False, "detail": "Cross-origin API key updates are forbidden."},
-            )
+            return _error_response("invalid_argument", "Content-Type must be application/json.", status=415)
         try:
             raw_body = await request.json()
         except ValueError:
-            return JSONResponse(
-                status_code=422,
-                content={"ok": False, "detail": "Invalid JSON request body."},
-            )
+            return _error_response("invalid_argument", "Invalid JSON request body.")
         if not isinstance(raw_body, dict):
-            return JSONResponse(
-                status_code=422,
-                content={"ok": False, "detail": "Expected JSON object payload."},
-            )
+            return _error_response("invalid_argument", "Expected JSON object payload.")
         try:
             req = ApiKeyUpdateRequest.model_validate(raw_body)
         except ValidationError as exc:
             first_msg = exc.errors()[0].get("msg", "Invalid API key update request.") if exc.errors() else "Invalid."
-            return JSONResponse(
-                status_code=422,
-                content={"ok": False, "detail": str(first_msg)},
-            )
+            return _error_response("invalid_argument", str(first_msg))
+        if req.provider == "git_remote":
+            # Validate against the configured allowed hosts (not defaults); WorkspaceError -> 422 invalid_argument.
+            candidate = manager.settings.model_copy(update={"git_remote_url": req.api_key})
+            GitReleasePublisher(candidate).resolve_remote()
+            if not req.confirm_remote_change:
+                return _error_response(
+                    "invalid_argument",
+                    "Changing the release remote redirects every later deploy: "
+                    "resend with confirm_remote_change=true to confirm.",
+                    confirmation_required=True,
+                )
 
-        providers = await _invoke_maybe_async(manager.update_api_key, req.provider, req.api_key)
+        # Settings are never swapped under a run, a quiz answer or a deploy (the remote least of all): 409 run_active.
+        with manager.exclusive("settings"):
+            providers = await _invoke_maybe_async(manager.update_api_key, req.provider, req.api_key)
         return JSONResponse(
             status_code=200,
             content={
@@ -1003,20 +1021,21 @@ def create_app(
                 "providers": providers,
                 "notion_enabled": manager.settings.notion_enabled,
                 "models": _build_models_catalogue(manager.settings),
-                "git": _git_summary(manager.settings),
+                "git": describe_release_remote(manager.settings),
             },
         )
 
     @app.post("/api/reset")
     async def post_reset(req: ResetRequest) -> dict[str, Any]:
-        final_state = await _invoke_maybe_async(
-            manager.workspace.reset,
-            req.seed,
-            preserve_skill_memory=not req.reset_skill_memory,
-        )
-        manager.sessions.clear()
-        manager.clear_thread_meta()
-        manager.latest_thread_id = None
+        with manager.exclusive("reset"):  # refused with 409 run_active while a run streams or a deploy is in flight
+            final_state = await _invoke_maybe_async(
+                manager.workspace.reset,
+                req.seed,
+                preserve_skill_memory=not req.reset_skill_memory,
+            )
+            manager.sessions.clear()
+            manager.clear_thread_meta()
+            manager.latest_thread_id = None
         state_payload = manager.build_state_payload(user_id=req.user_id, thread_id=None)
         return {
             "reset": True,
@@ -1027,38 +1046,80 @@ def create_app(
             "state": state_payload,
         }
 
-    @app.post("/api/runs/stream")
-    async def post_runs_stream(req: RunStreamRequest) -> StreamingResponse:
+    @app.post("/api/runs/stream", response_model=None)
+    async def post_runs_stream(req: RunStreamRequest) -> Response:
         catalogue = _build_models_catalogue(manager.settings)
         chosen_model = req.model or str(catalogue["default_model"])
         thread_id = req.thread_id or f"thr_{uuid.uuid4().hex[:8]}"
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[RunEvent | None] = asyncio.Queue()
 
-        session = manager.sessions.get(thread_id)
-        if session is None:
-            session = _ThreadSession(
-                thread_id=thread_id,
-                model=chosen_model,
-                topology=req.topology,
-                user_id=req.user_id,
-            )
-            manager.sessions[thread_id] = session
-        else:
-            session.model = chosen_model
-            session.topology = req.topology
-            session.user_id = req.user_id
-            session.interrupt = None
-            session.stop_reason = None
-        manager.persist_thread_meta(thread_id, model=chosen_model, topology=req.topology)
-        manager.latest_thread_id = thread_id
+        # A release remote that cannot work is reported now, before any model call (typed error, see the handler).
+        validate_release_config(manager.settings)
 
-        # Arm transient fault when requested on a clean workspace via #14 contract reset()
-        if req.fault is not None and manager.workspace.get_diff_report().trees_identical:
-            await _invoke_maybe_async(
-                manager.workspace.reset,
-                DEFAULT_SEED,
-                fault=req.fault,
-                preserve_skill_memory=True,
-            )
+        def on_event(ev: RunEvent) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, ev)
+
+        async def run_worker(session: _ThreadSession) -> tuple[WorkflowOutcomeLike | None, Exception | None]:
+            """Drive the workflow to its next pause or end.
+
+            The worker, not the response stream, owns the run slot and the recorded outcome: both stay right when
+            the browser disconnects before the last frame.
+            """
+            try:
+                wf = manager.get_workflow_for_session(session)
+                outcome = await _invoke_maybe_async(
+                    wf.start_run,
+                    req.prompt,
+                    thread_id=thread_id,
+                    user_id=req.user_id,
+                    max_steps=req.max_steps,
+                    on_event=on_event,
+                )
+            except Exception as exc:  # noqa: BLE001 — not swallowed: recorded and sent to the client as a run_error frame
+                session.stop_reason = "api_error"
+                session.interrupt = None
+                return None, exc
+            else:
+                manager.record_outcome(session, outcome)
+                return outcome, None
+            finally:
+                manager.end()
+                queue.put_nowait(None)
+
+        manager.begin("run")  # 409 run_active when another run, quiz answer, deploy or reset owns the workspace
+        try:
+            session = manager.sessions.get(thread_id)
+            if session is None:
+                session = _ThreadSession(
+                    thread_id=thread_id,
+                    model=chosen_model,
+                    topology=req.topology,
+                    user_id=req.user_id,
+                )
+                manager.sessions[thread_id] = session
+            else:
+                session.model = chosen_model
+                session.topology = req.topology
+                session.user_id = req.user_id
+                session.interrupt = None
+                session.stop_reason = None
+            manager.persist_thread_meta(thread_id, model=chosen_model, topology=req.topology)
+            manager.latest_thread_id = thread_id
+
+            # Arm transient fault when requested on a clean workspace via #14 contract reset()
+            if req.fault is not None and manager.workspace.get_diff_report().trees_identical:
+                await _invoke_maybe_async(
+                    manager.workspace.reset,
+                    DEFAULT_SEED,
+                    fault=req.fault,
+                    preserve_skill_memory=True,
+                )
+            worker_task = asyncio.create_task(run_worker(session))
+        except BaseException:
+            manager.end()  # the worker never started, so nothing else would release the slot
+            raise
+        manager.keep_alive(worker_task)
 
         async def event_generator() -> AsyncIterator[str]:
             seq = 0
@@ -1073,30 +1134,6 @@ def create_app(
             )
             yield _sse_frame(started_event)
 
-            loop = asyncio.get_running_loop()
-            queue: asyncio.Queue[RunEvent | None] = asyncio.Queue()
-
-            def on_event(ev: RunEvent) -> None:
-                loop.call_soon_threadsafe(queue.put_nowait, ev)
-
-            async def run_worker() -> tuple[WorkflowOutcomeLike | None, Exception | None]:
-                try:
-                    wf = manager.get_workflow_for_session(session)
-                    outcome = await _invoke_maybe_async(
-                        wf.start_run,
-                        req.prompt,
-                        thread_id=thread_id,
-                        user_id=req.user_id,
-                        max_steps=req.max_steps,
-                        on_event=on_event,
-                    )
-                    return outcome, None
-                except Exception as exc:  # noqa: BLE001 — surfaced as structured SSE run_error frame
-                    return None, exc
-                finally:
-                    loop.call_soon_threadsafe(queue.put_nowait, None)
-
-            worker_task = asyncio.create_task(run_worker())
             deferred_terminal: RunEvent | None = None
 
             while True:
@@ -1130,9 +1167,7 @@ def create_app(
                     yield _sse_frame(art_event)
 
             outcome, error = await worker_task
-            if error is not None:
-                session.stop_reason = "api_error"
-                session.interrupt = None
+            if error is not None or outcome is None:
                 seq += 1
                 err_event = RunEvent(
                     type="run_error",
@@ -1143,16 +1178,6 @@ def create_app(
                 )
                 yield _sse_frame(err_event)
                 return
-
-            assert outcome is not None
-            session.interrupt = outcome.interrupt
-            session.stop_reason = outcome.stop_reason
-            session.budget = outcome.budget
-            session.final_answer = outcome.final_answer
-            if outcome.interrupt and outcome.interrupt.quiz:
-                session.expected_diff_sha256 = outcome.interrupt.quiz.diff_sha256
-            elif outcome.interrupt and outcome.interrupt.gate:
-                session.expected_diff_sha256 = outcome.interrupt.gate.diff_sha256
 
             diff, pytest_rep, ship_log, quiz, locks = manager.snapshot_artifacts(
                 thread_id, expected_diff_sha256=session.expected_diff_sha256
@@ -1179,14 +1204,14 @@ def create_app(
                 term_event = RunEvent.model_validate(
                     {**deferred_terminal.model_dump(), "seq": seq, "thread_id": thread_id}
                 )
-            elif outcome.stop_reason == "api_error":
+            elif outcome.stop_reason in ERROR_STOP_REASONS:
                 term_event = RunEvent(
                     type="run_error",
                     thread_id=thread_id,
                     seq=seq,
                     budget=outcome.budget,
-                    stop_reason="api_error",
-                    text=outcome.final_answer or "Upstream LLM provider error.",
+                    stop_reason=outcome.stop_reason,
+                    text=outcome.final_answer or "Workflow execution failed.",
                 )
             elif outcome.interrupt is not None:
                 term_event = RunEvent(
@@ -1207,6 +1232,7 @@ def create_app(
                     interrupt=None,
                     stop_reason=outcome.stop_reason or "completed",
                     text=outcome.final_answer,
+                    pending_release=_pending_release_of(outcome),
                 )
             yield _sse_frame(term_event)
 
@@ -1227,9 +1253,13 @@ def create_app(
         request: Request,
         stream: bool = Query(default=False),
     ) -> Response:
+        wants_sse = stream or "text/event-stream" in request.headers.get("accept", "")
+        with manager.exclusive("quiz"):
+            return await submit_quiz(thread_id, req, wants_sse=wants_sse)
+
+    async def submit_quiz(thread_id: str, req: QuizSubmitRequest, *, wants_sse: bool) -> Response:
         answer = QuizAnswer(selected_option=req.selected_option)
         session = manager.sessions.get(thread_id)
-        wants_sse = stream or "text/event-stream" in request.headers.get("accept", "")
 
         remediation_events: list[RunEvent] = []
 
@@ -1247,8 +1277,8 @@ def create_app(
                 user_id=req.user_id,
             )
 
+        wf = manager.get_workflow_for_session(session)
         try:
-            wf = manager.get_workflow_for_session(session)
             grade, outcome = await _invoke_maybe_async(
                 wf.submit_quiz,
                 thread_id,
@@ -1256,20 +1286,12 @@ def create_app(
                 user_id=req.user_id,
                 on_event=collect_event,
             )
-        except (KeyError, ValueError, RuntimeError) as exc:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "code": "gate_locked",
-                    "message": f"No resumable workflow quiz interrupt for thread '{thread_id}': {exc}",
-                },
-            )
+        except _thread_state_error() as exc:
+            # Only "this thread has no quiz to answer" is a 409; any other failure keeps its own type and status.
+            return _error_response("conflict", f"Thread '{thread_id}' is not waiting for a quiz answer: {exc}")
 
         manager.sessions[thread_id] = session
-        session.interrupt = outcome.interrupt
-        session.stop_reason = outcome.stop_reason
-        session.budget = outcome.budget
-        session.final_answer = outcome.final_answer
+        manager.record_outcome(session, outcome)
         session.expected_diff_sha256 = grade.diff_sha256
         interrupt = outcome.interrupt
         stop_reason = outcome.stop_reason
@@ -1374,28 +1396,15 @@ def create_app(
 
     @app.post("/api/runs/{thread_id}/deploy", response_model=None)
     async def post_submit_deploy(thread_id: str, req: DeploySubmitRequest) -> Response:
+        with manager.exclusive("deploy"):
+            return await submit_deploy(thread_id, req)
+
+    async def submit_deploy(thread_id: str, req: DeploySubmitRequest) -> Response:
+        # The decision names the diff the human was shown (required by the request model): nothing is defaulted here.
+        decision = DeployDecision(action=req.action, expected_diff_sha256=req.expected_diff_sha256, reason=req.reason)
+        expected_sha = decision.expected_diff_sha256
         pre_diff = manager.workspace.get_diff_report()
-        expected_sha = req.expected_diff_sha256 or pre_diff.diff_sha256
-
-        # Validate expected_diff_sha256 shape before constructing strictSha256Hex DeployDecision
-        try:
-            decision = DeployDecision(
-                action=req.action,
-                expected_diff_sha256=expected_sha,
-                reason=req.reason,
-            )
-        except ValidationError as exc:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "deployed": False,
-                    "code": "gate_locked",
-                    "missing_locks": ["sha256_matches"],
-                    "message": f"Invalid expected_diff_sha256 digest: {exc.errors()[0]['msg']}",
-                },
-            )
-
-        pre_locks = manager.workspace.get_gate_status(expected_diff_sha256=decision.expected_diff_sha256)
+        pre_locks = manager.workspace.get_gate_status(expected_sha)
 
         if decision.approved:
             pre_missing = [lock for lock in pre_locks.missing_locks if lock != "human_approved"]
@@ -1405,18 +1414,13 @@ def create_app(
                     if pre_missing
                     else (["tests_passed"] if pre_diff.trees_identical else list(pre_locks.missing_locks))
                 )
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "deployed": False,
-                        "code": "gate_locked",
-                        "missing_locks": reported_missing,
-                        "locks": pre_locks.model_dump(mode="json"),
-                        "message": (
-                            f"Server-side production gate rejected deployment: "
-                            f"missing_locks={reported_missing} for diff {pre_locks.diff_sha256[:8]}."
-                        ),
-                    },
+                return _error_response(
+                    "gate_locked",
+                    f"Server-side production gate rejected deployment: "
+                    f"missing_locks={reported_missing} for diff {pre_locks.diff_sha256[:8]}.",
+                    deployed=False,
+                    missing_locks=reported_missing,
+                    locks=pre_locks.model_dump(mode="json"),
                 )
 
         session = manager.sessions.get(thread_id)
@@ -1432,8 +1436,8 @@ def create_app(
             )
 
         deploy_events: list[RunEvent] = []
+        wf = manager.get_workflow_for_session(session)
         try:
-            wf = manager.get_workflow_for_session(session)
             outcome = await _invoke_maybe_async(
                 wf.submit_deploy_decision,
                 thread_id,
@@ -1441,92 +1445,76 @@ def create_app(
                 user_id=req.user_id,
                 on_event=deploy_events.append,
             )
-        except (KeyError, ValueError, RuntimeError) as exc:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "deployed": False,
-                    "code": "gate_locked",
-                    "missing_locks": list(pre_locks.missing_locks),
-                    "locks": pre_locks.model_dump(mode="json"),
-                    "message": f"No resumable workflow deploy gate for thread '{thread_id}': {exc}",
-                },
+        except _thread_state_error() as exc:
+            # Only "this thread has no deploy decision to take" is a 409; any other failure keeps its own type.
+            return _error_response(
+                "conflict",
+                f"Thread '{thread_id}' is not waiting for a deploy decision: {exc}",
+                deployed=False,
+                missing_locks=list(pre_locks.missing_locks),
+                locks=pre_locks.model_dump(mode="json"),
             )
 
         manager.sessions[thread_id] = session
-        session.interrupt = outcome.interrupt
-        session.stop_reason = outcome.stop_reason
-        session.budget = outcome.budget
-        session.final_answer = outcome.final_answer
-        stop_reason: StopReason = outcome.stop_reason or ("completed" if decision.approved else "human_rejected")
-
-        ledger_proved = manager.settings.gate_ledger_path.is_file() and (
-            expected_sha in GateLedger.load(manager.settings.gate_ledger_path).deployed
-        )
-        deployed_ok = bool(outcome.final_state.deployed or ledger_proved)
+        manager.record_outcome(session, outcome)
+        manager.latest_thread_id = thread_id
+        deployed = bool(outcome.final_state.deployed)
+        pending = session.pending_release
         # the steps of this decision (human sign-off, system deploy_to_production), for the Studio's step feed
         step_traces = [ev.step.model_dump(mode="json") for ev in deploy_events if ev.type == "step" and ev.step]
+        interrupt_dump = _dump_or_none(outcome.interrupt)
 
-        if decision.approved and not deployed_ok:
-            post_locks = manager.workspace.get_gate_status(expected_diff_sha256=decision.expected_diff_sha256)
-            push_error = next(
-                (
-                    step["error"]
-                    for step in reversed(step_traces)
-                    if step["tool"] == "deploy_to_production" and step.get("error")
-                ),
-                None,
+        if decision.approved and not deployed:
+            post_locks = manager.workspace.get_gate_status(expected_sha)
+            refusal: dict[str, Any] = {
+                "deployed": False,
+                "missing_locks": list(post_locks.missing_locks),
+                "locks": post_locks.model_dump(mode="json"),
+                "trace": step_traces,
+                "stop_reason": outcome.stop_reason,
+                "interrupt": interrupt_dump,
+                "pending_release": _dump_or_none(pending),
+            }
+            if pending is not None:
+                # The gate let the deploy through but the release was not published. The failed push revoked the
+                # sign-off: the human may approve the same diff again (while the harness still offers a retry)
+                # or reject it. This is a release failure, reported with its own code, never as "gate_locked".
+                code: ToolErrorCode = pending.error.code if pending.error is not None else "upstream_error"
+                return _error_response(
+                    code,
+                    outcome.final_answer or f"The release of diff {expected_sha[:8]} was not published ({code}).",
+                    status=409,
+                    retryable=outcome.interrupt is not None and code in RELEASE_RETRY_CODES,
+                    **refusal,
+                )
+            return _error_response(
+                "gate_locked",
+                outcome.final_answer
+                or f"Server-side production gate rejected deployment for diff {post_locks.diff_sha256[:8]}.",
+                **refusal,
             )
-            # a failed push leaves every lock in place: approving the same diff again retries that deploy
-            push_failed = push_error is not None and push_error["code"] in _RELEASE_RETRY_CODES
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "deployed": False,
-                    "code": push_error["code"] if push_failed else "gate_locked",
-                    "retryable": push_failed and post_locks.can_deploy,
-                    "missing_locks": list(post_locks.missing_locks),
-                    "locks": post_locks.model_dump(mode="json"),
-                    "trace": step_traces,
-                    "message": outcome.final_answer
-                    or f"Server-side production gate rejected deployment for diff {post_locks.diff_sha256[:8]}.",
-                },
-            )
-        if deployed_ok:
+        if deployed:
             session.deployed_diff_sha256 = expected_sha
 
-        manager.latest_thread_id = thread_id
         post_diff = manager.workspace.get_diff_report()
         ship_log = manager.workspace.get_latest_ship_log(thread_id=thread_id)
         if ship_log is None:
             ship_log = manager.workspace.get_latest_ship_log(thread_id=None)
-
-        if deployed_ok:
-            if manager.settings.gate_ledger_path.is_file():
-                final_locks = GateLedger.load(manager.settings.gate_ledger_path).status(expected_sha, expected_sha)
-            else:
-                final_locks = DeployGateStatus(
-                    diff_sha256=expected_sha,
-                    tests_passed=True,
-                    sha256_matches=True,
-                    quiz_passed=True,
-                    human_approved=True,
-                    blocked=False,
-                )
-            deployed_at_iso = (
-                ship_log.deployed_at.isoformat() if ship_log and ship_log.deployed_at else datetime.now(UTC).isoformat()
-            )
-        else:
-            final_locks = manager.workspace.get_gate_status(expected_diff_sha256=expected_sha)
-            deployed_at_iso = None
-
+        # The locks recorded for the decided diff. Nothing is made up when a record is missing: that is an error.
+        final_locks = (
+            manager.workspace.gate_status_of(expected_sha)
+            if deployed
+            else manager.workspace.get_gate_status(expected_sha)
+        )
         return JSONResponse(
             status_code=200,
             content={
-                "deployed": deployed_ok,
-                "stop_reason": stop_reason,
+                "deployed": deployed,
+                "stop_reason": outcome.stop_reason or ("completed" if deployed else "human_rejected"),
                 "diff": post_diff.model_dump(mode="json"),
-                "deployed_at": deployed_at_iso,
+                "deployed_at": ship_log.deployed_at.isoformat()
+                if deployed and ship_log and ship_log.deployed_at
+                else None,
                 "ship_log": ship_log.model_dump(mode="json") if ship_log else None,
                 "locks": final_locks.model_dump(mode="json"),
                 "trace": step_traces,
@@ -1543,7 +1531,8 @@ def create_app(
 
     @app.delete("/api/memory/{user_id}")
     async def delete_user_memory(user_id: str) -> dict[str, Any]:
-        await _invoke_maybe_async(manager.workspace.forget_user_skills, user_id=user_id)
+        with manager.exclusive("memory"):
+            await _invoke_maybe_async(manager.workspace.forget_user_skills, user_id=user_id)
         records = _normalize_skill_profile(manager.workspace.get_skill_profile(user_id=user_id), user_id)
         return {
             "user_id": user_id,
@@ -1567,9 +1556,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1).")
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000).")
     parser.add_argument("--reload", action="store_true", help="Enable uvicorn auto-reload.")
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Extra host name the Studio answers to, besides loopback and --host (repeatable). "
+        "Requests with any other Host header are refused.",
+    )
     args = parser.parse_args(argv)
+    allowed_hosts = allowed_hosts_from(args.host, args.allowed_host)
 
     if args.reload:
+        # The reloader re-imports the factory in a child process: the allow-list travels through the environment.
+        os.environ[ALLOWED_HOSTS_ENV] = ",".join(allowed_hosts)
         uvicorn.run(
             "no_quiz_no_prod.ui.server:create_app",
             factory=True,
@@ -1578,14 +1578,16 @@ def main(argv: list[str] | None = None) -> int:
             reload=True,
         )
     else:
-        uvicorn.run(create_app(), host=args.host, port=args.port)
+        uvicorn.run(create_app(allowed_hosts=allowed_hosts), host=args.host, port=args.port)
     return 0
 
 
 __all__ = [
+    "RunActiveError",
     "StudioManager",
     "create_app",
     "main",
+    "same_origin_client_kwargs",
 ]
 
 

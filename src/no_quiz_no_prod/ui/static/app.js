@@ -13,6 +13,13 @@ import {
 
 const DEFAULT_USER_ID = "dev_default";
 
+// The server puts a per-session token in the page; every state-changing request must send it back.
+const SESSION_TOKEN = document.querySelector('meta[name="nq-session-token"]')?.content || "";
+const SESSION_TOKEN_HEADER = "X-NQ-Session-Token";
+const BUSY_POLL_MS = 2000;
+const CONFIRM_WINDOW_MS = 4000;
+const RELEASE_GATE_KINDS = new Set(["deploy_approval", "release_retry"]);
+
 const CANONICAL_SCENARIOS = [
   {
     id: "vat",
@@ -171,6 +178,10 @@ const store = {
   providers: { openrouter: false, anthropic: false, notion: false },
 
   isStreaming: false,
+  serverBusy: null, // operation the server reports as running ("run", "deploy", ...), e.g. started in another tab
+  busyPollTimer: null,
+  pendingRelease: null, // a deploy whose push failed: waiting for re-approval or rejection
+  remoteConfirmTimer: null,
   isSubmittingQuiz: false,
   isSubmittingDeploy: false,
   auraWaveTimer: null,
@@ -216,6 +227,43 @@ const store = {
 
 // ---- DOM & Reactive Aura Helpers ------------------------------------------
 const $ = (id) => document.getElementById(id);
+
+// ---- API access: one sender for state-changing requests, one error reader --
+function apiSend(path, method, payload) {
+  const headers = { [SESSION_TOKEN_HEADER]: SESSION_TOKEN };
+  const init = { method, headers };
+  if (payload !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(payload);
+  }
+  return fetch(path, init);
+}
+
+function readJson(resp) {
+  return resp.json().catch(() => ({}));
+}
+
+function apiErrorMessage(data, status) {
+  const detail = data?.message ?? data?.detail;
+  if (typeof detail === "string" && detail) {
+    return detail;
+  }
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0] || {};
+    const where = Array.isArray(first.loc) ? first.loc.filter((part) => part !== "body").join(".") : "";
+    return where ? `${where}: ${first.msg}` : String(first.msg || "Invalid request");
+  }
+  return `HTTP ${status}`;
+}
+
+// The workspace runs one operation at a time: this tab's own stream, or one the server reports (another tab).
+function isWorkspaceBusy() {
+  return Boolean(store.isStreaming || store.serverBusy);
+}
+
+function isReleaseGate(interrupt) {
+  return Boolean(interrupt && RELEASE_GATE_KINDS.has(interrupt.kind));
+}
 
 function shortSha(sha, len = 10) {
   if (!sha) {
@@ -531,7 +579,11 @@ function renderApiPopoverState() {
     ? `https://github.com/${store.git.repo}.git`
     : API_PROVIDER_META.git_remote.placeholder;
   $("btn-save-git-remote").disabled = store.isSavingApiKey;
-  $("btn-save-git-remote").textContent = store.isSavingApiKey ? "Saving…" : "Save";
+  $("btn-save-git-remote").textContent = store.isSavingApiKey
+    ? "Saving…"
+    : store.remoteConfirmTimer !== null
+      ? "Confirm new remote"
+      : "Save";
 
   document.querySelectorAll("#api-popover-tabs .api-tab").forEach((btn) => {
     const isActive = btn.dataset.keyProvider === store.activeKeyProvider;
@@ -556,26 +608,37 @@ async function handleSaveApiKey(ev, { provider = store.activeKeyProvider, inputI
   const rawKey = input.value.trim();
   if (!rawKey || store.isSavingApiKey) {
     if (!rawKey) {
-      showToast("Paste a non-empty API token before saving.");
+      showToast("Enter a value before saving.");
     }
     return;
+  }
+  const isRemote = provider === "git_remote";
+  if (isRemote && store.remoteConfirmTimer === null) {
+    // Changing where deploys are pushed takes a second, explicit click (same pattern as the skill reset).
+    store.remoteConfirmTimer = window.setTimeout(() => {
+      store.remoteConfirmTimer = null;
+      renderApiPopoverState();
+    }, CONFIRM_WINDOW_MS);
+    renderApiPopoverState();
+    return;
+  }
+  if (isRemote) {
+    window.clearTimeout(store.remoteConfirmTimer);
+    store.remoteConfirmTimer = null;
   }
 
   store.isSavingApiKey = true;
   renderApiPopoverState();
 
   try {
-    const resp = await fetch("/api/apikey", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider,
-        api_key: rawKey,
-      }),
+    const resp = await apiSend("/api/apikey", "POST", {
+      provider,
+      api_key: rawKey,
+      ...(isRemote ? { confirm_remote_change: true } : {}),
     });
-    const data = await resp.json().catch(() => ({}));
+    const data = await readJson(resp);
     if (!resp.ok || !data.ok) {
-      throw new Error(data.detail || `HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
 
     input.value = "";
@@ -601,7 +664,7 @@ async function handleSaveApiKey(ev, { provider = store.activeKeyProvider, inputI
     triggerAuraWave("verified");
     showToast(`${API_PROVIDER_META[provider].envVar} saved to .env (0600).`);
   } catch (err) {
-    showToast(`Could not save key: ${err.message}`);
+    showToast(`Could not save ${API_PROVIDER_META[provider].envVar}: ${err.message}`);
   } finally {
     store.isSavingApiKey = false;
     renderApiPopoverState();
@@ -669,12 +732,14 @@ function renderHeaderControls() {
     hubDot.classList.toggle("is-live", Boolean(store.notion?.notion_enabled));
   }
 
-  // Release remote pill (same component as the Notion Hub pill): GitHub once an https remote and a token are set
-  const isGithubRemote = store.git?.remote_kind === "https" && Boolean(store.git?.token_set);
+  // Release remote pill: GitHub link when a github.com repo is configured, HTTPS label for other allow-listed hosts.
+  const isHttpsRemote = store.git?.remote_kind === "https";
+  const isGithubRepo = isHttpsRemote && Boolean(store.git?.repo);
+  const hasRemoteReady = isHttpsRemote && Boolean(store.git?.token_set);
   const repoLink = $("link-github-repo");
-  repoLink.href = isGithubRemote && store.git.repo ? sanitizeHref(`https://github.com/${store.git.repo}`) || "#" : "#";
-  $("github-repo-label").textContent = isGithubRemote ? "GitHub" : "Local remote";
-  $("github-repo-dot").classList.toggle("is-live", isGithubRemote);
+  repoLink.href = isGithubRepo ? sanitizeHref(`https://github.com/${store.git.repo}`) || "#" : "#";
+  $("github-repo-label").textContent = isGithubRepo ? "GitHub" : isHttpsRemote ? "HTTPS remote" : "Local remote";
+  $("github-repo-dot").classList.toggle("is-live", hasRemoteReady);
 
   renderApiPopoverState();
   window.requestAnimationFrame(updateModeGlider);
@@ -699,6 +764,12 @@ function renderTelemetryBar() {
   if (store.isStreaming) {
     statusPill.setAttribute("data-agent", "coder");
     statusText.textContent = "streaming";
+  } else if (store.serverBusy) {
+    statusPill.setAttribute("data-agent", "coder");
+    statusText.textContent = `busy · ${store.serverBusy}`;
+  } else if (store.interrupt && store.pendingRelease) {
+    statusPill.setAttribute("data-status", "Remediation v2");
+    statusText.textContent = "push_failed · awaiting_decision";
   } else if (store.interrupt) {
     statusPill.setAttribute(
       "data-status",
@@ -713,8 +784,10 @@ function renderTelemetryBar() {
       refused: "Blocked",
       quiz_failed: "Blocked",
       human_rejected: "Blocked",
+      release_failed: "Blocked",
       max_steps: "Blocked",
       api_error: "Blocked",
+      harness_error: "Blocked",
     };
     statusPill.setAttribute("data-status", statusMap[store.stopReason] || "Staging");
     statusText.textContent = store.stopReason;
@@ -756,8 +829,11 @@ function renderTelemetryBar() {
   bar.setAttribute("aria-valuemax", String(maxSteps));
   bar.setAttribute("aria-valuenow", String(steps));
 
-  const runBtn = $("btn-run-agent");
-  runBtn.disabled = store.isStreaming;
+  // One operation per workspace: no second run and no Reset while one is in progress (the server refuses both).
+  const busy = isWorkspaceBusy();
+  $("btn-run-agent").disabled = busy;
+  $("btn-hero-send").disabled = busy;
+  $("btn-reset-seed").disabled = busy;
 }
 
 function renderScenarioChips() {
@@ -1072,7 +1148,7 @@ function renderQuizPanel() {
 
   const optionKeys = ["A", "B", "C", "D"];
   const optionsDisabled =
-    store.isSubmittingQuiz || isPassed || isBlocked || awaitingProceedV2;
+    store.isSubmittingQuiz || isPassed || isBlocked || awaitingProceedV2 || isWorkspaceBusy();
 
   const optionsHtml = optionKeys
     .map((key, idx) => {
@@ -1154,7 +1230,7 @@ function renderQuizPanel() {
     `<div class="quiz-stem">${renderInlineMarkdown(quiz.stem)}</div>` +
     `<div class="quiz-options">${optionsHtml}</div>` +
     (!submitHidden
-      ? `<button type="button" id="btn-submit-quiz" class="btn-quiz-submit" ${!store.selectedQuizOption || store.isSubmittingQuiz ? "disabled" : ""}>` +
+      ? `<button type="button" id="btn-submit-quiz" class="btn-quiz-submit" ${!store.selectedQuizOption || store.isSubmittingQuiz || isWorkspaceBusy() ? "disabled" : ""}>` +
           `${store.isSubmittingQuiz ? "Verifying server-side…" : "Verify Answer (↵)"}` +
         `</button>`
       : "") +
@@ -1199,8 +1275,22 @@ function renderDeployPanel() {
     );
   }).join("");
 
-  // A push that failed after the sign-off leaves all 4 locks holding (can_deploy): the same button retries it.
-  const canApprove = Boolean(locks?.ready_for_approval || locks?.can_deploy);
+  // A failed push revokes the sign-off server-side: the gate is back to "ready for approval" for the same diff.
+  const pending = store.pendingRelease;
+  const canDecide = Boolean(locks?.ready_for_approval) && (!pending || isReleaseGate(store.interrupt));
+  const pendingCode = pending?.error?.code || "release_failed";
+  const pendingHtml = pending
+    ? `<div class="quiz-feedback quiz-feedback--${canDecide ? "remediate" : "blocked"} release-notice" role="status">` +
+        `<strong>Push failed · ${escapeHtml(pendingCode)}</strong><br />` +
+        `${escapeHtml(pending.error?.message || "The release was not published.")}<br />` +
+        (pending.error?.outcome_unknown
+          ? `The remote did not answer: the push may have landed. A retry never pushes twice.<br />`
+          : `<code>prod/</code> is untouched.<br />`) +
+        (canDecide
+          ? `Attempt ${Number(pending.attempts || 1)} · approve again to retry the same diff, or reject it.`
+          : `No retry is left for this thread (release_failed).`) +
+      `</div>`
+    : "";
   let footerHtml = "";
   if (isDeployed) {
     const prodSha = shortSha(diff?.prod_tree_sha256, 8);
@@ -1222,20 +1312,22 @@ function renderDeployPanel() {
         commitHtml +
         `<div><code>${escapeHtml(prodSha)}</code></div>` +
       `</div>`;
-  } else if (canApprove && !treesIdentical) {
+  } else if (canDecide && !treesIdentical) {
     footerHtml =
+      pendingHtml +
       `<div class="deploy-actions">` +
-        `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
-          `${svgIcon("check", 13)}` +
-          `<span>${store.isSubmittingDeploy ? "Deploying…" : "Approve & Deploy"}</span>` +
+        `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
+          `${svgIcon(pending ? "retry" : "check", 13)}` +
+          `<span>${store.isSubmittingDeploy ? "Deploying…" : pending ? "Approve & Retry Push" : "Approve & Deploy"}</span>` +
         `</button>` +
-        `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy ? "disabled" : ""}>` +
+        `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
           `Reject` +
         `</button>` +
       `</div>` +
       `<div class="kpi-card__sub deploy-actions__sub">commit + push to ${escapeHtml(store.git?.branch || "main")}</div>`;
   } else {
     footerHtml =
+      pendingHtml +
       `<div class="deploy-actions">` +
         `<button type="button" disabled class="btn-deploy btn-deploy--locked">` +
           `${svgIcon("lock", 12)}` +
@@ -1339,16 +1431,31 @@ function applyStatePayload(data) {
   store.shipLog = active.ship_log || null;
   store.quiz = active.quiz || null;
   store.locks = active.locks || null;
+  store.pendingRelease = active.pending_release || null;
+  store.serverBusy = store.isStreaming ? null : active.busy || null;
   store.skillProfile = data.skill_profile || [];
+  scheduleBusyPoll();
+}
+
+// While the server reports an operation this tab did not start, re-read the state until it is over.
+function scheduleBusyPoll() {
+  if (!store.serverBusy || store.busyPollTimer !== null) {
+    return;
+  }
+  store.busyPollTimer = window.setTimeout(async () => {
+    store.busyPollTimer = null;
+    await fetchInitialState();
+  }, BUSY_POLL_MS);
 }
 
 async function fetchInitialState() {
   try {
-    const resp = await fetch(`/api/state?user_id=${encodeURIComponent(DEFAULT_USER_ID)}`);
+    const threadQuery = store.threadId ? `&thread_id=${encodeURIComponent(store.threadId)}` : "";
+    const resp = await fetch(`/api/state?user_id=${encodeURIComponent(DEFAULT_USER_ID)}${threadQuery}`);
+    const data = await readJson(resp);
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
-    const data = await resp.json();
     applyStatePayload(data);
     renderAllStudio();
   } catch (err) {
@@ -1407,9 +1514,11 @@ function appendAgentTurnToFeed({ text, stopReason, interrupt, isError = false })
   if (isClarify) {
     badgeHtml = `<span class="pill" data-status="Staging"><span class="pill__dot"></span><span>clarification_needed · zero mutation</span></span>`;
   } else if (isError) {
-    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>runtime_error</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>${escapeHtml(stopReason || "runtime_error")}</span></span>`;
   } else if (interrupt?.kind === "quiz") {
     badgeHtml = `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>hitl_pause · quiz_gate</span></span>`;
+  } else if (interrupt?.kind === "release_retry") {
+    badgeHtml = `<span class="pill" data-status="Remediation v2"><span class="pill__dot"></span><span>hitl_pause · push_retry</span></span>`;
   } else if (interrupt?.kind === "deploy_approval") {
     badgeHtml = `<span class="pill" data-status="Deployed to Prod"><span class="pill__dot"></span><span>hitl_pause · signoff_ready</span></span>`;
   }
@@ -1434,6 +1543,7 @@ function handleRunEvent(ev) {
   if (ev.type === "run_started") {
     store.interrupt = null;
     store.stopReason = null;
+    store.pendingRelease = null;
     store.lastDeployReceipt = null;
     renderTelemetryBar();
     return;
@@ -1487,6 +1597,7 @@ function handleRunEvent(ev) {
   if (ev.type === "run_completed") {
     store.interrupt = ev.interrupt || null;
     store.stopReason = ev.stop_reason || null;
+    store.pendingRelease = ev.interrupt?.release || ev.pending_release || null;
     if (ev.interrupt?.quiz) {
       store.quiz = ev.interrupt.quiz;
       store.selectedQuizOption = null;
@@ -1508,12 +1619,13 @@ function handleRunEvent(ev) {
   }
 
   if (ev.type === "run_error") {
-    store.stopReason = "api_error";
+    const reason = ev.stop_reason || "api_error";
+    store.stopReason = reason;
     store.interrupt = null;
     triggerAuraWave("shield");
     appendAgentTurnToFeed({
       text: ev.text || "Upstream provider error.",
-      stopReason: "api_error",
+      stopReason: reason,
       interrupt: null,
       isError: true,
     });
@@ -1553,13 +1665,10 @@ async function runAgentStream(promptText) {
   }
 
   try {
-    const resp = await fetch("/api/runs/stream", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const resp = await apiSend("/api/runs/stream", "POST", payload);
     if (!resp.ok || !resp.body) {
-      throw new Error(`Stream request failed (HTTP ${resp.status})`);
+      // Refused before any model call: another run is active, or the release remote is misconfigured.
+      throw new Error(apiErrorMessage(await readJson(resp), resp.status));
     }
 
     const reader = resp.body.getReader();
@@ -1592,11 +1701,14 @@ async function runAgentStream(promptText) {
   } catch (err) {
     triggerAuraWave("shield");
     appendAgentTurnToFeed({
-      text: `Stream interrupted: ${err.message}`,
+      text: `Run not completed: ${err.message}`,
       stopReason: "api_error",
       interrupt: null,
       isError: true,
     });
+    // What the server holds may differ from this tab's view (e.g. a run started elsewhere): read it again.
+    store.isStreaming = false;
+    await fetchInitialState();
   } finally {
     store.isStreaming = false;
     renderTelemetryBar();
@@ -1625,22 +1737,17 @@ async function submitQuizAnswer() {
   );
 
   try {
-    const resp = await fetch(`/api/runs/${encodeURIComponent(store.threadId)}/quiz`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        selected_option: store.selectedQuizOption,
-        user_id: DEFAULT_USER_ID,
-        question_id: store.quiz.question_id,
-        model: $("model-select").value || null,
-        topology: $("topology-select").value || "dual",
-      }),
+    const resp = await apiSend(`/api/runs/${encodeURIComponent(store.threadId)}/quiz`, "POST", {
+      selected_option: store.selectedQuizOption,
+      user_id: DEFAULT_USER_ID,
+      question_id: store.quiz.question_id,
+      model: $("model-select").value || null,
+      topology: $("topology-select").value || "dual",
     });
+    const data = await readJson(resp);
     if (!resp.ok) {
-      const errData = await resp.json().catch(() => ({}));
-      throw new Error(errData.message || errData.detail || `HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
-    const data = await resp.json();
 
     if (Array.isArray(data.trace)) {
       for (const step of data.trace) {
@@ -1696,46 +1803,56 @@ async function submitDeployDecision(action) {
   if (!store.threadId || store.isSubmittingDeploy) {
     return;
   }
+  // The decision names the diff the gate holds, and only if it is the diff on screen. The server never guesses it.
+  const gatedSha = store.locks?.diff_sha256 || null;
+  const shownSha = store.diff?.diff_sha256 || null;
+  if (!gatedSha || (shownSha && shownSha !== gatedSha)) {
+    showToast("The diff on screen is not the one the gate holds. Nothing was sent: reloading the gate state.");
+    await fetchInitialState();
+    return;
+  }
   store.isSubmittingDeploy = true;
   syncAmbientAura();
   renderDeployPanel();
 
   try {
-    const resp = await fetch(`/api/runs/${encodeURIComponent(store.threadId)}/deploy`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action,
-        expected_diff_sha256: store.locks?.diff_sha256 || store.diff?.diff_sha256 || null,
-        reason:
-          action === "approve"
-            ? "Comprehension verified; approved in Workbench."
-            : "Rejected by developer in Workbench.",
-        user_id: DEFAULT_USER_ID,
-        model: $("model-select").value || null,
-        topology: $("topology-select").value || "dual",
-      }),
+    const resp = await apiSend(`/api/runs/${encodeURIComponent(store.threadId)}/deploy`, "POST", {
+      action,
+      expected_diff_sha256: gatedSha,
+      reason:
+        action === "approve"
+          ? "Comprehension verified; approved in Workbench."
+          : "Rejected by developer in Workbench.",
+      user_id: DEFAULT_USER_ID,
+      model: $("model-select").value || null,
+      topology: $("topology-select").value || "dual",
     });
-    const data = await resp.json();
+    const data = await readJson(resp);
     if (Array.isArray(data.trace)) {
       for (const step of data.trace) {
         appendStepToFeed(step);
       }
     }
-    if (resp.status === 409) {
+    if (!resp.ok) {
       if (data.locks) {
         store.locks = data.locks;
       }
+      if ("pending_release" in data) {
+        // The server answered about this decision: a failed release (retry or reject), or a gate refusal.
+        store.pendingRelease = data.pending_release || null;
+        store.interrupt = data.interrupt || null;
+        store.stopReason = data.stop_reason || null;
+      }
       triggerAuraWave("shield");
       showToast(
-        data.retryable
-          ? `Push failed (${data.code}): prod/ untouched, locks intact. Approve & Deploy retries the same deploy.`
-          : data.message || "Gate locked: promotion rejected server-side."
+        data.pending_release
+          ? `Push failed (${data.code}). ${data.retryable ? "Approve again to retry the same diff, or reject it." : "No retry is left."}`
+          : apiErrorMessage(data, resp.status)
       );
+      if (data.code === "conflict" || data.code === "run_active") {
+        await fetchInitialState(); // this tab's view of the thread is stale
+      }
       return;
-    }
-    if (!resp.ok) {
-      throw new Error(data.message || data.detail || `HTTP ${resp.status}`);
     }
 
     if (data.diff) {
@@ -1749,6 +1866,7 @@ async function submitDeployDecision(action) {
     }
     store.stopReason = data.stop_reason || (action === "approve" ? "completed" : "human_rejected");
     store.interrupt = null;
+    store.pendingRelease = null;
 
     if (data.deployed) {
       store.lastDeployReceipt = {
@@ -1772,21 +1890,22 @@ async function submitDeployDecision(action) {
 }
 
 async function handleResetSeed(resetSkillMemory = false) {
+  if (isWorkspaceBusy()) {
+    showToast("A run is in progress: Reset is available once it is over.");
+    return;
+  }
   try {
-    const resp = await fetch("/api/reset", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        seed: "fintech",
-        user_id: DEFAULT_USER_ID,
-        reset_skill_memory: resetSkillMemory,
-      }),
+    const resp = await apiSend("/api/reset", "POST", {
+      seed: "fintech",
+      user_id: DEFAULT_USER_ID,
+      reset_skill_memory: resetSkillMemory,
     });
+    const data = await readJson(resp);
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
-    const data = await resp.json();
     store.threadId = null;
+    store.pendingRelease = null;
     store.workbenchForcedOpen = false;
     store.heroPeek = false;
     store.selectedQuizOption = null;
@@ -1836,13 +1955,11 @@ async function handleGdprForgetClick() {
   store.forgetConfirmTimer = null;
 
   try {
-    const resp = await fetch(`/api/memory/${encodeURIComponent(DEFAULT_USER_ID)}`, {
-      method: "DELETE",
-    });
+    const resp = await apiSend(`/api/memory/${encodeURIComponent(DEFAULT_USER_ID)}`, "DELETE");
+    const data = await readJson(resp);
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
-    const data = await resp.json();
     store.skillProfile = data.records || [];
     store.highlightedSkills = new Set(store.skillProfile.map((r) => r.skill_tag));
     renderMemoryPanel();
@@ -2105,10 +2222,11 @@ function buildRepresentativeSampleEval() {
 async function fetchEvalResults({ silent = false } = {}) {
   try {
     const resp = await fetch("/api/eval/results");
+    const data = await readJson(resp);
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}`);
+      throw new Error(apiErrorMessage(data, resp.status));
     }
-    store.evalData = await resp.json();
+    store.evalData = data;
     const totalRuns = Number(store.evalData.summary?.total_runs || 0);
     const badge = $("explorer-count-badge");
     badge.textContent = String(totalRuns);
@@ -2153,6 +2271,10 @@ function renderExplorerView() {
       ? `${srcFiles[0]} +${srcFiles.length - 1} cohorts`
       : srcFiles[0] || "eval/results.jsonl";
   srcChip.title = srcFiles.join(", ") || "eval/results.jsonl";
+  const invalidRows = Number(data.invalid_rows || 0);
+  const invalidChip = $("explorer-invalid-rows");
+  invalidChip.hidden = invalidRows === 0;
+  invalidChip.textContent = `${invalidRows} invalid row${invalidRows === 1 ? "" : "s"} skipped`;
 
   const passPct = (Number(s.pass_rate || 0) * 100).toFixed(1);
   const passHatKPct = (Number(s.pass_hat_k || 0) * 100).toFixed(1);
@@ -2542,9 +2664,11 @@ function bindEvents() {
   $("link-github-repo").addEventListener("click", (ev) => {
     if ($("link-github-repo").getAttribute("href") === "#") {
       ev.preventDefault();
-      showToast(
-        `Deploys commit + push to ${store.git?.branch || "main"} on the workspace's local bare remote (set NO_QUIZ_GIT_REMOTE_URL and NO_QUIZ_GITHUB_TOKEN to push to GitHub).`
-      );
+      const targetMsg =
+        store.git?.remote_kind === "https"
+          ? `Deploys commit + push to ${store.git?.branch || "main"} on the configured HTTPS release remote.`
+          : `Deploys commit + push to ${store.git?.branch || "main"} on the workspace's local bare remote (set NO_QUIZ_GIT_REMOTE_URL and NO_QUIZ_GITHUB_TOKEN to push to GitHub).`;
+      showToast(targetMsg);
     }
   });
 
@@ -2670,6 +2794,7 @@ function bindEvents() {
     store.lastQuizGrade = null;
     store.pendingNextQuiz = null;
     store.lastDeployReceipt = null;
+    store.pendingRelease = null;
     store.workbenchForcedOpen = true;
     renderAllStudio();
     showToast("Started fresh conversation thread (workspace files preserved).");

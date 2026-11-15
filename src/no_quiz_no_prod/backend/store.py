@@ -1,10 +1,14 @@
-"""Workspace persistence: the SQLite state database (WAL) and the cross-process workspace lock.
+"""Workspace persistence: the SQLite state database (WAL), the gate ledger, the release journal and the locks.
 
 Both MCP servers and the harness are separate processes sharing one ``<workspace_dir>``. Every multi-step operation
-(reset, staging write, pytest run, ledger update, deploy, grading) runs under ``workspace_lock``: a reentrant
-in-process lock plus an exclusive ``flock`` on ``<workspace_dir>/.workspace.lock``, so no reader ever sees half of a
-change and no ledger update is lost. SQLite runs in WAL mode with a busy timeout, and every write transaction is
-``BEGIN IMMEDIATE``.
+(reset, staging write, ledger update, promotion, grading) runs under ``workspace_lock``: a reentrant in-process lock
+plus an exclusive ``flock`` on ``<workspace_dir>/.workspace.lock``, so no reader ever sees half of a change. It is
+never held across a network call or a test run: a deploy reserves ``deploy_slot`` instead (non-blocking: a second
+deploy, or a reset during one, is refused as ``run_active``).
+
+The gate ledger lives in ``state.sqlite`` (table ``gate_ledger``), so a lock is written in the same transaction as
+the fact that earns it (a graded quiz row, a pytest run). SQLite runs in WAL mode with a busy timeout, and every
+write transaction is ``BEGIN IMMEDIATE``.
 """
 
 import json
@@ -17,6 +21,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
 
+from no_quiz_no_prod.backend.errors import WorkspaceError
+from no_quiz_no_prod.contracts import GateLedgerEntry, ReleaseJournalState
+
 try:  # POSIX only: elsewhere the in-process lock still serializes threads, processes are not coordinated.
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows only
@@ -24,6 +31,9 @@ except ImportError:  # pragma: no cover - exercised on Windows only
 
 STATE_DB_FILENAME: Final = "state.sqlite"
 LOCK_FILENAME: Final = ".workspace.lock"
+DEPLOY_LOCK_FILENAME: Final = ".deploy.lock"
+SCHEMA_VERSION: Final = 2  # 2: gate_ledger and release_journal tables, quizzes.epoch
+OPEN_JOURNAL_STATES: Final[tuple[ReleaseJournalState, ...]] = ("push_started", "pushed")  # still to reconcile
 SQLITE_BUSY_TIMEOUT_S: Final = 30.0
 
 # Run tables are wiped by every reset; skill_profile is Layer 4 memory and survives `preserve_skill_memory=True`.
@@ -36,6 +46,8 @@ WIPE_RUN_TABLES: Final = (
     "DELETE FROM pytest_runs",
     "DELETE FROM idempotency_store",
     "DELETE FROM events",
+    "DELETE FROM gate_ledger",
+    "DELETE FROM release_journal",
 )
 WIPE_MEMORY_TABLES: Final = ("DELETE FROM skill_profile",)
 
@@ -56,7 +68,8 @@ CREATE TABLE IF NOT EXISTS quizzes (
     attempt INTEGER NOT NULL,
     state TEXT NOT NULL,
     record TEXT NOT NULL,
-    grade TEXT
+    grade TEXT,
+    epoch INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS pytest_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,6 +95,19 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,
     detail TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gate_ledger (
+    entry TEXT NOT NULL,
+    diff_sha256 TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (entry, diff_sha256)
+);
+CREATE TABLE IF NOT EXISTS release_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    diff_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL,
+    record TEXT NOT NULL
 );
 """
 
@@ -137,6 +163,43 @@ def workspace_lock(workspace_dir: Path) -> AbstractContextManager[None]:
     return lock.hold()
 
 
+_BUSY_DEPLOY_SLOTS: set[Path] = set()
+
+
+@contextmanager
+def deploy_slot(workspace_dir: Path) -> Iterator[None]:
+    """Reserve the workspace's single deploy slot for the whole deploy, network calls included.
+
+    Non-blocking: when another thread or process holds it, raises a retryable ``run_active`` error instead of
+    waiting. The workspace lock is NOT held by this slot, so other tools keep working during a slow push.
+    """
+    path = (workspace_dir / DEPLOY_LOCK_FILENAME).resolve()
+    busy = WorkspaceError(
+        "run_active",
+        "A deploy is in progress on this workspace: wait until it is over, then repeat the call.",
+        retryable=True,
+    )
+    with _LOCKS_GUARD:
+        if path in _BUSY_DEPLOY_SLOTS:
+            raise busy
+        _BUSY_DEPLOY_SLOTS.add(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise busy from None
+            yield
+        finally:
+            os.close(descriptor)  # closing the descriptor releases the flock
+    finally:
+        with _LOCKS_GUARD:
+            _BUSY_DEPLOY_SLOTS.discard(path)
+
+
 # ---- SQLite --------------------------------------------------------------------------------------------------------
 @contextmanager
 def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
@@ -146,7 +209,7 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(SCHEMA)
+        _ensure_schema(conn)
         yield conn
     finally:
         conn.close()
@@ -162,6 +225,17 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         conn.execute("ROLLBACK")
         raise
     conn.execute("COMMIT")
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create or migrate the schema once per database file (``PRAGMA user_version``): no data is ever dropped."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+        return
+    conn.executescript(SCHEMA)
+    with transaction(conn):
+        if "epoch" not in {row["name"] for row in conn.execute("PRAGMA table_info(quizzes)")}:  # a version 1 file
+            conn.execute("ALTER TABLE quizzes ADD COLUMN epoch INTEGER NOT NULL DEFAULT 1")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
 def wipe(conn: sqlite3.Connection, *, keep_memory: bool) -> None:
@@ -206,3 +280,49 @@ def log_event(conn: sqlite3.Connection, kind: str, detail: dict[str, Any]) -> No
         "INSERT INTO events (kind, detail, created_at) VALUES (?, ?, ?)",
         (kind, json.dumps(detail, sort_keys=True, default=str), utc_now().isoformat()),
     )
+
+
+# ---- gate ledger ---------------------------------------------------------------------------------------------------
+def ledger_record(conn: sqlite3.Connection, entry: GateLedgerEntry, diff_sha256: str, epoch: int) -> None:
+    """Grant ``entry`` to ``diff_sha256`` (no-op if it already holds). Call it inside the transaction that earns it."""
+    conn.execute(
+        "INSERT OR IGNORE INTO gate_ledger (entry, diff_sha256, epoch, created_at) VALUES (?, ?, ?, ?)",
+        (entry, diff_sha256, epoch, utc_now().isoformat()),
+    )
+
+
+def ledger_revoke(conn: sqlite3.Connection, entry: GateLedgerEntry, diff_sha256: str) -> bool:
+    """Withdraw ``entry`` from ``diff_sha256``; True when it was held."""
+    cursor = conn.execute("DELETE FROM gate_ledger WHERE entry = ? AND diff_sha256 = ?", (entry, diff_sha256))
+    return cursor.rowcount > 0
+
+
+def ledger_entries(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """``{entry: [diff hashes, oldest first]}`` for every entry that has at least one hash."""
+    entries: dict[str, list[str]] = {}
+    for row in conn.execute("SELECT entry, diff_sha256 FROM gate_ledger ORDER BY rowid"):
+        entries.setdefault(row["entry"], []).append(row["diff_sha256"])
+    return entries
+
+
+# ---- release journal -----------------------------------------------------------------------------------------------
+def journal_append(conn: sqlite3.Connection, diff_sha256: str, state: ReleaseJournalState, record: str) -> int:
+    """Open a journal entry (``record`` is the ``ReleaseJournalEntry`` JSON); returns its id."""
+    cursor = conn.execute(
+        "INSERT INTO release_journal (diff_sha256, state, record) VALUES (?, ?, ?)", (diff_sha256, state, record)
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def journal_update(conn: sqlite3.Connection, journal_id: int, state: ReleaseJournalState, record: str) -> None:
+    conn.execute("UPDATE release_journal SET state = ?, record = ? WHERE id = ?", (state, record, journal_id))
+
+
+def journal_open_entries(conn: sqlite3.Connection) -> list[tuple[int, str]]:
+    """``[(id, record JSON)]`` of the entries still to reconcile (``OPEN_JOURNAL_STATES``), oldest first."""
+    marks = ", ".join("?" for _ in OPEN_JOURNAL_STATES)
+    rows = conn.execute(
+        f"SELECT id, record FROM release_journal WHERE state IN ({marks}) ORDER BY id",  # noqa: S608 - constant marks
+        OPEN_JOURNAL_STATES,
+    )
+    return [(int(row["id"]), str(row["record"])) for row in rows]

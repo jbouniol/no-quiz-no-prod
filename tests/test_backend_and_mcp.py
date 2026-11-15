@@ -6,6 +6,7 @@ as spawned subprocesses) and a mocked Notion REST API.
 
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -19,19 +20,23 @@ from typing import Any
 import httpx
 import pytest
 from mcp import Client
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from testkit import FIXED_FINTECH_ORDERS, HERMETIC_RELEASE_ENV
 
 from no_quiz_no_prod.backend import SandboxWorkspace, WorkspaceError, catalog
 from no_quiz_no_prod.backend.notion_sync import NotionDatabaseSync, provision_notion_databases
 from no_quiz_no_prod.backend.seeds import SEEDS_DIR, load_seed_rules
+from no_quiz_no_prod.backend.store import deploy_slot
 from no_quiz_no_prod.contracts import (
     ALL_FINTECH_MODULES,
     ALL_RULE_DOMAINS,
     ALL_SKILL_TAGS,
     DEFAULT_SEED,
     DEFAULT_USER_ID,
+    SECRET_ENV_VARS,
     DeployDecision,
+    DeployGateStatus,
+    EnvVar,
     InjectionSpec,
     OptionTexts,
     PublicQuizView,
@@ -40,9 +45,11 @@ from no_quiz_no_prod.contracts import (
     ShipLogEntry,
     SkillProfileRecord,
     ToolErrorPayload,
+    project_environment,
 )
 from no_quiz_no_prod.mcp_servers import code_server, notion_quiz_server
 from no_quiz_no_prod.mcp_servers.client import ToolOutcome, decode_tool_result, server_parameters
+from no_quiz_no_prod.mcp_servers.common import WorkspaceBinding, server_settings
 from no_quiz_no_prod.mcp_servers.notion_quiz_server import quiz_tool_arguments
 
 NOW = 1_763_000_000
@@ -125,6 +132,15 @@ def approve(sandbox: SandboxWorkspace, diff: str) -> None:
     sandbox.apply_deploy_decision(DeployDecision(action="approve", expected_diff_sha256=diff))
 
 
+def reject(sandbox: SandboxWorkspace, diff: str) -> DeployGateStatus:
+    return sandbox.apply_deploy_decision(DeployDecision(action="reject", expected_diff_sha256=diff, reason="no"))
+
+
+def gate(sandbox: SandboxWorkspace) -> DeployGateStatus:
+    """The gate of whatever is staged now, asked with the hash of that very diff (the argument is mandatory)."""
+    return sandbox.get_gate_status(sandbox.get_diff_report().diff_sha256)
+
+
 def load_staged_module(sandbox: SandboxWorkspace, name: str) -> ModuleType:
     """Import a staged fintech module under a unique name (no generic `orders` left in sys.modules)."""
     spec = importlib.util.spec_from_file_location(f"staged_{name}_{uuid.uuid4().hex}", sandbox.staging_dir / name)
@@ -160,7 +176,7 @@ def test_seed_baseline_suite_is_green_fast_and_unlocks_nothing(workspace: Sandbo
     assert report.passed and re.search(r"\d+ passed", report.summary)
     reported = re.search(r"in ([\d.]+)s", report.summary)
     assert reported is not None and float(reported.group(1)) < BASELINE_PYTEST_BUDGET_S
-    assert workspace.get_gate_status().missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
+    assert gate(workspace).missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
     assert workspace.snapshot_final_state().tests_passed is True
 
 
@@ -199,7 +215,7 @@ def test_reset_is_deterministic_and_leaves_other_domains_files(settings: Runtime
     assert first == second
     assert first.prod_tree_sha256 == first.staging_tree_sha256
     assert (first.prod_changed, first.tests_passed, first.ship_log_status, first.deployed) == (False, None, None, False)
-    assert sandbox.get_gate_status().missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
+    assert gate(sandbox).missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
     assert all(path.read_text() == "owned by another domain" for path in foreign)
     assert sorted(sandbox.list_files("prod")) == sorted(ALL_FINTECH_MODULES)
 
@@ -358,6 +374,204 @@ def test_ship_log_writes_are_bound_to_the_live_change(workspace: SandboxWorkspac
     assert workspace.snapshot_final_state(thread_id="run-42").ship_log_status == "Quiz Pending"
 
 
+# ---- gate integrity: ledger in SQLite, task epochs, mandatory reviewed hash, replay-safe grading -------------------
+def exhaust_quiz(sandbox: SandboxWorkspace) -> str:
+    """Stage the fix and answer its quiz wrong twice: the task is blocked."""
+    diff = stage_fix(sandbox)
+    for wrong in ("B", "C"):
+        sandbox.grade_quiz_answer(sandbox.create_quiz(QUIZ, diff_sha256=diff).question_id, wrong)
+    return diff
+
+
+def test_a_forged_json_ledger_unlocks_nothing(workspace: SandboxWorkspace) -> None:
+    diff = stage_fix(workspace)
+    forged = {lock: [diff] for lock in ("tests_passed", "quiz_passed", "human_approved")}
+    legacy_ledger = workspace.root / "gate_ledger.json"  # where the ledger used to live, writable by any test code
+    legacy_ledger.write_text(json.dumps(forged))
+    assert gate(workspace).missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
+    assert refusal(lambda: workspace.deploy_to_production(diff, "forged")).code == "gate_locked"
+    assert not workspace.snapshot_final_state().prod_changed
+    workspace.reset()
+    assert not legacy_ledger.exists()
+
+
+def test_an_edit_never_lifts_a_block_or_buys_a_quiz_attempt(workspace: SandboxWorkspace) -> None:
+    exhaust_quiz(workspace)
+    edited = stage_fix(workspace, FIXED_ORDERS + REVIEW_NOTE)  # a no-op edit: a brand new diff hash
+    status = workspace.get_gate_status(edited)
+    assert (status.blocked, status.blocked_reason, status.quiz_attempts) == (True, "quiz_exhausted", 2)
+    blocked_quiz = refusal(lambda: workspace.create_quiz(QUIZ, diff_sha256=edited))
+    assert blocked_quiz.code == "quiz_exhausted" and blocked_quiz.details["blocked_reason"] == "quiz_exhausted"
+    assert refusal(lambda: document(workspace, edited)).code == "forbidden"
+    assert workspace.run_staging_tests().passed  # the code can still be tested...
+    approve(workspace, edited)
+    assert not workspace.get_gate_status(edited).human_approved
+    locked = refusal(lambda: workspace.deploy_to_production(edited, "ship"))  # ...but never shipped
+    assert locked.code == "gate_locked" and locked.details["blocked_reason"] == "quiz_exhausted"
+    workspace.reset()  # a human reset starts a fresh task
+    fresh = gate(workspace)
+    assert (fresh.blocked, fresh.quiz_attempts, fresh.task_epoch) == (False, 0, 1)
+
+
+def test_a_wrong_answer_then_an_edit_leaves_one_attempt_not_two(workspace: SandboxWorkspace) -> None:
+    diff = stage_fix(workspace)
+    workspace.grade_quiz_answer(workspace.create_quiz(QUIZ, diff_sha256=diff).question_id, "B")
+    edited = stage_fix(workspace, FIXED_ORDERS + REVIEW_NOTE)
+    second = workspace.create_quiz(QUIZ, diff_sha256=edited)
+    assert second.attempt == 2
+    assert workspace.grade_quiz_answer(second.question_id, "C").deployment_blocked
+    assert workspace.get_gate_status(edited).blocked_reason == "quiz_exhausted"
+
+
+def test_a_rejection_blocks_whatever_is_staged_until_a_human_unblocks(workspace: SandboxWorkspace) -> None:
+    diff = earn_locks_1_to_3(workspace)
+    approve(workspace, diff)
+    assert reject(workspace, diff).blocked_reason == "human_rejected"  # accepted even after an approval
+    assert not workspace.get_gate_status(diff).human_approved  # which is withdrawn
+    edited = stage_fix(workspace, FIXED_ORDERS + REVIEW_NOTE)
+    assert workspace.get_gate_status(edited).blocked
+    assert refusal(lambda: workspace.create_quiz(QUIZ, diff_sha256=edited)).code == "quiz_exhausted"
+    status = workspace.unblock("the reviewer asked for another try")
+    assert (status.blocked, status.blocked_reason, status.quiz_attempts, status.task_epoch) == (False, None, 0, 2)
+    assert status.missing_locks == ["tests_passed", "quiz_passed", "human_approved"]  # nothing is approved by it
+    assert workspace.create_quiz(QUIZ, diff_sha256=edited).attempt == 1
+
+
+def test_a_deploy_starts_a_new_epoch_and_its_locks_stay_readable(workspace: SandboxWorkspace) -> None:
+    diff = earn_locks_1_to_3(workspace)
+    approve(workspace, diff)
+    workspace.deploy_to_production(diff, "Fix VAT float drift")
+    shipped = workspace.gate_status_of(diff)
+    assert shipped.diff_sha256 == diff and shipped.can_deploy  # the four locks that let it through
+    now = gate(workspace)
+    assert (now.task_epoch, now.quiz_attempts) == (2, 0)
+    assert now.missing_locks == ["tests_passed", "quiz_passed", "human_approved"]
+    assert workspace.snapshot_final_state().quiz_attempts == 1  # the shipped task keeps its own count
+    assert not workspace.gate_status_of("0" * 64).sha256_matches  # an unknown hash matches nothing
+
+
+def test_the_reviewed_hash_is_mandatory_at_the_server(workspace: SandboxWorkspace) -> None:
+    for action in ("approve", "reject"):
+        with pytest.raises(ValidationError):
+            DeployDecision(action=action)
+    with pytest.raises(TypeError):
+        workspace.get_gate_status()  # type: ignore[call-arg]  # never defaulted to "whatever is staged now"
+
+
+def test_grading_is_replay_safe_and_an_answer_is_final(workspace: SandboxWorkspace) -> None:
+    diff = stage_fix(workspace)
+    document(workspace, diff)
+    question = workspace.create_quiz(QUIZ, diff_sha256=diff)
+    first = workspace.grade_quiz_answer(question.question_id, "B")
+    assert workspace.grade_quiz_answer(question.question_id, "B") == first  # e.g. the harness resumed after a crash
+    skill = workspace.get_skill_profile()[ALL_SKILL_TAGS.index("decimal_rounding")]
+    assert (skill.fail_count, workspace.get_gate_status(diff).quiz_attempts) == (1, 1)  # counted once
+    assert workspace.get_latest_ship_log().quiz_attempts == 1
+    assert refusal(lambda: workspace.grade_quiz_answer(question.question_id, "A")).code == "conflict"
+    assert not workspace.get_gate_status(diff).quiz_passed
+
+
+def test_a_grade_and_its_lock_commit_together_or_not_at_all(
+    workspace: SandboxWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = stage_fix(workspace)
+    question = workspace.create_quiz(QUIZ, diff_sha256=diff)
+
+    def crash(*_: Any) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(SandboxWorkspace, "_save_skill", crash)  # the last write of the grading transaction
+    with pytest.raises(RuntimeError):
+        workspace.grade_quiz_answer(question.question_id, "A")
+    half = workspace.get_gate_status(diff)
+    assert (half.quiz_passed, half.quiz_attempts) == (False, 0)  # nothing was half-written
+    monkeypatch.undo()
+    assert workspace.grade_quiz_answer(question.question_id, "A").passed  # and the question is still gradable
+    assert workspace.get_gate_status(diff).quiz_passed
+
+
+def test_a_failed_push_revokes_the_approval(settings: RuntimeSettings) -> None:
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset(fault="push_rejected")
+    diff = earn_locks_1_to_3(sandbox)
+    approve(sandbox, diff)
+    assert (
+        refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")).code == "upstream_error"
+    )
+    status = sandbox.get_gate_status(diff)
+    assert status.missing_locks == ["human_approved"] and status.ready_for_approval
+    again = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1"))
+    assert again.code == "gate_locked"  # no silent retry on the first approval
+    approve(sandbox, diff)  # a real second Lock 4, on the same diff
+    assert sandbox.deploy_to_production(diff, "Fix VAT", idempotency_key="d-1")["ok"]
+    assert sandbox.snapshot_final_state().deployed
+
+
+def test_a_rejection_after_a_failed_push_blocks_the_task(settings: RuntimeSettings) -> None:
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset(fault="push_rejected")
+    diff = earn_locks_1_to_3(sandbox)
+    approve(sandbox, diff)
+    refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT"))
+    assert reject(sandbox, diff).blocked_reason == "human_rejected"
+    approve(sandbox, diff)
+    assert refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT")).details["blocked"] is True
+    final = sandbox.snapshot_final_state()
+    assert (final.prod_changed, final.deployed, final.ship_log_status) == (False, False, "Blocked")
+
+
+def test_push_unavailable_refuses_every_push_of_the_run(settings: RuntimeSettings) -> None:
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset(fault="push_unavailable")
+    diff = earn_locks_1_to_3(sandbox)
+    for _ in range(3):
+        approve(sandbox, diff)
+        error = refusal(lambda: sandbox.deploy_to_production(diff, "Fix VAT"))
+        assert (error.code, error.retryable) == ("upstream_error", True)
+    final = sandbox.snapshot_final_state()
+    assert (final.prod_changed, final.deployed, final.pushed) == (False, False, False)
+
+
+def test_write_outcome_unknown_lands_once_and_is_not_blindly_retryable(settings: RuntimeSettings) -> None:
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset(fault="write_outcome_unknown")
+    lost = refusal(lambda: sandbox.write_staging_file("orders.py", FIXED_ORDERS, idempotency_key="w-1"))
+    assert (lost.code, lost.retryable, lost.outcome_unknown) == ("timeout", False, True)
+    assert sandbox.read_file("orders.py") == FIXED_ORDERS  # the write did land: the caller must look before rewriting
+    assert sandbox.write_staging_file("orders.py", FIXED_ORDERS, idempotency_key="w-1")["replayed"]
+
+
+def test_a_reset_is_refused_while_a_deploy_is_in_flight(workspace: SandboxWorkspace) -> None:
+    stage_fix(workspace)
+    with deploy_slot(workspace.root):  # what deploy_to_production holds for its whole duration
+        busy = refusal(lambda: workspace.reset())
+        assert (busy.code, busy.retryable) == ("run_active", True)
+    assert workspace.read_file("orders.py") == FIXED_ORDERS  # nothing was wiped
+    workspace.reset()
+    assert workspace.read_file("orders.py") != FIXED_ORDERS
+
+
+def test_a_version_1_state_file_is_migrated_in_place(settings: RuntimeSettings) -> None:
+    settings.workspace_dir.mkdir(parents=True)
+    remembered = SkillProfileRecord(skill_tag="decimal_rounding").record_quiz(passed=False, misconception="floats")
+    with sqlite3.connect(settings.workspace_dir / "state.sqlite") as old:  # the schema before the fix phase
+        old.executescript(
+            "CREATE TABLE quizzes (question_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, diff_sha256 TEXT NOT NULL,"
+            " attempt INTEGER NOT NULL, state TEXT NOT NULL, record TEXT NOT NULL, grade TEXT);"
+            "CREATE TABLE skill_profile (user_id TEXT NOT NULL, skill_tag TEXT NOT NULL, record TEXT NOT NULL,"
+            " PRIMARY KEY (user_id, skill_tag));"
+        )
+        old.execute(
+            "INSERT INTO skill_profile VALUES (?, ?, ?)",
+            (DEFAULT_USER_ID, remembered.skill_tag, remembered.model_dump_json()),
+        )
+    sandbox = SandboxWorkspace(settings)
+    sandbox.reset(preserve_skill_memory=True)
+    assert sandbox.get_skill_profile()[ALL_SKILL_TAGS.index("decimal_rounding")] == remembered  # nothing dropped
+    exhaust_quiz(sandbox)  # the migrated tables carry epochs and the ledger
+    assert gate(sandbox).blocked_reason == "quiz_exhausted"
+
+
 # ---- Layer 4 skill memory ------------------------------------------------------------------------------------------
 def test_skill_memory_survives_preserving_resets_and_can_be_forgotten(workspace: SandboxWorkspace) -> None:
     record = SkillProfileRecord(skill_tag="sql_parameterization").record_quiz(passed=False, misconception="escaping")
@@ -484,7 +698,7 @@ async def test_mcp_failures_are_typed_tool_error_payloads(settings: RuntimeSetti
         assert escape.error is not None and escape.error.code == "invalid_argument"
         assert escape.error.details["fields"] == ["path"]
         unknown = await call(code, "drop_database")
-        assert unknown.error is not None and unknown.error.code == "invalid_argument"
+        assert unknown.error is not None and unknown.error.code == "not_found"  # not the caller's argument
         diff = (await call(code, catalog.GET_STAGING_DIFF)).payload["diff_sha256"]
         locked = await call(code, catalog.DEPLOY_TO_PRODUCTION, expected_diff_sha256=diff, release_note="ship it")
         assert (
@@ -510,6 +724,80 @@ async def test_module_level_server_resolves_the_workspace_per_call(
             listing = await call(client, catalog.LIST_WORKSPACE_FILES, area="prod")
             assert listing.payload == sorted(ALL_FINTECH_MODULES)
             assert (tmp_path / name / "prod" / "orders.py").is_file()
+
+
+# ---- least privilege: what each server may hold ----------------------------------------------------------------------
+FAKE_SECRETS = {
+    EnvVar.OPENROUTER_API_KEY: "sk-or-fake-llm-key",
+    EnvVar.ANTHROPIC_API_KEY: "sk-ant-fake-llm-key",
+    EnvVar.NOTION_API_KEY: "secret_fake_notion_key",
+    EnvVar.NO_QUIZ_GITHUB_TOKEN: "ghp_fake_release_token",
+}
+FAKE_REMOTE = "https://github.com/example-owner/example-release.git"
+
+
+@pytest.fixture
+def project_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project ``.env`` holding every secret, and a process environment holding none of them."""
+    env_file = tmp_path / "project.env"
+    lines = [f"{var.value}={value}" for var, value in FAKE_SECRETS.items()]
+    env_file.write_text("\n".join([*lines, f"{EnvVar.NO_QUIZ_GIT_REMOTE_URL.value}={FAKE_REMOTE}"]) + "\n")
+    monkeypatch.setenv(EnvVar.NO_QUIZ_ENV_FILE.value, str(env_file))
+    for var in (*FAKE_SECRETS, EnvVar.NO_QUIZ_GIT_REMOTE_URL):
+        monkeypatch.delenv(var.value, raising=False)
+    return env_file
+
+
+def secret(value: SecretStr | None) -> str | None:
+    return None if value is None else value.get_secret_value()
+
+
+def test_a_server_only_ever_holds_its_own_secrets(project_env: Path) -> None:
+    code, notion = server_settings(catalog.CODE_SERVER), server_settings(catalog.NOTION_QUIZ_SERVER)
+    assert (secret(code.github_token), code.git_remote_url) == (FAKE_SECRETS[EnvVar.NO_QUIZ_GITHUB_TOKEN], FAKE_REMOTE)
+    assert (code.notion_api_key, code.openrouter_api_key, code.anthropic_api_key) == (None, None, None)
+    assert secret(notion.notion_api_key) == FAKE_SECRETS[EnvVar.NOTION_API_KEY]
+    assert (notion.github_token, notion.git_remote_url) == (None, None)
+    assert (notion.openrouter_api_key, notion.anthropic_api_key) == (None, None)
+    # read from the file at call time, never exported: no child of the server can inherit or read back a secret
+    assert not [var for var in SECRET_ENV_VARS if os.environ.get(var.value)]
+    project_env.write_text(f"{EnvVar.NO_QUIZ_GITHUB_TOKEN.value}=ghp_rotated\n")
+    assert secret(server_settings(catalog.CODE_SERVER).github_token) == "ghp_rotated"  # a rewritten .env is followed
+
+
+def test_no_secret_is_ever_put_in_a_server_launch_environment(project_env: Path, tmp_path: Path) -> None:
+    harness = RuntimeSettings.from_env(project_environment(), notion_ids_file=None)  # the harness holds every secret
+    code_env = harness.environment_for(catalog.CODE_SERVER)
+    notion_env = harness.environment_for(catalog.NOTION_QUIZ_SERVER)
+    launched = json.dumps([code_env, notion_env])
+    assert not [value for value in FAKE_SECRETS.values() if value in launched]
+    # allowed and held by the harness: left out, so the server reads it itself from the forwarded .env
+    assert EnvVar.NO_QUIZ_GITHUB_TOKEN.value not in code_env and EnvVar.NOTION_API_KEY.value not in notion_env
+    assert code_env[EnvVar.NO_QUIZ_ENV_FILE.value] == str(project_env) == notion_env[EnvVar.NO_QUIZ_ENV_FILE.value]
+    # not allowed: blank, which wins over whatever the .env says
+    for blanked in (EnvVar.NOTION_API_KEY, EnvVar.OPENROUTER_API_KEY, EnvVar.ANTHROPIC_API_KEY):
+        assert code_env[blanked.value] == ""
+    for blanked in (EnvVar.NO_QUIZ_GITHUB_TOKEN, EnvVar.NO_QUIZ_GIT_REMOTE_URL, EnvVar.OPENROUTER_API_KEY):
+        assert notion_env[blanked.value] == ""
+    assert code_env[EnvVar.NO_QUIZ_GIT_REMOTE_URL.value] == FAKE_REMOTE
+    # a harness without a token keeps the server blank too (hermetic runs never fall back to the .env)
+    assert (
+        RuntimeSettings(workspace_dir=tmp_path).environment_for(catalog.CODE_SERVER)[EnvVar.NO_QUIZ_GITHUB_TOKEN.value]
+        == ""
+    )
+
+
+def test_launch_helpers_and_in_process_servers_apply_the_same_allow_list(settings: RuntimeSettings) -> None:
+    leaked = {EnvVar.NOTION_API_KEY.value: "secret_x", EnvVar.OPENROUTER_API_KEY.value: "sk-x"}
+    env = server_parameters(catalog.CODE_SERVER, env=leaked).env or {}
+    assert env[EnvVar.NOTION_API_KEY.value] == "" == env[EnvVar.OPENROUTER_API_KEY.value]
+    notion_env = server_parameters(catalog.NOTION_QUIZ_SERVER, env={EnvVar.NO_QUIZ_GITHUB_TOKEN.value: "ghp_x"}).env
+    assert notion_env is not None and notion_env[EnvVar.NO_QUIZ_GITHUB_TOKEN.value] == ""
+    full = notion_settings(settings).model_copy(update={"github_token": SecretStr("ghp_x")})
+    in_code = WorkspaceBinding(catalog.CODE_SERVER, full)().settings
+    in_notion = WorkspaceBinding(catalog.NOTION_QUIZ_SERVER, full)().settings
+    assert (in_code.notion_api_key, secret(in_code.github_token)) == (None, "ghp_x")
+    assert (secret(in_notion.notion_api_key), in_notion.github_token) == (NOTION_KEY, None)
 
 
 @asynccontextmanager
