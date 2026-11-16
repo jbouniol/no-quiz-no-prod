@@ -569,6 +569,41 @@ def test_the_macos_profile_opens_linked_libraries_file_by_file(tmp_path: Path) -
     assert sandbox._macho_dylibs(tmp_path / "not-macho") == set()
 
 
+def _fake_macho(path: Path, *dylibs: str) -> Path:
+    """A thin 64-bit Mach-O whose only load commands are LC_LOAD_DYLIB of ``dylibs``."""
+    commands = b""
+    for name in dylibs:
+        raw = name.encode() + b"\0"
+        raw += b"\0" * (-(24 + len(raw)) % 8)
+        commands += (0xC).to_bytes(4, "little") + (24 + len(raw)).to_bytes(4, "little") + (24).to_bytes(4, "little")
+        commands += b"\0" * 12 + raw
+    header = [0xFEEDFACF, 0x0100000C, 0, 6, len(dylibs), len(commands), 0, 0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(value.to_bytes(4, "little") for value in header) + commands)
+    return path
+
+
+def test_linked_libraries_follow_loader_path_siblings_of_an_outside_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # libssl in an outside keg loads its sibling libcrypto through @loader_path: both must be opened file by file
+    root, keg = tmp_path / "python", tmp_path / "keg" / "lib"
+    libcrypto = _fake_macho(keg / "libcrypto.dylib")
+    libssl = _fake_macho(keg / "libssl.dylib", "@loader_path/libcrypto.dylib", "@rpath/libinside.dylib")
+    python = _fake_macho(root / "bin" / "python", str(libssl), "/usr/lib/libSystem.B.dylib")
+    monkeypatch.setattr(sandbox.sys, "executable", str(python))
+    monkeypatch.setattr(sandbox, "_interpreter_roots", lambda: [root.resolve()])
+    sandbox._linked_libraries.cache_clear()
+    try:
+        found = {path.resolve() for path in sandbox._linked_libraries()}
+    finally:
+        sandbox._linked_libraries.cache_clear()
+    assert found == {libssl.resolve(), libcrypto.resolve()}
+    truncated = tmp_path / "truncated"
+    truncated.write_bytes(libssl.read_bytes()[:40])  # header plus a cut load command
+    assert sandbox._macho_dylibs(truncated) == set()
+
+
 def test_the_linux_namespace_mounts_only_the_system_the_interpreter_and_the_root(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     argv = sandbox.bubblewrap_argv(root, root / "run")

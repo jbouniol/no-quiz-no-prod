@@ -188,8 +188,8 @@ def _macho_dylibs(path: Path) -> set[str]:
         for _ in range(ncmds):
             cmd = int.from_bytes(data[offset : offset + 4], "little")
             size = int.from_bytes(data[offset + 4 : offset + 8], "little")
-            if size < 8:
-                break
+            if size < 8 or offset + size > len(data):
+                break  # malformed or truncated load command
             if cmd in _MACHO_DYLIB_COMMANDS:
                 start = offset + int.from_bytes(data[offset + 8 : offset + 12], "little")
                 names.add(data[start : offset + size].split(b"\0", 1)[0].decode("utf-8", "replace"))
@@ -218,9 +218,14 @@ def _linked_libraries() -> frozenset[Path]:
             continue
         seen.add(binary)
         for name in _macho_dylibs(binary):
-            if not name.startswith("/") or name.startswith(system):
-                continue  # @rpath/@loader_path stay inside readable roots; system libraries are already allowed
-            library = Path(name)
+            if name.startswith("@loader_path/"):
+                # a sibling of the binary: inside the interpreter roots for Python's own files, but an external keg
+                # (libssl -> @loader_path/libcrypto) is only readable through this list
+                library = binary.parent / name.removeprefix("@loader_path/")
+            elif not name.startswith("/") or name.startswith(system):
+                continue  # @rpath/@executable_path stay inside readable roots; system libraries are already allowed
+            else:
+                library = Path(name)
             if not library.exists():
                 continue
             resolved = library.resolve()
