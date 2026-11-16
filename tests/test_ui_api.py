@@ -1459,7 +1459,6 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
                 )
             ),
             turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
-            turn(text="STATUS: DONE\nDoc v1 and quiz attempt 1 are published."),
         ],
     )
     workflows: list[NoQuizWorkflow] = []
@@ -2047,7 +2046,6 @@ def test_reject_after_failed_push_blocks_epoch_and_keeps_prod_untouched(tmp_path
                 )
             ),
             turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
-            turn(text="STATUS: DONE\nQuiz ready."),
         ],
     )
     workflows: list[NoQuizWorkflow] = []

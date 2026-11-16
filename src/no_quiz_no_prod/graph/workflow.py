@@ -653,9 +653,7 @@ class NoQuizWorkflow:
             self._route_agent,
             {"tools": "tools", "give_up": "give_up", "handoff": "handoff", "finish": "finish"},
         )
-        graph.add_conditional_edges(
-            "tools", lambda state: "give_up" if state.get("budget_exhausted") else "agent", ["give_up", "agent"]
-        )
+        graph.add_conditional_edges("tools", self._route_tools, ["give_up", "handoff", "agent"])
         graph.add_edge("quiz_gate", QUIZ_OUTCOME_NODE)
         graph.add_edge("give_up", END)
         graph.add_edge("finish", END)
@@ -754,6 +752,33 @@ class NoQuizWorkflow:
             return "give_up" if budget.steps >= budget.max_steps else "tools"
         return "handoff"
 
+    @staticmethod
+    def _route_tools(state: WorkflowState) -> str:
+        """After a tool call: stop on the budget, hand off once the documentation phase is complete, else continue.
+
+        The graph, not the model, decides that the Examiner is done. Its quiz call carries the sealed answer key,
+        which its own history only shows redacted, so a model left to judge reads its quiz as incomplete and
+        creates it again until the step budget runs out. Once the call that completes the Ship Log and the quiz
+        of the current attempt has succeeded, the run moves on; ``handoff`` re-checks both against the real diff.
+        """
+        if state.get("budget_exhausted"):
+            return "give_up"
+        trace = state.get("trace") or []
+        last = trace[-1] if trace else {}
+        quiz = state.get("quiz") or {}
+        documenting = state.get("phase") in ("examiner", "single")
+        completes = last.get("ok") and last.get("tool") in ("upsert_ship_log_doc", "create_comprehension_quiz")
+        if documenting and completes and quiz.get("diff_sha256"):
+            missing = missing_deliverables(
+                ship_log=state.get("ship_log"),
+                quiz=quiz,
+                diff_sha256=str(quiz["diff_sha256"]),
+                attempt=state.get("attempt", 1),
+            )
+            if not missing:
+                return "handoff"
+        return "agent"
+
     def _node_tools(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = _thread_id(config)
         spec = _active_spec(state)
@@ -828,7 +853,8 @@ class NoQuizWorkflow:
         )
         if missing:
             return self._nudge(state, f"Before you finish: {'; '.join(missing)}.")
-        return Command(goto="quiz_gate", update={"final_answer": answer, "nudges": 0})
+        final_answer = answer or state.get("final_answer") or ""
+        return Command(goto="quiz_gate", update={"final_answer": final_answer, "nudges": 0})
 
     def _node_quiz_gate(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         """Ask the human, grade server-side, and checkpoint the grade: nothing else.

@@ -479,11 +479,8 @@ def doc_and_quiz(attempt: int, correct: str, *, targeted: tuple[str, ...] = ()) 
         applied_rules=["RULE-001"],
         targeted_weaknesses=list(targeted),
     )
-    return [
-        turn(upsert),
-        turn(call("create_comprehension_quiz", **quiz)),
-        turn(text=f"STATUS: DONE\nDoc and quiz {attempt} ready."),
-    ]
+    # No closing "STATUS: DONE" turn: once the doc and the quiz of the attempt exist, the graph moves to the quiz gate.
+    return [turn(upsert), turn(call("create_comprehension_quiz", **quiz))]
 
 
 EXPECT = {
@@ -588,6 +585,36 @@ def test_status_protocol_with_conservative_fallback(text: str, wrote: bool, stat
 
 
 # ---- the four HITL paths -------------------------------------------------------------------------------------------
+def test_the_graph_moves_to_the_quiz_once_the_doc_and_quiz_exist(tmp_path: Path, backend: FakeBackend) -> None:
+    """Studio regression (thr_e3420d90, thr_15b4027e): the Examiner's quiz call is stored with the answer key
+    redacted, so the model read its own quiz as incomplete and created it again until the step budget ran out
+    (max_steps, the quiz never shown). The graph now decides: once the doc and quiz of the attempt exist, it hands
+    off to the quiz gate without asking the model whether it is done."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    looping = [upsert, *[quiz] * 6]  # what the model did live: the same quiz, again and again
+    llm = ScriptedLLM(coder=coder_fix(), examiner=looping)
+    workflow = make_workflow(tmp_path, backend, llm)
+    paused = workflow.start_run(TASK, thread_id="t-loop", max_steps=16)
+    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert tools_called(backend).count("create_comprehension_quiz") == 1
+    assert llm.remaining()["examiner"] == 5  # the model was not asked again after its quiz
+    assert paused.budget.steps == 7  # 5 coder calls + doc + quiz, far from the budget of 16
+    grade, gated = workflow.submit_quiz("t-loop", QuizAnswer(selected_option="A"))
+    assert grade.passed and gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
+
+    # the route itself, without a model: a failed quiz call, or a quiz of another diff, goes back to the agent
+    route = NoQuizWorkflow._route_tools
+    ready = {"ship_log": {"diff_sha256": "d1", "doc_version": "v1"}, "quiz": {"diff_sha256": "d1", "attempt": 1}}
+    base = {"phase": "examiner", "attempt": 1, **ready}
+    assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "handoff"
+    assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": False}]}) == "agent"
+    assert route({**base, "trace": [{"tool": "read_code_file", "ok": True}]}) == "agent"
+    assert route({**base, "phase": "coder", "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
+    stale = {**base, "ship_log": {"diff_sha256": "d0", "doc_version": "v1"}}
+    assert route({**stale, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
+    assert route({**base, "budget_exhausted": True, "trace": []}) == "give_up"
+
+
 def test_happy_path_pass_first_try_completes(tmp_path: Path, backend: FakeBackend) -> None:
     llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A"))
     workflow = make_workflow(tmp_path, backend, llm)
@@ -948,9 +975,9 @@ def test_repeated_unusable_turns_stop_as_api_error_with_zero_writes(tmp_path: Pa
 def test_an_examiner_question_is_a_dead_end_so_its_deliverables_decide(tmp_path: Path, backend: FakeBackend) -> None:
     """Live Gemini 2.5 Flash regression (n12, ad06): after a rejected quiz the Examiner asked the developer to fix
     it; nobody can answer an Examiner (a follow-up goes to the Coder), so the run died as clarification_needed."""
-    upsert, quiz, done = doc_and_quiz(1, "A")
+    upsert, quiz = doc_and_quiz(1, "A")
     question = turn(text="STATUS: CLARIFICATION_NEEDED\nPlease provide four distinct options for the quiz?")
-    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, question, quiz, done])
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, question, quiz])
     result = make_workflow(tmp_path, backend, llm).run_scenario(scenario(max_steps=14))
     assert result.passed, result.why
     nudges = [
@@ -1375,8 +1402,8 @@ def test_a_sealed_turn_drops_readable_reasoning_but_keeps_opaque_blocks() -> Non
 
 
 def test_sealed_arguments_lost_by_a_restart_are_asked_again(tmp_path: Path, backend: FakeBackend) -> None:
-    upsert, quiz, done = doc_and_quiz(1, "A")
-    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz, done])
+    upsert, quiz = doc_and_quiz(1, "A")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])
     workflow = make_workflow(tmp_path, backend, llm)
     unseal = workflow._unseal
     lost: list[str] = []

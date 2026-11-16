@@ -111,11 +111,8 @@ def examiner_script(attempt: int, quiz: dict[str, str]) -> list[ChatTurnResponse
         applied_rules=["RULE-001"],
         targeted_weaknesses=[SKILL],
     )
-    return [
-        turn(upsert),
-        turn(call("create_comprehension_quiz", **quiz)),
-        turn(text=f"STATUS: DONE\nDoc v{attempt} and quiz attempt {attempt} are published."),
-    ]
+    # No closing "STATUS: DONE" turn: once the doc and the quiz exist, the graph moves to the quiz gate on its own.
+    return [turn(upsert), turn(call("create_comprehension_quiz", **quiz))]
 
 
 # ---- the live Studio -----------------------------------------------------------------------------------------------
