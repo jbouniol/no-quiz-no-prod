@@ -159,6 +159,77 @@ def _resolution_trail(path: Path, depth: int = 0) -> set[Path]:
     return trail
 
 
+_MACHO_MAGIC_64: Final = 0xFEEDFACF
+_MACHO_FAT_MAGIC: Final = 0xCAFEBABE
+# LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB
+_MACHO_DYLIB_COMMANDS: Final = frozenset({0xC, 0x80000018, 0x8000001F, 0x20, 0x80000023})
+
+
+def _macho_dylibs(path: Path) -> set[str]:
+    """The install names a Mach-O file (thin 64-bit or fat) loads; empty when it is not one or cannot be read."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return set()
+    if len(data) < 8:
+        return set()
+    slices: list[int] = []
+    if int.from_bytes(data[:4], "big") == _MACHO_FAT_MAGIC:
+        count = int.from_bytes(data[4:8], "big")
+        slices = [int.from_bytes(data[8 + 20 * i + 8 : 8 + 20 * i + 12], "big") for i in range(min(count, 8))]
+    else:
+        slices = [0]
+    names: set[str] = set()
+    for base in slices:
+        if int.from_bytes(data[base : base + 4], "little") != _MACHO_MAGIC_64:
+            continue
+        ncmds = int.from_bytes(data[base + 16 : base + 20], "little")
+        offset = base + 32
+        for _ in range(ncmds):
+            cmd = int.from_bytes(data[offset : offset + 4], "little")
+            size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+            if size < 8:
+                break
+            if cmd in _MACHO_DYLIB_COMMANDS:
+                start = offset + int.from_bytes(data[offset + 8 : offset + 12], "little")
+                names.add(data[start : offset + size].split(b"\0", 1)[0].decode("utf-8", "replace"))
+            offset += size
+    return names
+
+
+@functools.cache
+def _linked_libraries() -> frozenset[Path]:
+    """Absolute non-system libraries the interpreter and its extension modules load, followed transitively.
+
+    A Homebrew Python links ``_sqlite3``, ``_ssl``, ``_lzma``... against other kegs (``/opt/homebrew/opt/<pkg>/lib``)
+    outside ``sys.base_prefix``; without them ``import sqlite3`` fails under the deny-default profile.
+    """
+    system = tuple(MACOS_SYSTEM_READ_PATHS)
+    roots = _interpreter_roots()
+    queue = [Path(sys.executable).resolve()]
+    for root in roots:
+        queue += [path for path in root.glob("lib/python*/lib-dynload/*.so")]
+        queue += [path for path in root.glob("Python") if path.is_file()]
+    seen: set[Path] = set()
+    found: set[Path] = set()
+    while queue:
+        binary = queue.pop()
+        if binary in seen:
+            continue
+        seen.add(binary)
+        for name in _macho_dylibs(binary):
+            if not name.startswith("/") or name.startswith(system):
+                continue  # @rpath/@loader_path stay inside readable roots; system libraries are already allowed
+            library = Path(name)
+            if not library.exists():
+                continue
+            resolved = library.resolve()
+            if not any(resolved.is_relative_to(root) for root in roots):
+                found.add(library)
+            queue.append(resolved)
+    return frozenset(found)
+
+
 def _with_ancestors(paths: Iterable[Path]) -> list[Path]:
     return sorted({ancestor for path in paths for ancestor in (path, *path.parents)})
 
@@ -179,7 +250,11 @@ def seatbelt_profile(root: Path) -> str:
     reveals no file content.
     """
     readable = [*(Path(path) for path in MACOS_SYSTEM_READ_PATHS), *_interpreter_roots(), root]
-    trail = _resolution_trail(Path(sys.executable)) | set(readable)
+    libraries: set[Path] = set()
+    for library in sorted(_linked_libraries()):
+        libraries |= _resolution_trail(library)
+    trail = _resolution_trail(Path(sys.executable)) | set(readable) | libraries
+    literal_reads: list[Path | str] = [*MACOS_LITERAL_READ_PATHS, *sorted(libraries)]
     return "\n".join(
         [
             "(version 1)",
@@ -188,7 +263,7 @@ def seatbelt_profile(root: Path) -> str:
             "(allow process-exec)",
             "(allow signal (target same-sandbox))",
             "(allow sysctl-read)",
-            f"(allow file-read* {_filters('subpath', readable)} {_filters('literal', MACOS_LITERAL_READ_PATHS)})",
+            f"(allow file-read* {_filters('subpath', readable)} {_filters('literal', literal_reads)})",
             f"(allow file-read-metadata {_filters('literal', _with_ancestors(trail))})",
             f"(allow file-write* (subpath {_quoted(root)}))",
             f"(allow file-write-data {_filters('literal', MACOS_DEVICE_WRITE_PATHS)})",
