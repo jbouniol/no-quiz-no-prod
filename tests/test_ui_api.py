@@ -2185,7 +2185,7 @@ def test_run_stream_validates_release_config_before_starting_workflow(tmp_path: 
     assert studio_of(client).busy is None
 
 
-def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(
+def test_default_eval_dir_loads_latest_campaign_and_its_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With eval/results*.jsonl moved into eval/campaigns/, default create_app() loads LATEST_CAMPAIGN_DIR and manifest."""
@@ -2203,7 +2203,6 @@ def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["available"] is True
-    assert body["summary"]["total_runs"] == 31
-    assert body["stale"] is True
-    assert isinstance(body["stale_reason"], str) and len(body["stale_reason"]) > 20
-    assert any("eval/campaigns/03_git_release_dual_deepseek/" in src for src in body["source_files"])
+    assert body["summary"]["total_runs"] == 456  # 4 cohorts x 38 dev scenarios x 3 repeats
+    assert body["stale"] is False
+    assert any("eval/campaigns/04_dev_models_x_topologies/" in src for src in body["source_files"])

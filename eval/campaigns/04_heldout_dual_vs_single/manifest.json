@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "04_heldout_dual_vs_single",
+  "description": "Held-out set (14 scenarios x 3 repeats), DeepSeek V4 Flash dual vs single, harness at 045ded7. First run ever of these scenarios: their step budgets were set by analogy and were NOT tuned on this result.",
+  "created_at": "2026-11-16T11:30:08+00:00",
+  "git_commit": "c7196b368e689a7bc2674cde31ad2e474fd596d4",
+  "git_dirty": true,
+  "recorded_in_commit": null,
+  "scenario_set": "heldout",
+  "scenario_file_sha256": "9de60ce0b55e390f057509825087efb196f449ad0e23c2c93d71c089251f9e21",
+  "scenario_count": 14,
+  "repeats": 3,
+  "dry_run": false,
+  "push_scored": true,
+  "stop_reason_scored": true,
+  "cohorts": [
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results_dual_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 42
+    },
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (single)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "single",
+      "results_file": "results_single_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 42
+    }
+  ],
+  "judge": null,
+  "cli_args": [
+    "--scenario-set",
+    "heldout",
+    "--out",
+    "eval/campaigns/04_heldout_dual_vs_single",
+    "--compare-topologies",
+    "--repeats",
+    "3",
+    "--workers",
+    "4"
+  ],
+  "stale": false,
+  "stale_reason": ""
+}

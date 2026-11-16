@@ -9,8 +9,16 @@ recorded verdicts, all written by the harness author. **Nobody labelled them.** 
 tests and for `--dry-run --with-judge`. A kappa computed against them is not a human-agreement figure, and every
 report says so. The keys `human_acceptable` and `human_rationale` inside the file are historical names.
 
-There are **no human labels yet**. Until a file like the one below exists and the judge reaches the bar, reports
-print "Judge validated against human labels: no".
+`human_labels.json`: **40 unlabelled records** (10 per scenario kind) exported from campaign 04,
+`04_dev_models_x_topologies/results_dual_deepseek_deepseek_v4_flash_latest.jsonl`. Nobody has filled them in yet,
+so there are **no human labels yet**: until the file is labelled and the judge reaches the bar, reports print
+"Judge validated against human labels: no".
+
+`label_tool.html`: a single local page to fill that file in (no server, no network). Open it in Chrome, click
+"Open human_labels.json": Chrome saves back in place (`⌘S`); other browsers download a copy. Each record
+shows the task, the tool trace and the final message; answer the four criteria with `1`–`4` then `y`/`n`, write a
+rationale, move with `←`/`→`. `human_acceptable` is computed from the criteria. Unsaved work is kept in the
+browser per record.
 
 ## Producing real labels
 

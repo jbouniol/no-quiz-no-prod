@@ -130,7 +130,17 @@ RECORDED_RESULT_MD5 = {
     "02_benchmark_pre_git_release/results_single_deepseek_deepseek_v4_flash_latest.jsonl": "e5f8f50b540858e48233051c9ed98f9e",
     "02_benchmark_pre_git_release/results_single_google_gemini_2_5_flash.jsonl": "0e4e69bc472255f033ca5626f719e937",
     "03_git_release_dual_deepseek/results.jsonl": "66818fb2340248dae05957ed23e7c0f5",
+    "04_dev_models_x_topologies/results.jsonl": "7f8b99071aeb3d9dd8105362c71a5a37",
+    "04_dev_models_x_topologies/results_dual_deepseek_deepseek_v4_flash_latest.jsonl": "7f8b99071aeb3d9dd8105362c71a5a37",
+    "04_dev_models_x_topologies/results_dual_google_gemini_2_5_flash.jsonl": "7793a8d154313acb331b66460b710ee3",
+    "04_dev_models_x_topologies/results_single_deepseek_deepseek_v4_flash_latest.jsonl": "160d1837dafb10d5aeb3378b963a9551",
+    "04_dev_models_x_topologies/results_single_google_gemini_2_5_flash.jsonl": "8fbdd63c6dcbb2dc68dd2642a0af3fc5",
+    "04_heldout_dual_vs_single/results.jsonl": "31b24fca1cbfdfa54109b2ddba5d3a1e",
+    "04_heldout_dual_vs_single/results_dual_deepseek_deepseek_v4_flash_latest.jsonl": "31b24fca1cbfdfa54109b2ddba5d3a1e",
+    "04_heldout_dual_vs_single/results_single_deepseek_deepseek_v4_flash_latest.jsonl": "a46b39e3ab4f1056dad59e9552dcc4e7",
 }
+STALE_CAMPAIGNS = ("01_pre_fix_dual_deepseek", "02_benchmark_pre_git_release", "03_git_release_dual_deepseek")
+CURRENT_CAMPAIGNS = ("04_dev_models_x_topologies", "04_heldout_dual_vs_single")
 
 
 class _StubJudgeClient(LLMClient):
@@ -1340,7 +1350,7 @@ def test_cli_exports_a_labeling_batch_without_running_anything(tmp_path: Path) -
     assert run_eval.main(args) == EXIT_OK
     batch = load_human_labels(out)
     assert len(batch.records) == 8 and not any(rec.labeled for rec in batch.records)
-    assert {rec.source for rec in batch.records} == {"eval/campaigns/03_git_release_dual_deepseek/results.jsonl"}
+    assert {rec.source for rec in batch.records} == {"eval/campaigns/04_dev_models_x_topologies/results.jsonl"}
     with pytest.raises(SystemExit):  # a label file is never replaced by accident
         run_eval.main(args)
 
@@ -1399,18 +1409,14 @@ def test_default_output_is_a_new_run_directory_and_existing_results_are_never_ov
     assert len(load_results(created / RESULTS_FILENAME)) == 1
 
 
-def test_recorded_campaigns_are_separated_untouched_and_declared_stale() -> None:
+def test_recorded_campaigns_are_separated_untouched_and_stale_unless_current() -> None:
     # EV-25D / RP-07: one directory per campaign, each with a manifest; nothing left at the top of eval/
     eval_dir = CAMPAIGNS_DIR.parent
     assert not list(eval_dir.glob("results*.jsonl")) and not (eval_dir / "summary.md").exists()
     assert not (eval_dir / "history").exists()
     campaigns = sorted(path for path in CAMPAIGNS_DIR.iterdir() if path.is_dir())
-    assert [path.name for path in campaigns] == [
-        "01_pre_fix_dual_deepseek",
-        "02_benchmark_pre_git_release",
-        "03_git_release_dual_deepseek",
-    ]
-    assert LATEST_CAMPAIGN_DIR == campaigns[-1]
+    assert tuple(path.name for path in campaigns) == STALE_CAMPAIGNS + CURRENT_CAMPAIGNS
+    assert LATEST_CAMPAIGN_DIR == CAMPAIGNS_DIR / "04_dev_models_x_topologies"
     # C12: the recorded rows were moved, never edited
     found = {
         str(path.relative_to(CAMPAIGNS_DIR)): hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324
@@ -1422,12 +1428,21 @@ def test_recorded_campaigns_are_separated_untouched_and_declared_stale() -> None
     for campaign in campaigns:
         manifest = load_manifest(campaign)
         assert manifest is not None and manifest.name == campaign.name
-        assert manifest.stale and manifest.stale_reason and manifest.repeats == 1 and not manifest.stop_reason_scored
-        assert manifest.scenario_file_sha256 != current_scenarios  # recorded on an older scenario file
-        assert manifest.git_commit is None and manifest.created_at is None  # not recorded then, not invented now
+        if campaign.name in STALE_CAMPAIGNS:
+            assert manifest.stale and manifest.stale_reason and manifest.repeats == 1
+            assert not manifest.stop_reason_scored
+            assert manifest.scenario_file_sha256 != current_scenarios  # recorded on an older scenario file
+            assert manifest.git_commit is None and manifest.created_at is None  # not recorded then, not invented now
+        else:
+            # campaign 04: the current scenario files, k = 3, every lens scored, harness commit recorded
+            assert not manifest.stale and manifest.repeats == DEFAULT_REPEATS and manifest.stop_reason_scored
+            set_file = {str(name): path for name, path in SCENARIO_SET_PATHS.items()}.get(manifest.scenario_set)
+            assert set_file is not None, manifest.scenario_set
+            assert manifest.scenario_file_sha256 == hashlib.sha256(set_file.read_bytes()).hexdigest()
+            assert manifest.git_commit is not None and manifest.created_at is not None
         for cohort in manifest.cohorts:
             rows = load_results(campaign / cohort.results_file)
-            assert len(rows) == cohort.rows == manifest.scenario_count
+            assert len(rows) == cohort.rows == manifest.scenario_count * manifest.repeats
             assert {(r.model, r.topology) for r in rows} == {(cohort.model, cohort.topology)}
             # EV-26D: campaigns 01 and 02 never observed the push; a re-rendered summary must not print "0 pushed"
             summary = summarize_cohort(rows)
@@ -1438,6 +1453,8 @@ def test_recorded_campaigns_are_separated_untouched_and_declared_stale() -> None
             if not manifest.push_scored:
                 assert summary.deployed_and_pushed_runs == 0 and summary.deployed_runs > 0
                 assert not any(deploy_push_mismatch(r) for r in rows)
+    dev04 = load_manifest(CAMPAIGNS_DIR / "04_dev_models_x_topologies")
+    assert dev04 is not None and "INVALID COHORT: google/gemini-2.5-flash (single)" in dev04.description
     judged = load_manifest(campaigns[1])
     assert judged is not None and judged.judge is not None and judged.judge.verdicts_stored is False
 
@@ -1647,7 +1664,7 @@ def test_replay_acceptance_rebuilds_modules_deduplicates_cohorts_and_grades_camp
     rendered = out_md.read_text(encoding="utf-8")
     assert "`n02#0`" in rendered and "1/2 (50.0%)" in rendered
 
-    (camp03_replay,) = replay_acceptance.replay(LATEST_CAMPAIGN_DIR / RESULTS_FILENAME)
+    (camp03_replay,) = replay_acceptance.replay(CAMPAIGNS_DIR / "03_git_release_dual_deepseek" / RESULTS_FILENAME)
     assert camp03_replay.used_legacy_n15 is True
     assert camp03_replay.passed_before == camp03_replay.passed_after == 31
     assert camp03_replay.flipped_runs == ()

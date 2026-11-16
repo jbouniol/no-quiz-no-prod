@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "name": "04_dev_models_x_topologies",
+  "description": "Development set (38 scenarios x 3 repeats), 2 models x 2 topologies, harness at 045ded7 (working tree dirty only with these result files). scenario_set corrected from 'custom' to 'dev' after the run: --scenarios named eval/scenarios.jsonl (same sha256); the runner now resolves that itself. INVALID COHORT: google/gemini-2.5-flash (single) - 85/114 rows are api_error (OpenRouter HTTP 402, credits exhausted mid-run); do not cite its rates, rerun that cohort alone. google/gemini-2.5-flash (dual) has 5 api_error rows (429 rate limits), counted as failures in its rates, so 68.4% is a slight underestimate.",
+  "created_at": "2026-11-16T13:18:10+00:00",
+  "git_commit": "045ded73b96d00f4a4a715b9f2fc5438a7b16b9b",
+  "git_dirty": true,
+  "recorded_in_commit": null,
+  "scenario_set": "dev",
+  "scenario_file_sha256": "e5e1f19756d3c8b6036f3877e3cc37711013bb3d582a15dc7bad79c6a02a43cf",
+  "scenario_count": 38,
+  "repeats": 3,
+  "dry_run": false,
+  "push_scored": true,
+  "stop_reason_scored": true,
+  "cohorts": [
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (dual)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "dual",
+      "results_file": "results_dual_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 114
+    },
+    {
+      "label": "~deepseek/deepseek-v4-flash-latest (single)",
+      "model": "~deepseek/deepseek-v4-flash-latest",
+      "topology": "single",
+      "results_file": "results_single_deepseek_deepseek_v4_flash_latest.jsonl",
+      "rows": 114
+    },
+    {
+      "label": "google/gemini-2.5-flash (dual)",
+      "model": "google/gemini-2.5-flash",
+      "topology": "dual",
+      "results_file": "results_dual_google_gemini_2_5_flash.jsonl",
+      "rows": 114
+    },
+    {
+      "label": "google/gemini-2.5-flash (single)",
+      "model": "google/gemini-2.5-flash",
+      "topology": "single",
+      "results_file": "results_single_google_gemini_2_5_flash.jsonl",
+      "rows": 114
+    }
+  ],
+  "judge": null,
+  "cli_args": [
+    "--scenarios",
+    "eval/scenarios.jsonl",
+    "--out",
+    "eval/campaigns/04_dev_models_x_topologies",
+    "--compare-models",
+    "~deepseek/deepseek-v4-flash-latest,google/gemini-2.5-flash",
+    "--compare-topologies",
+    "--repeats",
+    "3",
+    "--workers",
+    "4"
+  ],
+  "stale": false,
+  "stale_reason": ""
+}
