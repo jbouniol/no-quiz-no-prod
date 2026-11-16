@@ -380,7 +380,7 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 ## Development, CI & Branch Protection
 
 ```bash
-# Python test suite (347 tests: graph+memory 74, backend+MCP 58, sandbox 47, git release 43, eval 34, UI 31, CLI 27, LLM 25, e2e 4, hermetic env 4)
+# Python test suite (350 tests: graph+memory 75, backend+MCP 58, sandbox 48, git release 43, eval 34, UI 32, CLI 27, LLM 25, e2e 4, hermetic env 4)
 uv run pytest -q
 
 # Frontend JavaScript unit tests (22 tests for diff.js and markdown.js; Node >= 22.7)
