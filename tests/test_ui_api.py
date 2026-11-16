@@ -2206,3 +2206,21 @@ def test_default_eval_dir_loads_latest_campaign_and_its_manifest(
     assert body["summary"]["total_runs"] == 456  # 4 cohorts x 38 dev scenarios x 3 repeats
     assert body["stale"] is False
     assert any("eval/campaigns/04_dev_models_x_topologies/" in src for src in body["source_files"])
+
+
+def test_changing_the_model_of_a_thread_rebuilds_its_workflow(tmp_path: Path) -> None:
+    # a thread first run on an OpenRouter model, then re-run on native Claude, must not keep the OpenRouter workflow
+    built: list[tuple[Topology, str]] = []
+
+    def builder(ws: StubSandboxWorkspace, topology: Topology, model: str) -> StubWorkflow:
+        built.append((topology, model))
+        return StubWorkflow(ws, topology=topology, model=model)
+
+    app, _, _ = build_studio(tmp_path, workflow_builder=builder)
+    client = page_client(app)
+    run = {"prompt": "Stage fix", "thread_id": "thr_switch", "topology": "dual"}
+    client.post("/api/runs/stream", json={**run, "model": "~deepseek/deepseek-v4-flash-latest"})
+    client.post("/api/runs/stream", json={**run, "model": "~deepseek/deepseek-v4-flash-latest"})
+    client.post("/api/runs/stream", json={**run, "model": "claude-sonnet-5-5"})
+    assert built == [("dual", "~deepseek/deepseek-v4-flash-latest"), ("dual", "claude-sonnet-5-5")]
+    assert app.state.studio.sessions["thr_switch"].workflow.model == "claude-sonnet-5-5"

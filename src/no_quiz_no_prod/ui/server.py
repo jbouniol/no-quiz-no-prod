@@ -1129,6 +1129,9 @@ def create_app(
                 )
                 manager.sessions[thread_id] = session
             else:
+                if (session.model, session.topology) != (chosen_model, req.topology):
+                    # the cached workflow is bound to the model and topology it was built with: rebuild it
+                    session.workflow = None
                 session.model = chosen_model
                 session.topology = req.topology
                 session.user_id = req.user_id
