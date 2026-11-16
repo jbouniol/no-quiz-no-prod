@@ -97,7 +97,7 @@
           >
             <span id="provider-brand-icon" class="provider-brand-icon" aria-hidden="true"></span>
             <span id="api-status-dot" class="api-status-pill__dot" aria-hidden="true"></span>
-            <span id="api-status-label" class="api-status-pill__label">.env</span>
+            <span id="api-status-label" class="api-status-pill__label">API keys</span>
           </button>
 
           <div
@@ -368,9 +368,12 @@
                   </button>
                 </div>
 
-                <span id="run-status-pill" class="pill" data-agent="system">
-                  <span class="pill__dot"></span>
-                  <span id="run-status-text">idle</span>
+                <span class="telemetry-bar__right">
+                  <button type="button" id="btn-detail-toggle" class="ghost-micro-btn" aria-pressed="false">View: Simple</button>
+                  <span id="run-status-pill" class="pill" data-agent="system">
+                    <span class="pill__dot"></span>
+                    <span id="run-status-text">Ready</span>
+                  </span>
                 </span>
               </div>
 
@@ -434,9 +437,9 @@
                   >
                     + New
                   </button>
-                  <label class="fault-inline-toggle" for="chk-fault-timeout" title="Inject transient write_timeout fault">
+                  <label class="fault-inline-toggle" for="chk-fault-timeout" title="Make the first file write time out once, to show the agent retrying safely">
                     <input type="checkbox" id="chk-fault-timeout" />
-                    <span>fault</span>
+                    <span>Simulate a failure</span>
                   </label>
                 </div>
                 <div class="composer__footer-right">
@@ -487,7 +490,7 @@
                 <div class="diff-banner__left">
                   <span id="pytest-banner-pill" class="pill" data-agent="system">
                     <span class="pill__dot"></span>
-                    <span id="pytest-banner-text">pytest idle</span>
+                    <span id="pytest-banner-text">Tests not run yet</span>
                   </span>
                   <button type="button" id="btn-toggle-pytest-log" class="ghost-micro-btn mono-text" hidden>
                     <span>log</span>

@@ -67,11 +67,24 @@ const AGENT_DISPLAY_NAMES = {
   system: "system",
 };
 
+// what a run's stop reason means, in the words of the person using the Studio
+const STOP_REASON_LABELS = {
+  completed: "Shipped to prod",
+  clarification_needed: "The agent has a question",
+  refused: "Refused: nothing changed",
+  quiz_failed: "Blocked: quiz failed twice",
+  human_rejected: "You rejected the release",
+  release_failed: "Push failed",
+  max_steps: "Stopped: step budget used up",
+  api_error: "Model API error",
+  harness_error: "Internal error",
+};
+
 const LOCK_DESCRIPTIONS = [
-  { stepCode: "01", key: "tests_passed", title: "Staging Pytest" },
-  { stepCode: "02", key: "sha256_matches", title: "Tree SHA-256" },
-  { stepCode: "03", key: "quiz_passed", title: "Server Quiz Token" },
-  { stepCode: "04", key: "human_approved", title: "Human Sign-Off" },
+  { stepCode: "01", key: "tests_passed", title: "Staging Pytest", plain: "The fix passes the tests", missing: "passing tests" },
+  { stepCode: "02", key: "sha256_matches", title: "Tree SHA-256", plain: "What was checked is what ships", missing: "a matching fingerprint" },
+  { stepCode: "03", key: "quiz_passed", title: "Server Quiz Token", plain: "You understood the change (quiz)", missing: "the quiz" },
+  { stepCode: "04", key: "human_approved", title: "Human Sign-Off", plain: "You approve the release", missing: "your approval" },
 ];
 
 const API_PROVIDER_META = {
@@ -486,7 +499,7 @@ function renderStepCardHtml(step, { forbiddenSet = null } = {}) {
             `<span class="step-card__tool">${escapeHtml(step.tool)}</span>` +
           `</div>` +
           `<div class="step-card__right tabular-nums">` +
-            `<span>${latencyMs}ms</span>` +
+            `<span class="step-card__ms">${latencyMs}ms</span>` +
             glyphHtml +
           `</div>` +
         `</div>` +
@@ -552,7 +565,18 @@ function renderApiPopoverState() {
     Number(Boolean(store.providers.openrouter)) +
     Number(Boolean(store.providers.anthropic)) +
     Number(Boolean(store.providers.notion));
-  label.textContent = anyLlm ? `.env · ${activeCount}/3` : ".env";
+  label.textContent = `API keys · ${activeCount}/3`;
+  const missingKeys = [
+    ["openrouter", "OpenRouter"],
+    ["anthropic", "Anthropic"],
+    ["notion", "Notion"],
+  ]
+    .filter(([key]) => !store.providers[key])
+    .map(([, name]) => name);
+  $("btn-api-popover").setAttribute(
+    "title",
+    missingKeys.length ? `Missing: ${missingKeys.join(", ")}. Click to add a key.` : "All API keys are set."
+  );
 
   $("api-provider-badges").innerHTML = ["openrouter", "anthropic", "notion"]
     .map((key) => {
@@ -692,6 +716,41 @@ function syncHeroTopologyUi(topoVal) {
   $("btn-topo-single").classList.toggle("is-active", val === "single");
 }
 
+// Simple / Expert detail level: Simple hides tool plumbing (servers, ms, idempotency keys, hashes, tokens, skills).
+const DETAIL_STORAGE_KEY = "nqnp.detail";
+
+function applyDetailMode(mode) {
+  const next = mode === "expert" ? "expert" : "simple";
+  document.documentElement.dataset.detail = next;
+  const btn = document.getElementById("btn-detail-toggle");
+  if (btn) {
+    btn.setAttribute("aria-pressed", String(next === "expert"));
+    btn.textContent = next === "expert" ? "View: Expert" : "View: Simple";
+    btn.title = next === "expert" ? "Showing every technical detail. Click for the simple view." : "Showing the essentials. Click to see every technical detail.";
+  }
+  try {
+    localStorage.setItem(DETAIL_STORAGE_KEY, next);
+  } catch (_err) {
+    /* storage unavailable: the choice just is not remembered */
+  }
+}
+
+function initDetailMode() {
+  let saved = "simple";
+  try {
+    saved = localStorage.getItem(DETAIL_STORAGE_KEY) || "simple";
+  } catch (_err) {
+    /* ignore */
+  }
+  applyDetailMode(saved);
+  const btn = document.getElementById("btn-detail-toggle");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      applyDetailMode(document.documentElement.dataset.detail === "expert" ? "simple" : "expert");
+    });
+  }
+}
+
 function renderHeaderControls() {
   if (store.models) {
     const modelSelect = $("model-select");
@@ -752,6 +811,7 @@ function renderTelemetryBar() {
 
   const threadChip = $("thread-chip");
   threadChip.textContent = store.threadId ? store.threadId : "new";
+  threadChip.title = store.threadId ? `Copy thread_id: ${store.threadId}` : "Copy thread_id";
 
   const statusPill = $("run-status-pill");
   const statusText = $("run-status-text");
@@ -761,22 +821,28 @@ function renderTelemetryBar() {
   statusPill.removeAttribute("data-status");
   statusPill.removeAttribute("data-agent");
 
+  // plain words in the pill, the raw state name in its tooltip
+  let rawStatus = "idle";
   if (store.isStreaming) {
     statusPill.setAttribute("data-agent", "coder");
-    statusText.textContent = "streaming";
+    statusText.textContent = "Agent working…";
+    rawStatus = "streaming";
   } else if (store.serverBusy) {
     statusPill.setAttribute("data-agent", "coder");
-    statusText.textContent = `busy · ${store.serverBusy}`;
+    statusText.textContent = `Busy: ${store.serverBusy}`;
+    rawStatus = `busy · ${store.serverBusy}`;
   } else if (store.interrupt && store.pendingRelease) {
     statusPill.setAttribute("data-status", "Remediation v2");
-    statusText.textContent = "push_failed · awaiting_decision";
+    statusText.textContent = "Push failed: your decision";
+    rawStatus = "push_failed · awaiting_decision";
   } else if (store.interrupt) {
     statusPill.setAttribute(
       "data-status",
       store.interrupt.kind === "quiz" ? "Quiz Pending" : "Staging"
     );
     statusText.textContent =
-      store.interrupt.kind === "quiz" ? "awaiting_quiz" : "awaiting_signoff";
+      store.interrupt.kind === "quiz" ? "Answer the quiz" : "Approve or reject";
+    rawStatus = store.interrupt.kind === "quiz" ? "awaiting_quiz" : "awaiting_signoff";
   } else if (store.stopReason) {
     const statusMap = {
       completed: "Deployed to Prod",
@@ -790,11 +856,13 @@ function renderTelemetryBar() {
       harness_error: "Blocked",
     };
     statusPill.setAttribute("data-status", statusMap[store.stopReason] || "Staging");
-    statusText.textContent = store.stopReason;
+    statusText.textContent = STOP_REASON_LABELS[store.stopReason] || store.stopReason;
+    rawStatus = store.stopReason;
   } else {
     statusPill.setAttribute("data-agent", "system");
-    statusText.textContent = "idle";
+    statusText.textContent = "Ready";
   }
+  statusPill.title = `${statusText.textContent} (state: ${rawStatus})`;
 
   const b = store.budget || {
     steps: 0,
@@ -900,18 +968,18 @@ function renderDiffPane() {
 
   if (!pytest) {
     pytestPill.setAttribute("data-agent", "system");
-    pytestText.textContent = "pytest: pending";
+    pytestText.textContent = "Tests not run yet";
     pytestToggle.hidden = true;
     pytestDrawer.hidden = true;
   } else if (pytest.passed) {
     pytestPill.setAttribute("data-status", "Deployed to Prod");
-    pytestText.textContent = `pytest: ${pytest.summary || "passed"}`;
+    pytestText.textContent = `Tests passed · ${pytest.summary || "ok"}`;
     pytestToggle.hidden = !pytest.output_tail;
     pytestDrawer.textContent = pytest.output_tail || pytest.summary || "";
     pytestDrawer.hidden = !store.pytestDrawerOpen || !pytest.output_tail;
   } else {
     pytestPill.setAttribute("data-status", "Blocked");
-    pytestText.textContent = `pytest: ${pytest.summary || "failed"}`;
+    pytestText.textContent = `Tests failed · ${pytest.summary || "see log"}`;
     pytestToggle.hidden = !pytest.output_tail;
     pytestDrawer.textContent = pytest.output_tail || pytest.summary || "";
     pytestDrawer.hidden = !store.pytestDrawerOpen;
@@ -982,7 +1050,7 @@ function renderNotionPane() {
   const safeNotionUrl = sanitizeHref(ship.notion_url);
   const externalPill = safeNotionUrl
     ? `<a class="pill" data-mcp="notion-quiz-mcp" href="${escapeHtml(safeNotionUrl)}" target="_blank" rel="noopener noreferrer"><span>Open in Notion</span>${svgIcon("external", 11)}</a>`
-    : `<span class="pill" data-mcp="notion-quiz-mcp">local_sandbox_db</span>`;
+    : `<span class="pill expert-only" data-mcp="notion-quiz-mcp">local_sandbox_db</span>`;
 
   const changedChips = (ship.changed_files || []).length
     ? ship.changed_files
@@ -1100,12 +1168,12 @@ function renderNotionPane() {
       `<div class="notion-props__val tabular-nums">` +
         `<span>${Number(ship.quiz_attempts || 0)} / 2</span>` +
         (ship.diff_sha256
-          ? `<button type="button" class="mono-chip js-copy-sha" data-sha="${escapeHtml(ship.diff_sha256)}">sha:${escapeHtml(shortSha(ship.diff_sha256, 10))}</button>`
+          ? `<button type="button" class="mono-chip js-copy-sha expert-only" data-sha="${escapeHtml(ship.diff_sha256)}">sha:${escapeHtml(shortSha(ship.diff_sha256, 10))}</button>`
           : "") +
       `</div>` +
       commitRowHtml +
-      `<div class="notion-props__key">sync_source</div>` +
-      `<div class="notion-props__val">${urlRowHtml}</div>` +
+      `<div class="notion-props__key expert-only">sync_source</div>` +
+      `<div class="notion-props__val expert-only">${urlRowHtml}</div>` +
     `</div>` +
     activeRulePopover +
     remediationHtml +
@@ -1245,12 +1313,14 @@ function renderDeployPanel() {
     store.shipLog?.status === "Deployed to Prod" || Boolean(store.lastDeployReceipt);
   const treesIdentical = Boolean(diff?.trees_identical) && !isDeployed;
 
+  // an empty diff trivially matches its own fingerprint: do not show that lock as earned before the tests
+  const isLockSatisfied = (item) =>
+    item.key === "sha256_matches" && treesIdentical && !locks?.tests_passed
+      ? false
+      : Boolean(locks?.[item.key]);
+
   const lockRows = LOCK_DESCRIPTIONS.map((item) => {
-    const rawSatisfied = Boolean(locks?.[item.key]);
-    const satisfied =
-      item.key === "sha256_matches" && treesIdentical && !locks?.tests_passed
-        ? false
-        : rawSatisfied;
+    const satisfied = isLockSatisfied(item);
     const isBlocked = Boolean(locks?.blocked) && !satisfied;
     const cls = satisfied
       ? "lock-item lock-item--ok"
@@ -1270,10 +1340,21 @@ function renderDeployPanel() {
             `<span class="lock-item__code">${escapeHtml(item.stepCode)}</span>` +
             `<span>${escapeHtml(item.title)}</span>` +
           `</div>` +
+          `<div class="lock-item__plain">${escapeHtml(item.plain)}</div>` +
         `</div>` +
       `</li>`
     );
   }).join("");
+
+  const missingLabels = LOCK_DESCRIPTIONS.filter((item) => !isLockSatisfied(item)).map((item) => item.missing);
+  const doneCount = LOCK_DESCRIPTIONS.length - missingLabels.length;
+  const missingText = treesIdentical
+    ? "Nothing to ship yet: ask the agent for a change on the left."
+    : locks?.blocked
+      ? "This change is blocked and cannot ship. Start a new thread to try again."
+      : missingLabels.length
+        ? `Still needed: ${missingLabels.join(", ")}.`
+        : "All checks done.";
 
   // A failed push revokes the sign-off server-side: the gate is back to "ready for approval" for the same diff.
   const pending = store.pendingRelease;
@@ -1333,14 +1414,16 @@ function renderDeployPanel() {
           `${svgIcon("lock", 12)}` +
           `<span>Deploy to prod/</span>` +
         `</button>` +
-      `</div>`;
+      `</div>` +
+      `<div class="deploy-missing" role="status">${escapeHtml(missingText)}</div>`;
   }
 
   panel.innerHTML =
     `<div class="gate-card__header">` +
       `<span class="eyebrow">PRODUCTION GATE</span>` +
+      (isDeployed ? "" : `<span class="gate-progress tabular-nums">${doneCount} of ${LOCK_DESCRIPTIONS.length} checks</span>`) +
       (locks?.diff_sha256 && !treesIdentical
-        ? `<span class="mono-chip mono-chip--compact">${escapeHtml(shortSha(locks.diff_sha256, 8))}</span>`
+        ? `<span class="mono-chip mono-chip--compact expert-only">${escapeHtml(shortSha(locks.diff_sha256, 8))}</span>`
         : "") +
     `</div>` +
     `<ul class="lock-list">${lockRows}</ul>` +
@@ -1490,10 +1573,107 @@ function appendStepToFeed(step) {
   const wrapper = document.createElement("div");
   wrapper.innerHTML = renderStepCardHtml(step);
   const el = wrapper.firstElementChild;
-  if (el) {
-    feed.appendChild(el);
-    feed.scrollTop = feed.scrollHeight;
+  if (!el) {
+    return;
   }
+  const agent = step.agent || "system";
+  let group = feed.lastElementChild;
+  if (!group || !group.classList.contains("step-group") || group.dataset.agent !== agent) {
+    // a new agent takes over: fold the earlier groups the person did not open themselves
+    feed.querySelectorAll(".step-group.is-open:not([data-user-open])").forEach((g) => setStepGroupOpen(g, false));
+    group = document.createElement("section");
+    group.className = "step-group";
+    group.dataset.agent = agent;
+    group.innerHTML =
+      `<button type="button" class="step-group__summary" aria-expanded="true"></button>` +
+      `<div class="step-group__body"></div>`;
+    feed.appendChild(group);
+    setStepGroupOpen(group, true);
+  }
+  group.querySelector(".step-group__body").appendChild(el);
+  group.dataset.tools = [...(group.dataset.tools ? group.dataset.tools.split(",") : []), step.tool].join(",");
+  renderStepGroupSummary(group);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+// what each tool call did, in plain words, for the Simple view's one-line summary of an agent's steps
+const TOOL_PLAIN_LABELS = {
+  read_notion_rule: "read the rules",
+  search_notion_rules: "searched the rules",
+  read_code_file: "read code",
+  list_workspace_files: "listed files",
+  write_staging_file: "edited code",
+  run_staging_tests: "ran the tests",
+  get_staging_diff: "checked the diff",
+  upsert_ship_log_doc: "wrote the Ship Log",
+  create_comprehension_quiz: "wrote the quiz",
+  deploy_to_production: "deployed",
+  read_audit_credentials: "read credentials",
+};
+
+function setStepGroupOpen(group, open) {
+  group.classList.toggle("is-open", open);
+  group.querySelector(".step-group__summary")?.setAttribute("aria-expanded", String(open));
+}
+
+function renderStepGroupSummary(group) {
+  const counts = new Map();
+  for (const tool of (group.dataset.tools || "").split(",").filter(Boolean)) {
+    const label = TOOL_PLAIN_LABELS[tool] || tool;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  const actions = [...counts].map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)).join(", ");
+  const errors = group.querySelectorAll(".step-card--error").length;
+  const total = group.querySelectorAll(".step-card").length;
+  const agent = group.dataset.agent;
+  const status = errors
+    ? `<span class="step-glyph step-glyph--err" title="${errors} failed">${svgIcon("x", 12)}</span>`
+    : `<span class="step-glyph step-glyph--ok" title="All succeeded">${svgIcon("check", 12)}</span>`;
+  group.querySelector(".step-group__summary").innerHTML =
+    `<span class="step-group__chevron" aria-hidden="true">›</span>` +
+    `<span class="pill" data-agent="${escapeHtml(agent)}"><span class="pill__dot"></span><span>${escapeHtml(AGENT_DISPLAY_NAMES[agent] || agent)}</span></span>` +
+    `<span class="step-group__actions">${escapeHtml(actions)}</span>` +
+    `<span class="step-group__count tabular-nums">${total} step${total > 1 ? "s" : ""}</span>` +
+    status;
+}
+
+function wireStepGroups() {
+  $("stream-feed").addEventListener("click", (ev) => {
+    const summary = ev.target.closest(".step-group__summary");
+    if (!summary) {
+      return;
+    }
+    const group = summary.closest(".step-group");
+    const open = !group.classList.contains("is-open");
+    setStepGroupOpen(group, open);
+    // remember a group the person opened, so the next agent's turn does not fold it away
+    if (open) {
+      group.dataset.userOpen = "true";
+    } else {
+      delete group.dataset.userOpen;
+    }
+  });
+}
+
+// ---- 7. the release landed: say so where the person is looking
+function appendShipSuccessToFeed(receipt) {
+  const feed = $("stream-feed");
+  const commitUrl = sanitizeHref(receipt.commit_url || "");
+  const commitHtml = receipt.commit_sha
+    ? `<span class="mono-chip mono-chip--compact">${escapeHtml(shortSha(receipt.commit_sha, 7))}</span>` +
+      (commitUrl
+        ? `<a class="md-link" href="${escapeHtml(commitUrl)}" target="_blank" rel="noopener noreferrer">View the commit ↗</a>`
+        : "")
+    : "";
+  const card = document.createElement("div");
+  card.className = "ship-success-card";
+  card.setAttribute("role", "status");
+  card.innerHTML =
+    `<div class="ship-success-card__title">${svgIcon("check", 14)}<span>Shipped to prod</span></div>` +
+    `<div class="ship-success-card__body">All 4 checks held: tests, matching fingerprint, your quiz answer and your approval.</div>` +
+    (commitHtml ? `<div class="ship-success-card__commit">${commitHtml}</div>` : "");
+  feed.appendChild(card);
+  feed.scrollTop = feed.scrollHeight;
 }
 
 function appendAgentTurnToFeed({ text, stopReason, interrupt, isError = false }) {
@@ -1512,15 +1692,15 @@ function appendAgentTurnToFeed({ text, stopReason, interrupt, isError = false })
 
   let badgeHtml = `<span class="pill" data-agent="examiner"><span class="pill__dot"></span><span>workflow</span></span>`;
   if (isClarify) {
-    badgeHtml = `<span class="pill" data-status="Staging"><span class="pill__dot"></span><span>clarification_needed · zero mutation</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Staging"><span class="pill__dot"></span><span>Question from the agent · nothing changed</span></span>`;
   } else if (isError) {
-    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>${escapeHtml(stopReason || "runtime_error")}</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Blocked"><span class="pill__dot"></span><span>${escapeHtml(STOP_REASON_LABELS[stopReason] || stopReason || "Runtime error")}</span></span>`;
   } else if (interrupt?.kind === "quiz") {
-    badgeHtml = `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>hitl_pause · quiz_gate</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>Paused · your quiz</span></span>`;
   } else if (interrupt?.kind === "release_retry") {
-    badgeHtml = `<span class="pill" data-status="Remediation v2"><span class="pill__dot"></span><span>hitl_pause · push_retry</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Remediation v2"><span class="pill__dot"></span><span>Paused · retry or reject the push</span></span>`;
   } else if (interrupt?.kind === "deploy_approval") {
-    badgeHtml = `<span class="pill" data-status="Deployed to Prod"><span class="pill__dot"></span><span>hitl_pause · signoff_ready</span></span>`;
+    badgeHtml = `<span class="pill" data-status="Deployed to Prod"><span class="pill__dot"></span><span>Paused · approve or reject</span></span>`;
   }
 
   const card = document.createElement("div");
@@ -1711,7 +1891,8 @@ async function runAgentStream(promptText) {
     await fetchInitialState();
   } finally {
     store.isStreaming = false;
-    renderTelemetryBar();
+    // the quiz options and deploy buttons were rendered disabled while the stream was open: re-render them enabled
+    renderAllStudio();
   }
 }
 
@@ -1875,6 +2056,7 @@ async function submitDeployDecision(action) {
         commit_url: data.ship_log?.release_commit_url || null,
       };
       triggerAuraWave("verified");
+      appendShipSuccessToFeed(store.lastDeployReceipt);
       showToast("Promoted to prod/ (`prod == staging` SHA-256 verified).");
     } else {
       triggerAuraWave("shield");
@@ -3120,6 +3302,8 @@ function bindEvents() {
 
 // ---- Bootstrap ------------------------------------------------------------
 function initStudio() {
+  initDetailMode();
+  wireStepGroups();
   renderScenarioChips();
   renderProviderBrandIcon();
   bindEvents();
