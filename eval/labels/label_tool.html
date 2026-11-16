@@ -102,7 +102,11 @@
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
   };
   $("labeler").value = store.get("nq-labeler") || "";
-  $("labeler").addEventListener("input", () => { store.set("nq-labeler", $("labeler").value.trim()); });
+  $("labeler").addEventListener("input", () => {
+    store.set("nq-labeler", $("labeler").value.trim());
+    // a name typed after the labelling must still reach every record already judged
+    if (data) data.records.filter((r) => r.rationale.trim() || verdictOf(r) !== null).forEach(touch);
+  });
 
   const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
   const today = () => new Date().toISOString().slice(0, 10);
@@ -258,13 +262,15 @@
 
   let pendingCrit = null;
   document.addEventListener("keydown", (e) => {
-    if (!data || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+    if (!data) return;
+    // save first: Cmd/Ctrl+S right after typing a rationale must not open the browser's "Save page as"
+    if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); $("save").click(); return; }
+    if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
     const names = Object.keys(data.meta.rubric);
     if (e.key === "ArrowRight") go(index + 1);
     else if (e.key === "ArrowLeft") go(index - 1);
     else if (/^[1-9]$/.test(e.key) && Number(e.key) <= names.length) pendingCrit = names[Number(e.key) - 1];
     else if ((e.key === "y" || e.key === "n") && pendingCrit) { setCrit(pendingCrit, e.key === "y"); pendingCrit = null; }
-    else if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); $("save").click(); }
   });
 })();
 </script>
