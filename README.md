@@ -61,7 +61,7 @@ flowchart TD
 
 ## Getting Started (`uv`)
 
-**Prerequisites:** Python `>= 3.12`, [`uv`](https://docs.astral.sh/uv/), **`git >= 2.31`** (required for every deploy, including the default local bare remote, and validated at run start), and an OS test sandbox (`sandbox-exec` is built into macOS; on Linux install `bubblewrap` / `bwrap`). Node.js `>= 22.7` is optional and used only to run the frontend unit tests (`node --test`). Running the offline test suite (`uv run pytest -q`) needs no API key.
+**Prerequisites:** [`uv`](https://docs.astral.sh/uv/) (it downloads its own CPython `3.12` on the first `uv sync`: `pyproject.toml` sets `python-preference = "only-managed"`, so a Homebrew or system Python is never picked up), **`git >= 2.31`** (required for every deploy, including the default local bare remote, and validated at run start), and an OS test sandbox (`sandbox-exec` is built into macOS; on Linux install `bubblewrap` / `bwrap`). Node.js `>= 22.7` is optional and used only to run the frontend unit tests (`node --test`). Running the offline test suite (`uv run pytest -q`) needs no API key.
 
 ### 1. Install and configure
 
@@ -135,6 +135,14 @@ Open `http://127.0.0.1:8000`:
 ### 4. Run the state-based evaluation harness
 
 Two scenario sets live under [`eval/`](eval/README.md): the **development set** [`eval/scenarios.jsonl`](eval/scenarios.jsonl) (**38 scenarios**: 19 `normal`, 6 `ambiguous`, 6 `impossible`, 7 `adversarial` — used during prompt/harness iteration, so rates on it are optimistic) and the **held-out set** [`eval/scenarios_heldout.jsonl`](eval/scenarios_heldout.jsonl) (**14 scenarios**: 5 `normal`, 3 `ambiguous`, 3 `impossible`, 3 `adversarial` — never tune prompts or budgets on it). By default, `run_eval.py` runs `k = 3` repeats per scenario (`pass^3` + scenario-level 95% Wilson CI) and writes to a fresh `eval/runs/<UTC-timestamp>_<slug>/` directory (refusing to overwrite existing results without `--overwrite`).
+
+**Course grading command.** The command from the project brief works as is:
+
+```bash
+uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/
+```
+
+It resets the backend before every run and writes `eval/results.jsonl` (outcome and why, final state, tools called in order, steps, tokens in/out, latency, cost, stop reason), plus `eval/summary.md` and `eval/manifest.json`. With the default `--repeats 3` it makes **114 runs** (38 × 3); add `--repeats 1` for a single 38-run pass. These top-level outputs are git-ignored so a fresh clone never already "holds eval results" (which `--out` refuses without `--overwrite`); archived runs live under `eval/campaigns/`.
 
 ```bash
 # Offline contract check (no API call, tagged dry-run -> new directory under eval/runs/)
@@ -332,7 +340,7 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 ## Development, CI & Branch Protection
 
 ```bash
-# Python test suite (343 tests: graph+memory 72, backend+MCP 58, sandbox 45, git release 43, eval 34, UI 31, CLI 27, LLM 25, e2e 4, hermetic env 4)
+# Python test suite (347 tests: graph+memory 74, backend+MCP 58, sandbox 47, git release 43, eval 34, UI 31, CLI 27, LLM 25, e2e 4, hermetic env 4)
 uv run pytest -q
 
 # Frontend JavaScript unit tests (22 tests for diff.js and markdown.js; Node >= 22.7)

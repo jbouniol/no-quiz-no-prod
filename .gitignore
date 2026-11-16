@@ -17,6 +17,14 @@ dist/
 .runtime_workspace/
 .langgraph_api/
 eval/runs/
+# Outputs of the course grading command (`run_eval.py --out eval/`): archive a run under eval/campaigns/ instead
+/eval/results*.jsonl
+/eval/summary.md
+/eval/comparison.md
+/eval/manifest.json
+/eval/judge_*.json
+/eval/judge_*.jsonl
+/eval/swap_test.json
 
 # OS
 .DS_Store
