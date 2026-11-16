@@ -206,7 +206,7 @@ Scrollable vertical timeline (`padding: var(--space-3); gap: var(--space-2-5); o
 - `<form id="prompt-form">` pinned to bottom (`background: var(--bg-surface); border-top: 1px solid var(--border-hairline); padding: var(--space-3)`).
 - `<textarea id="prompt-input" rows="2" placeholder="Ask Coder to implement a fix, or answer a clarification…"></textarea>`
 - Footer row inside composer:
-  - Left: `+ New Thread` micro-button (clears `thread_id` to start fresh conversation without resetting backend seed) + keyboard hint `⌘↵ to send`.
+  - Left: `+ New Thread` micro-button (resets the workspace to the seed through `POST /api/reset`, Layer 4 skill memory kept, then clears `thread_id`: a new task never inherits the previous task's staged diff) + keyboard hint `⌘↵ to send`.
   - Right: Primary button `Run Agent →` (`background: var(--ink-primary)` or `var(--accent-primary)`, switches to `Running…` with abort/disabled guard during active SSE).
 
 ---

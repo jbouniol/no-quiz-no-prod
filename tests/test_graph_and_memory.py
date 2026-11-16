@@ -456,10 +456,7 @@ def coder_fix(
 
 
 def doc_and_quiz(attempt: int, correct: str, *, targeted: tuple[str, ...] = ()) -> list[ChatTurnResponse]:
-    """One documentation round (the Examiner's, or the documentation phase of the single agent).
-
-    No closing "STATUS: DONE" turn: once the doc and the quiz of the current attempt exist, the harness hands off.
-    """
+    """One documentation round (the Examiner's, or the documentation phase of the single agent)."""
     doc = f"## Technical Feature Documentation\nDecimal totals (v{attempt}).\n\n## Pedagogical Lesson\nHalf-up ties."
     quiz = {
         "skill_tag": "decimal_rounding",
@@ -482,6 +479,7 @@ def doc_and_quiz(attempt: int, correct: str, *, targeted: tuple[str, ...] = ()) 
         applied_rules=["RULE-001"],
         targeted_weaknesses=list(targeted),
     )
+    # No closing "STATUS: DONE" turn: once the doc and the quiz of the attempt exist, the graph moves to the quiz gate.
     return [turn(upsert), turn(call("create_comprehension_quiz", **quiz))]
 
 
@@ -587,6 +585,36 @@ def test_status_protocol_with_conservative_fallback(text: str, wrote: bool, stat
 
 
 # ---- the four HITL paths -------------------------------------------------------------------------------------------
+def test_the_graph_moves_to_the_quiz_once_the_doc_and_quiz_exist(tmp_path: Path, backend: FakeBackend) -> None:
+    """Studio regression (thr_e3420d90, thr_15b4027e): the Examiner's quiz call is stored with the answer key
+    redacted, so the model read its own quiz as incomplete and created it again until the step budget ran out
+    (max_steps, the quiz never shown). The graph now decides: once the doc and quiz of the attempt exist, it hands
+    off to the quiz gate without asking the model whether it is done."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    looping = [upsert, *[quiz] * 6]  # what the model did live: the same quiz, again and again
+    llm = ScriptedLLM(coder=coder_fix(), examiner=looping)
+    workflow = make_workflow(tmp_path, backend, llm)
+    paused = workflow.start_run(TASK, thread_id="t-loop", max_steps=16)
+    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert tools_called(backend).count("create_comprehension_quiz") == 1
+    assert llm.remaining()["examiner"] == 5  # the model was not asked again after its quiz
+    assert paused.budget.steps == 7  # 5 coder calls + doc + quiz, far from the budget of 16
+    grade, gated = workflow.submit_quiz("t-loop", QuizAnswer(selected_option="A"))
+    assert grade.passed and gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
+
+    # the route itself, without a model: a failed quiz call, or a quiz of another diff, goes back to the agent
+    route = NoQuizWorkflow._route_tools
+    ready = {"ship_log": {"diff_sha256": "d1", "doc_version": "v1"}, "quiz": {"diff_sha256": "d1", "attempt": 1}}
+    base = {"phase": "examiner", "attempt": 1, **ready}
+    assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "handoff"
+    assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": False}]}) == "agent"
+    assert route({**base, "trace": [{"tool": "read_code_file", "ok": True}]}) == "agent"
+    assert route({**base, "phase": "coder", "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
+    stale = {**base, "ship_log": {"diff_sha256": "d0", "doc_version": "v1"}}
+    assert route({**stale, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
+    assert route({**base, "budget_exhausted": True, "trace": []}) == "give_up"
+
+
 def test_happy_path_pass_first_try_completes(tmp_path: Path, backend: FakeBackend) -> None:
     llm = ScriptedLLM(coder=coder_fix(), examiner=doc_and_quiz(1, "A"))
     workflow = make_workflow(tmp_path, backend, llm)
@@ -958,32 +986,6 @@ def test_an_examiner_question_is_a_dead_end_so_its_deliverables_decide(tmp_path:
         if c.role == "examiner" and str(c.messages[-1]["content"]).startswith("[harness]")
     ]
     assert len(nudges) == 1 and "Before you finish" in nudges[0] and "create_comprehension_quiz" in nudges[0]
-
-
-def test_complete_deliverables_hand_off_without_asking_the_examiner_again(tmp_path: Path, backend: FakeBackend) -> None:
-    """Live DeepSeek V4 Flash regression (n01): the Examiner saw its own quiz call sealed, took it for a failure and
-    re-created the quiz until max_steps, at last sending the sealed marker itself. The harness now hands off as soon
-    as the doc and the quiz of the current attempt exist: the model is never asked whether it is done."""
-    upsert, quiz = doc_and_quiz(1, "A")
-    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])  # the trailing duplicate must stay unplayed
-    paused = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-handoff")
-    assert paused.interrupt is not None and paused.interrupt.kind == "quiz"
-    assert llm.remaining() == {"coder": 0, "examiner": 1}
-    assert tools_called(backend).count("create_comprehension_quiz") == 1
-    assert paused.final_answer.startswith("Totals use Decimal ROUND_HALF_UP")  # the Coder's summary is kept
-
-
-def test_words_beside_the_last_deliverable_call_are_not_read_as_a_status(tmp_path: Path, backend: FakeBackend) -> None:
-    """A question written next to the call that completes the deliverables is not a clarification stop."""
-    upsert, quiz = doc_and_quiz(1, "A")
-    aside = turn(
-        *[(c.name, c.args) for c in upsert.tool_calls],
-        text="STATUS: CLARIFICATION_NEEDED\nShould the doc also cite RULE-003?",
-    )
-    llm = ScriptedLLM(single=[*coder_fix("")[:-1], quiz, aside])
-    paused = make_workflow(tmp_path, backend, llm, topology="single").start_run(TASK, thread_id="t-aside")
-    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
-    assert llm.remaining() == {"single": 0}
 
 
 def test_rejected_arguments_tell_the_agent_to_fix_and_call_again() -> None:
@@ -1697,3 +1699,29 @@ def test_resume_entrypoints_pass_remaining_steps_and_forget_is_bounded(
     tight_wf.request_forget(DEFAULT_USER_ID, thread_id="t-forget-bound")
     tight_wf.confirm_forget("t-forget-bound", approve=False)
     assert forget_limits == [FORGET_RECURSION_LIMIT, FORGET_RECURSION_LIMIT]
+
+
+def test_complete_deliverables_hand_off_without_asking_the_examiner_again(tmp_path: Path, backend: FakeBackend) -> None:
+    """Live DeepSeek V4 Flash regression (n01): the Examiner saw its own quiz call sealed, took it for a failure and
+    re-created the quiz until max_steps, at last sending the sealed marker itself. The harness now hands off as soon
+    as the doc and the quiz of the current attempt exist: the model is never asked whether it is done."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])  # the trailing duplicate must stay unplayed
+    paused = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-handoff")
+    assert paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"coder": 0, "examiner": 1}
+    assert tools_called(backend).count("create_comprehension_quiz") == 1
+    assert paused.final_answer.startswith("Totals use Decimal ROUND_HALF_UP")  # the Coder's summary is kept
+
+
+def test_words_beside_the_last_deliverable_call_are_not_read_as_a_status(tmp_path: Path, backend: FakeBackend) -> None:
+    """A question written next to the call that completes the deliverables is not a clarification stop."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    aside = turn(
+        *[(c.name, c.args) for c in upsert.tool_calls],
+        text="STATUS: CLARIFICATION_NEEDED\nShould the doc also cite RULE-003?",
+    )
+    llm = ScriptedLLM(single=[*coder_fix("")[:-1], quiz, aside])
+    paused = make_workflow(tmp_path, backend, llm, topology="single").start_run(TASK, thread_id="t-aside")
+    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"single": 0}
