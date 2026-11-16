@@ -1891,7 +1891,8 @@ async function runAgentStream(promptText) {
     await fetchInitialState();
   } finally {
     store.isStreaming = false;
-    // the quiz options and deploy buttons were rendered disabled while the stream was open: re-render them enabled
+    // Redraw everything, not only the telemetry bar: the quiz and approval panels were drawn while the stream was
+    // still open, so their buttons were disabled (isWorkspaceBusy) and would stay so until some other render.
     renderAllStudio();
   }
 }
@@ -2071,9 +2072,13 @@ async function submitDeployDecision(action) {
   }
 }
 
-async function handleResetSeed(resetSkillMemory = false) {
+async function handleResetSeed(resetSkillMemory = false, { newThread = false } = {}) {
   if (isWorkspaceBusy()) {
-    showToast("A run is in progress: Reset is available once it is over.");
+    showToast(
+      newThread
+        ? "A run is in progress: a new thread is available once it is over."
+        : "A run is in progress: Reset is available once it is over."
+    );
     return;
   }
   try {
@@ -2087,8 +2092,11 @@ async function handleResetSeed(resetSkillMemory = false) {
       throw new Error(apiErrorMessage(data, resp.status));
     }
     store.threadId = null;
+    store.interrupt = null;
+    store.stopReason = null;
+    store.quiz = null;
     store.pendingRelease = null;
-    store.workbenchForcedOpen = false;
+    store.workbenchForcedOpen = newThread;
     store.heroPeek = false;
     store.selectedQuizOption = null;
     store.lastQuizGrade = null;
@@ -2116,7 +2124,9 @@ async function handleResetSeed(resetSkillMemory = false) {
     setCenterTab("diff");
     renderAllStudio();
     showToast(
-      `Seed reset to fintech baseline (sha:${shortSha(data.prod_tree_sha256, 10)})`
+      newThread
+        ? "New thread: workspace reset to the fintech seed (skill memory kept)."
+        : `Seed reset to fintech baseline (sha:${shortSha(data.prod_tree_sha256, 10)})`
     );
   } catch (err) {
     showToast(`Reset failed: ${err.message}`);
@@ -2988,19 +2998,10 @@ function bindEvents() {
   wireStepCardContainer($("stream-feed"));
   wireStepCardContainer($("drawer-panel-trace"));
 
+  // A new thread starts from the seed: staging/ and prod/ shared by every thread would otherwise carry the
+  // previous task's diff into this one (its Ship Log and quiz would cover both changes). Skill memory is kept.
   $("btn-new-thread").addEventListener("click", () => {
-    store.threadId = null;
-    store.interrupt = null;
-    store.stopReason = null;
-    store.quiz = null;
-    store.selectedQuizOption = null;
-    store.lastQuizGrade = null;
-    store.pendingNextQuiz = null;
-    store.lastDeployReceipt = null;
-    store.pendingRelease = null;
-    store.workbenchForcedOpen = true;
-    renderAllStudio();
-    showToast("Started fresh conversation thread (workspace files preserved).");
+    handleResetSeed(false, { newThread: true });
   });
 
   $("prompt-form").addEventListener("submit", (ev) => {
