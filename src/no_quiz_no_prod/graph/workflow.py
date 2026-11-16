@@ -653,9 +653,7 @@ class NoQuizWorkflow:
             self._route_agent,
             {"tools": "tools", "give_up": "give_up", "handoff": "handoff", "finish": "finish"},
         )
-        graph.add_conditional_edges(
-            "tools", lambda state: "give_up" if state.get("budget_exhausted") else "agent", ["give_up", "agent"]
-        )
+        graph.add_conditional_edges("tools", self._route_tools, ["give_up", "agent", "handoff"])
         graph.add_edge("quiz_gate", QUIZ_OUTCOME_NODE)
         graph.add_edge("give_up", END)
         graph.add_edge("finish", END)
@@ -754,6 +752,27 @@ class NoQuizWorkflow:
             return "give_up" if budget.steps >= budget.max_steps else "tools"
         return "handoff"
 
+    def _route_tools(self, state: WorkflowState) -> str:
+        """After a tool node: give up on an exhausted budget, hand off once the documentation phase is complete.
+
+        The doc and the quiz bound to the current diff and attempt are the Examiner's whole job (and the single agent's
+        last one), so the harness goes straight to the handoff instead of asking the model whether it is done. A live
+        DeepSeek Examiner saw its own quiz call redacted (the answer key is sealed out of the transcript), read it as a
+        failed call and re-created the quiz until the budget ran out, at last sending the redaction marker itself.
+        """
+        if state.get("budget_exhausted"):
+            return "give_up"
+        if state["phase"] != "coder" and state.get("quiz"):
+            missing = missing_deliverables(
+                ship_log=state.get("ship_log"),
+                quiz=state.get("quiz"),
+                diff_sha256=self.workspace.get_diff_report().diff_sha256,
+                attempt=state["attempt"],
+            )
+            if not missing:
+                return "handoff"
+        return "agent"
+
     def _node_tools(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         thread_id = _thread_id(config)
         spec = _active_spec(state)
@@ -792,6 +811,7 @@ class NoQuizWorkflow:
             **{key: view[key] for key in HARVESTED_KEYS if key in view},
             "messages": {**state["messages"], spec.role: history},
             "pending_calls": [],
+            "last_text": "",  # words beside a tool call are not a final answer (``_route_tools`` may hand off now)
             "trace": entries,
             "budget": budget.model_dump(mode="json"),
             "budget_exhausted": exhausted,
@@ -828,7 +848,8 @@ class NoQuizWorkflow:
         )
         if missing:
             return self._nudge(state, f"Before you finish: {'; '.join(missing)}.")
-        return Command(goto="quiz_gate", update={"final_answer": answer, "nudges": 0})
+        # A handoff routed straight from the tools node carries no new text: keep the Coder's summary.
+        return Command(goto="quiz_gate", update={"final_answer": answer or state.get("final_answer"), "nudges": 0})
 
     def _node_quiz_gate(self, state: WorkflowState, config: RunnableConfig) -> dict[str, Any]:
         """Ask the human, grade server-side, and checkpoint the grade: nothing else.

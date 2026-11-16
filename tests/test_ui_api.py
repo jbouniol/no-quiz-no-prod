@@ -59,6 +59,7 @@ from no_quiz_no_prod.contracts import (
     compute_tree_sha256,
 )
 from no_quiz_no_prod.graph.workflow import ThreadStateError
+from no_quiz_no_prod.ui import server as server_module
 from no_quiz_no_prod.ui.security import (
     SESSION_TOKEN_HEADER,
     StudioGuard,
@@ -1459,7 +1460,6 @@ def test_failed_push_keeps_the_locks_and_the_same_approve_retries_the_deploy(tmp
                 )
             ),
             turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
-            turn(text="STATUS: DONE\nDoc v1 and quiz attempt 1 are published."),
         ],
     )
     workflows: list[NoQuizWorkflow] = []
@@ -2047,7 +2047,6 @@ def test_reject_after_failed_push_blocks_epoch_and_keeps_prod_untouched(tmp_path
                 )
             ),
             turn(call("create_comprehension_quiz", **RELEASE_QUIZ)),
-            turn(text="STATUS: DONE\nQuiz ready."),
         ],
     )
     workflows: list[NoQuizWorkflow] = []
@@ -2186,8 +2185,13 @@ def test_run_stream_validates_release_config_before_starting_workflow(tmp_path: 
     assert studio_of(client).busy is None
 
 
-def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(tmp_path: Path) -> None:
+def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With eval/results*.jsonl moved into eval/campaigns/, default create_app() loads LATEST_CAMPAIGN_DIR and manifest."""
+    monkeypatch.setattr(
+        server_module, "RUNS_DIR", tmp_path / "no-local-runs"
+    )  # git-ignored local runs must not leak in
     settings = RuntimeSettings(workspace_dir=tmp_path / "ws")
     app = create_app(
         settings=settings,

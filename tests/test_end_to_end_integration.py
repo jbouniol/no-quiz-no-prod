@@ -114,7 +114,6 @@ def examiner_script(attempt: int, quiz: dict[str, str]) -> list[ChatTurnResponse
     return [
         turn(upsert),
         turn(call("create_comprehension_quiz", **quiz)),
-        turn(text=f"STATUS: DONE\nDoc v{attempt} and quiz attempt {attempt} are published."),
     ]
 
 

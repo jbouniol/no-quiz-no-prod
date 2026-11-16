@@ -456,7 +456,10 @@ def coder_fix(
 
 
 def doc_and_quiz(attempt: int, correct: str, *, targeted: tuple[str, ...] = ()) -> list[ChatTurnResponse]:
-    """One documentation round (the Examiner's, or the documentation phase of the single agent)."""
+    """One documentation round (the Examiner's, or the documentation phase of the single agent).
+
+    No closing "STATUS: DONE" turn: once the doc and the quiz of the current attempt exist, the harness hands off.
+    """
     doc = f"## Technical Feature Documentation\nDecimal totals (v{attempt}).\n\n## Pedagogical Lesson\nHalf-up ties."
     quiz = {
         "skill_tag": "decimal_rounding",
@@ -479,11 +482,7 @@ def doc_and_quiz(attempt: int, correct: str, *, targeted: tuple[str, ...] = ()) 
         applied_rules=["RULE-001"],
         targeted_weaknesses=list(targeted),
     )
-    return [
-        turn(upsert),
-        turn(call("create_comprehension_quiz", **quiz)),
-        turn(text=f"STATUS: DONE\nDoc and quiz {attempt} ready."),
-    ]
+    return [turn(upsert), turn(call("create_comprehension_quiz", **quiz))]
 
 
 EXPECT = {
@@ -948,9 +947,9 @@ def test_repeated_unusable_turns_stop_as_api_error_with_zero_writes(tmp_path: Pa
 def test_an_examiner_question_is_a_dead_end_so_its_deliverables_decide(tmp_path: Path, backend: FakeBackend) -> None:
     """Live Gemini 2.5 Flash regression (n12, ad06): after a rejected quiz the Examiner asked the developer to fix
     it; nobody can answer an Examiner (a follow-up goes to the Coder), so the run died as clarification_needed."""
-    upsert, quiz, done = doc_and_quiz(1, "A")
+    upsert, quiz = doc_and_quiz(1, "A")
     question = turn(text="STATUS: CLARIFICATION_NEEDED\nPlease provide four distinct options for the quiz?")
-    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, question, quiz, done])
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, question, quiz])
     result = make_workflow(tmp_path, backend, llm).run_scenario(scenario(max_steps=14))
     assert result.passed, result.why
     nudges = [
@@ -959,6 +958,32 @@ def test_an_examiner_question_is_a_dead_end_so_its_deliverables_decide(tmp_path:
         if c.role == "examiner" and str(c.messages[-1]["content"]).startswith("[harness]")
     ]
     assert len(nudges) == 1 and "Before you finish" in nudges[0] and "create_comprehension_quiz" in nudges[0]
+
+
+def test_complete_deliverables_hand_off_without_asking_the_examiner_again(tmp_path: Path, backend: FakeBackend) -> None:
+    """Live DeepSeek V4 Flash regression (n01): the Examiner saw its own quiz call sealed, took it for a failure and
+    re-created the quiz until max_steps, at last sending the sealed marker itself. The harness now hands off as soon
+    as the doc and the quiz of the current attempt exist: the model is never asked whether it is done."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])  # the trailing duplicate must stay unplayed
+    paused = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-handoff")
+    assert paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"coder": 0, "examiner": 1}
+    assert tools_called(backend).count("create_comprehension_quiz") == 1
+    assert paused.final_answer.startswith("Totals use Decimal ROUND_HALF_UP")  # the Coder's summary is kept
+
+
+def test_words_beside_the_last_deliverable_call_are_not_read_as_a_status(tmp_path: Path, backend: FakeBackend) -> None:
+    """A question written next to the call that completes the deliverables is not a clarification stop."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    aside = turn(
+        *[(c.name, c.args) for c in upsert.tool_calls],
+        text="STATUS: CLARIFICATION_NEEDED\nShould the doc also cite RULE-003?",
+    )
+    llm = ScriptedLLM(single=[*coder_fix("")[:-1], quiz, aside])
+    paused = make_workflow(tmp_path, backend, llm, topology="single").start_run(TASK, thread_id="t-aside")
+    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"single": 0}
 
 
 def test_rejected_arguments_tell_the_agent_to_fix_and_call_again() -> None:
@@ -1375,8 +1400,8 @@ def test_a_sealed_turn_drops_readable_reasoning_but_keeps_opaque_blocks() -> Non
 
 
 def test_sealed_arguments_lost_by_a_restart_are_asked_again(tmp_path: Path, backend: FakeBackend) -> None:
-    upsert, quiz, done = doc_and_quiz(1, "A")
-    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz, done])
+    upsert, quiz = doc_and_quiz(1, "A")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])
     workflow = make_workflow(tmp_path, backend, llm)
     unseal = workflow._unseal
     lost: list[str] = []
