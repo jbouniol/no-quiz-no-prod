@@ -789,11 +789,11 @@ def test_cli_dry_run_writes_results_jsonl_summary_and_comparison(tmp_path: Path)
     assert "Injected faults: harness retries vs agent recoveries" in summary_md
     assert "| `n15#0` | `push_rejected` | `pass` |" in summary_md
     assert "SYNTHETIC draft labels" in summary_md and "Judge validated against human labels**: **no**" in summary_md
-    assert "- **Scenario set**: `custom`" in summary_md  # --scenarios was given explicitly
+    assert "- **Scenario set**: `dev`" in summary_md  # --scenarios naming the dev file is still the dev set
     assert (single_out / JUDGE_CALIBRATION_FILENAME).is_file()
     manifest = load_manifest(single_out)
     assert manifest is not None and manifest.dry_run and manifest.repeats == 1
-    assert manifest.scenario_count == scenario_count and manifest.scenario_set == "custom"
+    assert manifest.scenario_count == scenario_count and manifest.scenario_set == "dev"
     assert manifest.scenario_file_sha256 == hashlib.sha256(DEFAULT_SCENARIOS_PATH.read_bytes()).hexdigest()
 
     # Multi-cohort comparison (`dual` vs `single`)

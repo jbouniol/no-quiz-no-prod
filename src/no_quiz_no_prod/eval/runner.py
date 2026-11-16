@@ -763,7 +763,12 @@ def _load_run_scenarios(
 ) -> tuple[str, Path, list[ScenarioSpec]]:
     """``(scenario set name, file, scenarios)`` after ``--scenario-ids`` then ``--limit``."""
     if args.scenarios is not None:
-        set_name, path = CUSTOM_SCENARIO_SET, Path(args.scenarios)
+        path = Path(args.scenarios)
+        # the grading command names eval/scenarios.jsonl explicitly: that is still the development set
+        set_name = next(
+            (name for name, known in SCENARIO_SET_PATHS.items() if path.resolve() == known.resolve()),
+            CUSTOM_SCENARIO_SET,
+        )
         scenarios = load_scenarios(path)
     else:
         set_name, path = args.scenario_set, SCENARIO_SET_PATHS[args.scenario_set]
