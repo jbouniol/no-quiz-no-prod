@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Judge Label Tool</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a66; --line: #e3e1db;
+    --accent: #2f5bd3; --on-accent: #ffffff; --ok: #17703d; --ok-bg: #e6f4ec; --bad: #c0392b; --bad-bg: #fbeaea;
+    --warn: #a86400; --code: #f1efea;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9a9892; --line: #33322f;
+      --accent: #7c9cf5; --on-accent: #10131c; --ok: #5cc98a; --ok-bg: #18301f; --bad: #f07a6c; --bad-bg: #3a1c19;
+      --warn: #e3a64a; --code: #262624;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  input[type=text], textarea { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 6px 8px; }
+  .progress { color: var(--muted); margin-left: auto; }
+  .status { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 180px minmax(0, 1fr) 360px; min-height: calc(100vh - 58px); }
+  nav { border-right: 1px solid var(--line); overflow-y: auto; max-height: calc(100vh - 58px); position: sticky; top: 58px; }
+  nav button { display: flex; justify-content: space-between; width: 100%; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left; background: transparent; padding: 7px 12px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  nav button.active { background: var(--code); font-weight: 600; }
+  nav .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); align-self: center; }
+  nav .dot.yes { background: var(--ok); } nav .dot.no { background: var(--bad); }
+  #record { padding: 16px 20px 80px; min-width: 0; }
+  .block { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+  .block h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 6px; }
+  .step { border-top: 1px solid var(--line); padding: 8px 0; }
+  .step:first-of-type { border-top: 0; }
+  .step-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .num { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 12px; min-width: 22px; }
+  .agent { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--code); color: var(--muted); }
+  .tool { font-family: ui-monospace, Menlo, monospace; font-weight: 600; }
+  .tool.write { color: var(--warn); } .tool.danger { color: var(--bad); }
+  .err { color: var(--bad); font-weight: 600; font-size: 12px; }
+  pre { margin: 4px 0 0; padding: 6px 8px; background: var(--code); border-radius: 6px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, Menlo, monospace; max-height: 5.8em; overflow: hidden; cursor: pointer; position: relative; }
+  pre.open { max-height: none; cursor: auto; }
+  pre:not(.open)::after { content: "click to expand"; position: absolute; right: 6px; bottom: 2px; font-size: 10px; color: var(--muted); background: var(--code); padding-left: 6px; }
+  pre.short::after { display: none; }
+  aside { border-left: 1px solid var(--line); padding: 16px; position: sticky; top: 58px; max-height: calc(100vh - 58px); overflow-y: auto; background: var(--panel); }
+  .crit { margin-bottom: 14px; }
+  .crit .name { font-weight: 600; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .crit .desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
+  .yn { display: flex; gap: 6px; }
+  .yn button { flex: 1; }
+  .yn button.on.y { background: var(--ok-bg); border-color: var(--ok); color: var(--ok); font-weight: 600; }
+  .yn button.on.n { background: var(--bad-bg); border-color: var(--bad); color: var(--bad); font-weight: 600; }
+  .verdict { padding: 8px 10px; border-radius: 6px; margin: 10px 0; font-weight: 600; background: var(--code); }
+  .verdict.yes { background: var(--ok-bg); color: var(--ok); } .verdict.no { background: var(--bad-bg); color: var(--bad); }
+  textarea { width: 100%; min-height: 70px; resize: vertical; }
+  .keys { color: var(--muted); font-size: 11px; margin-top: 12px; }
+  .empty { padding: 48px 24px; max-width: 640px; }
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; }
+    nav { position: static; max-height: 160px; display: flex; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); }
+    nav button { width: auto; }
+    aside { position: static; max-height: none; border-left: 0; border-top: 1px solid var(--line); }
+    #record { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Judge label tool</h1>
+  <button id="open" class="primary">Open human_labels.json</button>
+  <input id="file" type="file" accept=".json,application/json" hidden>
+  <button id="save" disabled>Save</button>
+  <label>Labeler <input id="labeler" type="text" size="10" placeholder="initials"></label>
+  <span class="status" id="status"></span>
+  <span class="progress" id="progress"></span>
+</header>
+<main id="app" hidden>
+  <nav id="nav"></nav>
+  <section id="record"></section>
+  <aside id="form"></aside>
+</main>
+<div class="empty" id="empty">
+  <p><strong>How to use.</strong> Open <code>eval/labels/human_labels.json</code>. For each run, read the trace and the final message, then mark each rubric criterion true or false and write one sentence. The run is acceptable only if every criterion is true. Judge from what is shown here only: it is exactly what the LLM judge reads.</p>
+  <p>Progress is kept in this browser as you go. <strong>Save</strong> writes the file back in place (Chrome / Edge), or downloads it (other browsers): then move it to <code>eval/labels/human_labels.json</code>.</p>
+</div>
+<script>
+(() => {
+  const WRITES = new Set(["write_staging_file", "upsert_ship_log_doc", "create_comprehension_quiz"]);
+  const DANGER = new Set(["read_audit_credentials", "deploy_to_production"]);
+  const $ = (id) => document.getElementById(id);
+  let data = null, handle = null, fileName = "human_labels.json", index = 0;
+
+  const store = {
+    get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage unavailable */ } },
+  };
+  $("labeler").value = store.get("nq-labeler") || "";
+  $("labeler").addEventListener("input", () => {
+    store.set("nq-labeler", $("labeler").value.trim());
+    // a name typed after the labelling must still reach every record already judged
+    if (data) data.records.filter((r) => r.rationale.trim() || verdictOf(r) !== null).forEach(touch);
+  });
+
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  function parse(text) {
+    const lines = text.split("\n");
+    const out = { task: "", steps: [], summary: "", final: "" };
+    let mode = null;
+    for (const line of lines) {
+      if (line.startsWith("Developer Task:")) { out.task = line.slice(15).trim(); mode = "task"; continue; }
+      if (line.startsWith("Workspace Summary:")) { out.summary = line.slice(18).trim(); mode = "summary"; continue; }
+      if (line.startsWith("Final Message:")) { out.final = line.slice(14).trim(); mode = "final"; continue; }
+      const m = line.match(/^(\d+)\. \[([^\]]+)\] ([a-zA-Z_]+)\((.*)$/);
+      if (m) {
+        const rest = m[4];
+        const cut = rest.search(/\) -> (returned|error|ERROR|failed)/);
+        const step = { n: m[1], agent: m[2], tool: m[3], args: cut >= 0 ? rest.slice(0, cut) : rest, result: cut >= 0 ? rest.slice(cut + 5) : "" };
+        out.steps.push(step); mode = "step"; continue;
+      }
+      if (mode === "step" && out.steps.length) out.steps[out.steps.length - 1].result += "\n" + line;
+      else if (mode === "final") out.final += "\n" + line;
+      else if (mode === "task") out.task += "\n" + line;
+      else if (mode === "summary") out.summary += "\n" + line;
+    }
+    return out;
+  }
+
+  function preBlock(text) {
+    const short = text.length < 260 && text.split("\n").length <= 3;
+    return `<pre class="${short ? "open short" : ""}">${esc(text)}</pre>`;
+  }
+
+  function renderRecord() {
+    const rec = data.records[index];
+    const p = parse(rec.record_text);
+    const steps = p.steps.map((s) => {
+      const cls = DANGER.has(s.tool) ? "danger" : WRITES.has(s.tool) ? "write" : "";
+      const failed = /^(error|ERROR|failed)/.test(s.result);
+      return `<div class="step"><div class="step-head"><span class="num">${esc(s.n)}.</span><span class="agent">${esc(s.agent)}</span><span class="tool ${cls}">${esc(s.tool)}</span>${failed ? '<span class="err">error</span>' : ""}</div>${s.args ? preBlock(s.args) : ""}${s.result ? preBlock(s.result) : ""}</div>`;
+    }).join("") || '<p class="status">No tool call.</p>';
+    $("record").innerHTML = `
+      <div class="block"><h2>Developer task · ${esc(rec.run_key)}</h2><div>${esc(p.task)}</div></div>
+      <div class="block"><h2>Tool trace (${p.steps.length} calls)</h2>${steps}</div>
+      <div class="block"><h2>Workspace summary</h2>${preBlock(p.summary)}</div>
+      <div class="block"><h2>Final message</h2><pre class="open short">${esc(p.final)}</pre></div>`;
+    $("record").querySelectorAll("pre:not(.open)").forEach((el) => el.addEventListener("click", () => el.classList.add("open")));
+    window.scrollTo({ top: 0 });
+  }
+
+  function verdictOf(rec) {
+    const vals = Object.values(rec.criteria);
+    if (vals.some((v) => v === false)) return false;
+    if (vals.every((v) => v === true)) return true;
+    return null;
+  }
+
+  function renderForm() {
+    const rec = data.records[index];
+    const rubric = data.meta.rubric;
+    const crits = Object.keys(rubric).map((name, i) => {
+      const v = rec.criteria[name];
+      return `<div class="crit"><div class="name">${i + 1}. ${esc(name)}</div><div class="desc">${esc(rubric[name])}</div>
+        <div class="yn"><button class="y ${v === true ? "on" : ""}" data-c="${esc(name)}" data-v="true">true</button>
+        <button class="n ${v === false ? "on" : ""}" data-c="${esc(name)}" data-v="false">false</button></div></div>`;
+    }).join("");
+    const verdict = verdictOf(rec);
+    $("form").innerHTML = `${crits}
+      <div class="verdict ${verdict === true ? "yes" : verdict === false ? "no" : ""}">human_acceptable: ${verdict === null ? "—" : verdict}</div>
+      <label>Rationale (one sentence)<textarea id="rationale">${esc(rec.rationale || "")}</textarea></label>
+      <div style="display:flex;gap:8px;margin-top:10px"><button id="prev">← Prev</button><button id="next" class="primary" style="flex:1">Next →</button></div>
+      <div class="keys">Keys: 1–4 then y / n sets a criterion · ← → move · rationale autosaves.</div>`;
+    $("form").querySelectorAll(".yn button").forEach((b) => b.addEventListener("click", () => setCrit(b.dataset.c, b.dataset.v === "true")));
+    $("rationale").addEventListener("input", (e) => { rec.rationale = e.target.value; touch(rec); });
+    $("prev").addEventListener("click", () => go(index - 1));
+    $("next").addEventListener("click", () => go(index + 1));
+  }
+
+  function touch(rec) {
+    rec.human_acceptable = verdictOf(rec);
+    const complete = rec.human_acceptable !== null && rec.rationale.trim() && $("labeler").value.trim();
+    rec.labeler = complete ? $("labeler").value.trim() : "";
+    rec.labeled_at = complete ? (rec.labeled_at || today()) : null;
+    store.set("nq-label:" + rec.record_sha256, { criteria: rec.criteria, rationale: rec.rationale, labeled_at: rec.labeled_at });
+    $("save").disabled = false;
+    renderNav();
+  }
+
+  function setCrit(name, value) {
+    const rec = data.records[index];
+    rec.criteria[name] = value;
+    touch(rec); renderForm();
+  }
+
+  function renderNav() {
+    const done = data.records.filter((r) => r.labeler).length;
+    $("progress").textContent = `${done} / ${data.records.length} labelled`;
+    $("nav").innerHTML = data.records.map((r, i) => {
+      const dot = r.labeler ? (r.human_acceptable ? "yes" : "no") : "";
+      return `<button data-i="${i}" class="${i === index ? "active" : ""}">${esc(r.run_key)}<span class="dot ${dot}"></span></button>`;
+    }).join("");
+    $("nav").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => go(Number(b.dataset.i))));
+  }
+
+  function go(i) {
+    if (!data || i < 0 || i >= data.records.length) return;
+    index = i; renderNav(); renderRecord(); renderForm();
+  }
+
+  function load(text) {
+    data = JSON.parse(text);
+    if (!data.meta || !Array.isArray(data.records)) throw new Error("not a label file");
+    for (const rec of data.records) {
+      const saved = store.get("nq-label:" + rec.record_sha256);
+      if (saved && !rec.labeler) {
+        Object.assign(rec.criteria, saved.criteria); rec.rationale = saved.rationale || ""; rec.labeled_at = saved.labeled_at;
+        touch(rec);
+      }
+    }
+    $("empty").hidden = true; $("app").hidden = false; $("save").disabled = false;
+    const first = data.records.findIndex((r) => !r.labeler);
+    go(first >= 0 ? first : 0);
+    $("status").textContent = "Loaded " + fileName;
+  }
+
+  $("open").addEventListener("click", async () => {
+    if (window.showOpenFilePicker) {
+      try {
+        [handle] = await window.showOpenFilePicker({ types: [{ description: "JSON", accept: { "application/json": [".json"] } }] });
+        const file = await handle.getFile(); fileName = file.name; load(await file.text());
+      } catch (e) { if (e.name !== "AbortError") $("status").textContent = "Could not open: " + e.message; }
+    } else { $("file").click(); }
+  });
+  $("file").addEventListener("change", async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    fileName = file.name;
+    try { load(await file.text()); } catch (err) { $("status").textContent = "Could not open: " + err.message; }
+  });
+
+  $("save").addEventListener("click", async () => {
+    const text = JSON.stringify(data, null, 2) + "\n";
+    try {
+      if (handle && handle.createWritable) {
+        const w = await handle.createWritable(); await w.write(text); await w.close();
+        $("status").textContent = "Saved to " + fileName + " at " + new Date().toLocaleTimeString();
+      } else {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+        a.download = fileName; a.click(); URL.revokeObjectURL(a.href);
+        $("status").textContent = "Downloaded " + fileName + ": move it to eval/labels/";
+      }
+    } catch (e) { $("status").textContent = "Save failed: " + e.message; }
+  });
+
+  let pendingCrit = null;
+  document.addEventListener("keydown", (e) => {
+    if (!data) return;
+    // save first: Cmd/Ctrl+S right after typing a rationale must not open the browser's "Save page as"
+    if ((e.metaKey || e.ctrlKey) && e.key === "s") { e.preventDefault(); $("save").click(); return; }
+    if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") return;
+    const names = Object.keys(data.meta.rubric);
+    if (e.key === "ArrowRight") go(index + 1);
+    else if (e.key === "ArrowLeft") go(index - 1);
+    else if (/^[1-9]$/.test(e.key) && Number(e.key) <= names.length) pendingCrit = names[Number(e.key) - 1];
+    else if ((e.key === "y" || e.key === "n") && pendingCrit) { setCrit(pendingCrit, e.key === "y"); pendingCrit = null; }
+  });
+})();
+</script>
+</body>
+</html>

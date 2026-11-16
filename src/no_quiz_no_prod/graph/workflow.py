@@ -817,6 +817,7 @@ class NoQuizWorkflow:
             **{key: view[key] for key in HARVESTED_KEYS if key in view},
             "messages": {**state["messages"], spec.role: history},
             "pending_calls": [],
+            "last_text": "",  # words beside a tool call are not a final answer (``_route_tools`` may hand off now)
             "trace": entries,
             "budget": budget.model_dump(mode="json"),
             "budget_exhausted": exhausted,

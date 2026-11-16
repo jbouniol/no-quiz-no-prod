@@ -37,7 +37,7 @@ LABELS_DIR: Final = EVAL_DIR / "labels"
 SYNTHETIC_LABELS_PATH: Final = LABELS_DIR / "synthetic_draft_labels.json"
 
 CAMPAIGNS_DIR: Final = EVAL_DIR / "campaigns"
-LATEST_CAMPAIGN_DIR: Final = CAMPAIGNS_DIR / "03_git_release_dual_deepseek"  # the most recent recorded campaign
+LATEST_CAMPAIGN_DIR: Final = CAMPAIGNS_DIR / "04_dev_models_x_topologies"  # the most recent recorded campaign
 RUNS_DIR: Final = EVAL_DIR / "runs"
 
 RESULTS_FILENAME: Final = "results.jsonl"  # the primary cohort of a run

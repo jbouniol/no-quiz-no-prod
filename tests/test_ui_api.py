@@ -59,6 +59,7 @@ from no_quiz_no_prod.contracts import (
     compute_tree_sha256,
 )
 from no_quiz_no_prod.graph.workflow import ThreadStateError
+from no_quiz_no_prod.ui import server as server_module
 from no_quiz_no_prod.ui.security import (
     SESSION_TOKEN_HEADER,
     StudioGuard,
@@ -632,11 +633,13 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     assert 'id="home-prompt-card"' in index_resp.text
     assert 'id="workbench-split"' in index_resp.text
     assert 'id="api-popover"' in index_resp.text
+    # the Simple/Expert toggle sits in the Studio header and starts on the Simple view
+    assert re.search(r'id="btn-detail-toggle"[^>]*aria-pressed="false"[^>]*>View: Simple<', index_resp.text)
     assert "/static/tokens.css" in index_resp.text
     assert "/static/styles.css" in index_resp.text
     assert "/static/app.js" in index_resp.text
 
-    for asset in ("tokens.css", "styles.css", "app.js", "diff.js", "markdown.js"):
+    for asset in ("tokens.css", "styles.css", "app.js", "diff.js", "markdown.js", "studio-text.js"):
         res = client.get(f"/static/{asset}")
         assert res.status_code == 200, f"Failed to serve /static/{asset}"
         assert len(res.text) > 100
@@ -650,7 +653,7 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
 
     # Enforce zero hardcoded hex palettes & zero decorative emoji slop in JS/HTML files
     banned_emojis = ("🛡️", "📄", "🎯", "⚡", "🚀", "🛑", "🧠", "🔒", "🗑", "🔐", "↺", "▶")
-    for name in ("index.html", "app.js", "diff.js", "markdown.js"):
+    for name in ("index.html", "app.js", "diff.js", "markdown.js", "studio-text.js"):
         content = (STATIC_DIR / name).read_text(encoding="utf-8")
         assert re.search(r"#[0-9a-fA-F]{6}\b", content) is None, f"Hardcoded hex found in {name}"
         for emoji in banned_emojis:
@@ -2184,8 +2187,13 @@ def test_run_stream_validates_release_config_before_starting_workflow(tmp_path: 
     assert studio_of(client).busy is None
 
 
-def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(tmp_path: Path) -> None:
+def test_default_eval_dir_loads_latest_campaign_and_its_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With eval/results*.jsonl moved into eval/campaigns/, default create_app() loads LATEST_CAMPAIGN_DIR and manifest."""
+    monkeypatch.setattr(
+        server_module, "RUNS_DIR", tmp_path / "no-local-runs"
+    )  # git-ignored local runs must not leak in
     settings = RuntimeSettings(workspace_dir=tmp_path / "ws")
     app = create_app(
         settings=settings,
@@ -2197,7 +2205,24 @@ def test_default_eval_dir_loads_latest_campaign_and_surfaces_stale_manifest(tmp_
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["available"] is True
-    assert body["summary"]["total_runs"] == 31
-    assert body["stale"] is True
-    assert isinstance(body["stale_reason"], str) and len(body["stale_reason"]) > 20
-    assert any("eval/campaigns/03_git_release_dual_deepseek/" in src for src in body["source_files"])
+    assert body["summary"]["total_runs"] == 456  # 4 cohorts x 38 dev scenarios x 3 repeats
+    assert body["stale"] is False
+    assert any("eval/campaigns/04_dev_models_x_topologies/" in src for src in body["source_files"])
+
+
+def test_changing_the_model_of_a_thread_rebuilds_its_workflow(tmp_path: Path) -> None:
+    # a thread first run on an OpenRouter model, then re-run on native Claude, must not keep the OpenRouter workflow
+    built: list[tuple[Topology, str]] = []
+
+    def builder(ws: StubSandboxWorkspace, topology: Topology, model: str) -> StubWorkflow:
+        built.append((topology, model))
+        return StubWorkflow(ws, topology=topology, model=model)
+
+    app, _, _ = build_studio(tmp_path, workflow_builder=builder)
+    client = page_client(app)
+    run = {"prompt": "Stage fix", "thread_id": "thr_switch", "topology": "dual"}
+    client.post("/api/runs/stream", json={**run, "model": "~deepseek/deepseek-v4-flash-latest"})
+    client.post("/api/runs/stream", json={**run, "model": "~deepseek/deepseek-v4-flash-latest"})
+    client.post("/api/runs/stream", json={**run, "model": "claude-sonnet-5-5"})
+    assert built == [("dual", "~deepseek/deepseek-v4-flash-latest"), ("dual", "claude-sonnet-5-5")]
+    assert app.state.studio.sessions["thr_switch"].workflow.model == "claude-sonnet-5-5"

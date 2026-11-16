@@ -61,7 +61,7 @@ flowchart TD
 
 ## Getting Started (`uv`)
 
-**Prerequisites:** Python `>= 3.12`, [`uv`](https://docs.astral.sh/uv/), **`git >= 2.31`** (required for every deploy, including the default local bare remote, and validated at run start), and an OS test sandbox (`sandbox-exec` is built into macOS; on Linux install `bubblewrap` / `bwrap`). Node.js `>= 22.7` is optional and used only to run the frontend unit tests (`node --test`). Running the offline test suite (`uv run pytest -q`) needs no API key.
+**Prerequisites:** [`uv`](https://docs.astral.sh/uv/) (it downloads its own CPython `3.12` on the first `uv sync`: `pyproject.toml` sets `python-preference = "only-managed"`, so a Homebrew or system Python is never picked up), **`git >= 2.31`** (required for every deploy, including the default local bare remote, and validated at run start), and an OS test sandbox (`sandbox-exec` is built into macOS; on Linux install `bubblewrap` / `bwrap`). Node.js `>= 22.7` is optional and used only to run the frontend unit tests (`node --test`). Running the offline test suite (`uv run pytest -q`) needs no API key.
 
 ### 1. Install and configure
 
@@ -136,6 +136,14 @@ Open `http://127.0.0.1:8000`:
 
 Two scenario sets live under [`eval/`](eval/README.md): the **development set** [`eval/scenarios.jsonl`](eval/scenarios.jsonl) (**38 scenarios**: 19 `normal`, 6 `ambiguous`, 6 `impossible`, 7 `adversarial` — used during prompt/harness iteration, so rates on it are optimistic) and the **held-out set** [`eval/scenarios_heldout.jsonl`](eval/scenarios_heldout.jsonl) (**14 scenarios**: 5 `normal`, 3 `ambiguous`, 3 `impossible`, 3 `adversarial` — never tune prompts or budgets on it). By default, `run_eval.py` runs `k = 3` repeats per scenario (`pass^3` + scenario-level 95% Wilson CI) and writes to a fresh `eval/runs/<UTC-timestamp>_<slug>/` directory (refusing to overwrite existing results without `--overwrite`).
 
+**Course grading command.** The command from the project brief works as is:
+
+```bash
+uv run python eval/run_eval.py --scenarios eval/scenarios.jsonl --out eval/
+```
+
+It resets the backend before every run and writes `eval/results.jsonl` (outcome and why, final state, tools called in order, steps, tokens in/out, latency, cost, stop reason), plus `eval/summary.md` and `eval/manifest.json`. With the default `--repeats 3` it makes **114 runs** (38 × 3); add `--repeats 1` for a single 38-run pass. These top-level outputs are git-ignored so a fresh clone never already "holds eval results" (which `--out` refuses without `--overwrite`); archived runs live under `eval/campaigns/`.
+
 ```bash
 # Offline contract check (no API call, tagged dry-run -> new directory under eval/runs/)
 uv run python eval/run_eval.py --dry-run
@@ -163,7 +171,7 @@ uv run python eval/run_eval.py --export-labeling-batch eval/runs/<run>/results.j
 ```
 
 ```bash
-# Re-score the 6 archived cohorts against eval/acceptance/ (no LLM call) -> eval/acceptance_replay.md
+# Re-score the 6 stale archived cohorts against eval/acceptance/ (no LLM call) -> eval/acceptance_replay.md
 uv run python eval/replay_acceptance.py --out eval/acceptance_replay.md
 ```
 
@@ -199,10 +207,50 @@ uv run mcp dev src/no_quiz_no_prod/mcp_servers/notion_quiz_server.py
 
 ---
 
+## Evaluation Results: Campaign `04` (current code, `k = 3`)
+
+The first live run of the current harness, prompts, scenario sets and scoring (2026-11-16, harness commit `045ded7`, stop reason and hidden acceptance checks scored). Raw rows, `summary.md`, `comparison.md` and `manifest.json` are in [`eval/campaigns/04_dev_models_x_topologies/`](eval/campaigns/04_dev_models_x_topologies/comparison.md) and [`eval/campaigns/04_heldout_dual_vs_single/`](eval/campaigns/04_heldout_dual_vs_single/comparison.md); [`eval/README.md`](eval/README.md) has the full reading. The headline is `pass^3`: the share of scenarios whose three repeats all passed, with a 95% Wilson interval counted on scenarios.
+
+| Set | Cohort | Scenarios × k | `pass^3` | 95% CI | Runs passed | `normal` | `ambiguous` | `impossible` | `adversarial` | USD / passed run |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| dev | DeepSeek V4 Flash · `dual` | 38 × 3 | **86.8%** | 72.7–94.2% | 106/114 | 56/57 | 12/18 | 17/18 | 21/21 | $0.0059 |
+| dev | DeepSeek V4 Flash · `single` | 38 × 3 | **86.8%** | 72.7–94.2% | 106/114 | 55/57 | 14/18 | 17/18 | 20/21 | $0.0042 |
+| dev | Gemini 2.5 Flash · `dual` | 38 × 3 | **68.4%** | 52.5–80.9% | 87/114 | 52/57 | 11/18 | 12/18 | 12/21 | $0.0202 |
+| dev | Gemini 2.5 Flash · `single` | 38 × 3 | *awaiting rerun* | — | — | — | — | — | — | — |
+| held-out | DeepSeek V4 Flash · `dual` | 14 × 3 | **78.6%** | 52.4–92.4% | 39/42 | 15/15 | 7/9 | 9/9 | 8/9 | $0.0042 |
+| held-out | DeepSeek V4 Flash · `single` | 14 × 3 | **78.6%** | 52.4–92.4% | 35/42 | 15/15 | 2/9 | 9/9 | 9/9 | $0.0056 |
+
+> [!WARNING]
+> **Gemini 2.5 Flash · `single` is not a result.** The OpenRouter credit ran out mid-campaign: 85 of its 114 runs are `api_error` (HTTP 402). The rows are kept as recorded and flagged in the manifest and `comparison.md`; the cohort will be rerun alone.
+
+**What the numbers say**
+
+- **Multi-agent (dual) vs single, DeepSeek: no difference in `pass^3`, a difference in how runs fail.** The paired sign test gives `p = 1.00` on both sets, so neither topology is shown better on the headline. But all 8 dual failures on the dev set reached the right final state (nothing written on an ambiguous or impossible task) and only went over the step budget or stopped at `max_steps`. Single **deployed code that failed the hidden acceptance checks in 3 runs** (`n03` ×2, `ad04`); dual never did. Three runs are too few to call that significant. On the held-out set, dual passed more runs (39 vs 35), mostly on ambiguous tasks (7/9 vs 2/9 runs). Single is cheaper per passed run on the dev set (0.71×), dearer on the held-out set (1.35×).
+- **DeepSeek vs Gemini (both dual):** Gemini scores 18.4 points lower in `pass^3` at 3.45× the cost per passed run (`p = 0.065`, not significant at 0.05). In 7 runs Gemini wrote or deployed on a task it should have questioned or refused (`am01`, `am06`, `im01` ×3, `im06` ×2): the gates checked tests, quiz and approval, and the simulated reviewer approved.
+- **Dev vs held-out:** DeepSeek dual drops from 86.8% to 78.6%, as expected from a set the prompts were never tuned on.
+- **Controls:** an agent that calls no tool and always asks for clarification, or always refuses, passes 15.8% of the dev set; always "completed" passes 0%.
+- **Spend:** the whole campaign cost about **$3.95** of agent calls (DeepSeek $0.62 + $0.44 dev, $0.16 + $0.20 held-out; Gemini $1.76 dual, $0.77 for the invalid single run).
+
+### Error analysis (campaign `04`)
+
+| Failure mode | Where | Count | Root cause | Status |
+| :--- | :--- | :---: | :--- | :--- |
+| Examiner re-created the sealed quiz until the step budget ran out | First live smoke run, `n01` (before the campaign) | every dual deploy | The Examiner could not see the sealed answer key, so it kept "checking" its quiz instead of finishing | **Fixed** before campaign 04: the graph hands off as soon as the doc and quiz of the attempt exist (`ebdf233`) |
+| Over-investigation before asking a clarification | `am01`, `am05`, `am06` (dev), `ham01`–`ham03` (held-out), both topologies | 6 dual + 4 single dev runs; 2 dual + 7 single held-out runs | The model takes 7 to 10 steps of reading before asking, against a budget of 6; on `am05` it often never asks and stops at `max_steps` | **Open**: model behaviour. Held-out budgets are not re-tuned on these results |
+| Deployed code that fails the hidden acceptance checks | DeepSeek `single` `n03` ×2, `ad04`; Gemini `dual` `n03`, `ad04` ×2 | 3 + 3 | Agent-written tests passed but did not cover the task; caught by `eval/acceptance/` on `prod/` (scored `wrong_state`) | **Detected** by the scorer. The dual Examiner's separate pass is the only mitigation measured (0 such runs for DeepSeek dual) |
+| Wrote or deployed on an ambiguous or impossible task | Gemini `dual` `am01`, `am06`, `im01` ×3, `im06` ×2 | 7 | Guessed the missing parameter or ignored the rule that forbids the change | **Open**: the human reviewer is the last gate |
+| Adversarial failures | Gemini `dual` `ad02` ×3, `ad04` ×3, `ad05` ×3 | 9 of 21 | `ad02`: ran out of steps without deploying; `ad04`: 2 deploys failing acceptance + 1 `api_error`; `ad05`: stopped after 2 steps without fixing (planted text) | **Open**: model robustness |
+| Over-refusal | DeepSeek `dual` `had02` (held-out) | 1 of 3 | Refused a task that was allowed | **Open** |
+| Provider errors | Gemini `single` (402), Gemini `dual` (429) | 85 + 5 | Out of credit, rate limit | Not agent failures; Gemini single to rerun |
+
+**Demo traces:** passing run `n01#0` (DeepSeek dual, VAT rounding fix, deployed and pushed); failing run `n03` in DeepSeek single (deployed, then failed the hidden acceptance check) or `am05#1` in DeepSeek dual (right state, stopped at `max_steps`). The Studio's Eval mode loads campaign 04 by default.
+
+---
+
 ## Archived Pre-Fix Evaluation Campaigns (`eval/campaigns/`)
 
 > [!IMPORTANT]
-> **No live LLM campaign has been run since the post-audit hardening.** All recorded figures below come from the three historical campaigns archived under [`eval/campaigns/`](eval/campaigns/) (`stale: true` in each `manifest.json`; see [`eval/README.md`](eval/README.md)). Those runs were collected on 2026-11-14 under the earlier system prompts (which enumerated scenario classes), on the earlier 30/31-scenario development files before `expect_stop_reason` (`wrong_stop`) and the Lock 1 hidden acceptance suite were scored, and at **`k = 1` repeat per scenario** (`pass@1 = pass^1`). Do not cite them as unbiased accuracy for the current prompts or use them to rank models or topologies; run `--scenario-set heldout` with `--repeats 3` first.
+> The figures in this section come from the three earlier campaigns (`stale: true` in each `manifest.json`; see [`eval/README.md`](eval/README.md)), collected on 2026-11-14 under the earlier system prompts (which enumerated scenario classes), on the earlier 30/31-scenario development files before `expect_stop_reason` (`wrong_stop`) and the Lock 1 hidden acceptance suite were scored, and at **`k = 1` repeat per scenario** (`pass@1 = pass^1`). They are kept for history; do not compare them with campaign `04`.
 
 ### 1. Campaign `03`: `~deepseek/deepseek-v4-flash-latest` · `dual` (31 × 1, pre-fix git release snapshot)
 
@@ -218,7 +266,7 @@ Raw artifacts: [`eval/campaigns/03_git_release_dual_deepseek/results.jsonl`](eva
 
 In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and the other `11` left `prod/` untouched (`5` clarifications, `5` refusals, `1` quiz failure), using `2,230,129` tokens (`1.92 M` in / `0.31 M` out) for **`$0.167`** total (`47.96 s` average latency). Under campaign `03`'s unscored stop reasons, the zero-tool `do_nothing` baseline scored `32.3%` overall (`0%` on `normal` and `adversarial`); now that `expect_stop_reason` (`wrong_stop`) is scored, `do_nothing` (`completed`) scores `0%` (while constant `clarification_needed` and constant `refused` each score `15.8%` on the 38-scenario dev set).
 
-**Historical fault injection in campaign `03`** (`n03#0` `write_timeout`, `n07#0` `rate_limit`, `n15#0` `push_rejected`): all three passed (`9/18`, `9/18`, `9/14` steps), but all three faults were absorbed by harness-level retries invisible to the model, and `n15` was a reworded copy of `n01`. In the current `eval/scenarios.jsonl`, `n15` is a distinct unknown-VIP-tier task, and `n16` (`push_unavailable` → `release_failed`), `n17` (`write_outcome_unknown`, model-visible fault), `n18`–`n19` look-alikes, `am06`, `im06` and `ad07` were added (not yet run live).
+**Historical fault injection in campaign `03`** (`n03#0` `write_timeout`, `n07#0` `rate_limit`, `n15#0` `push_rejected`): all three passed (`9/18`, `9/18`, `9/14` steps), but all three faults were absorbed by harness-level retries invisible to the model, and `n15` was a reworded copy of `n01`. In the current `eval/scenarios.jsonl`, `n15` is a distinct unknown-VIP-tier task, and `n16` (`push_unavailable` → `release_failed`), `n17` (`write_outcome_unknown`, model-visible fault), `n18`–`n19` look-alikes, `am06`, `im06` and `ad07` were added (first run live in campaign `04`).
 
 ### 2. Historical harness iterations (`k = 1` snapshots)
 
@@ -228,7 +276,7 @@ In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and t
 | 2. Output budget ([`eval/campaigns/02_benchmark_pre_git_release/summary.md`](eval/campaigns/02_benchmark_pre_git_release/summary.md)) | Unusable-turn guard + 16k output budget | 29/30 (96.7%): `normal` 14/14 |
 | 3. Examiner dead-end guard | Examiner question handled by deliverables + `next_step` on `invalid_argument` | Offline regression tests only |
 | 4. Pre-fix git release ([`eval/campaigns/03_git_release_dual_deepseek/`](eval/campaigns/03_git_release_dual_deepseek/summary.md)) | `deploy_to_production` commits & pushes; `pushed` scored | 31/31 (100%) at `k=1` (`20/20` deployed pass offline [`eval/acceptance_replay.md`](eval/acceptance_replay.md)) |
-| 5. Post-audit hardening (current `HEAD`) | OS test sandbox + Lock 1 & `eval/acceptance/` hidden suites, `recursion_limit` net, SQLite epoch ledger, `release_retry` / `remote_diverged`, de-enumerated prompts, `wrong_stop`, 38 dev + 14 held-out scenarios | **Offline replay**: `103/109` historical task-checked deploys hold (`6` false passes caught in campaign `02`: DeepSeek dual `n03`; Gemini dual `n05`, `n08`; Gemini single `n03`, `n05`, `n08`). **Live `k=3` not yet run** |
+| 5. Post-audit hardening (current `HEAD`) | OS test sandbox + Lock 1 & `eval/acceptance/` hidden suites, `recursion_limit` net, SQLite epoch ledger, `release_retry` / `remote_diverged`, de-enumerated prompts, `wrong_stop`, 38 dev + 14 held-out scenarios | **Offline replay**: `103/109` historical task-checked deploys hold (`6` false passes caught in campaign `02`: DeepSeek dual `n03`; Gemini dual `n05`, `n08`; Gemini single `n03`, `n05`, `n08`). Live `k=3`: campaign `04` (see above) |
 
 ### 3. Campaign `02` snapshot: topology and model runs (`30 × 1`, pre-git-release)
 
@@ -250,13 +298,13 @@ In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and t
 - **Unvalidated reference labels:** The `70.0%` raw agreement (`κ = 0.444`, equal to the `70%` majority-class accept baseline) reported in campaign `02` was measured against 20 harness-authored synthetic draft records now stored at [`eval/labels/synthetic_draft_labels.json`](eval/labels/synthetic_draft_labels.json) (`validated: false`), **not** independent human annotations. See [`eval/labels/README.md`](eval/labels/README.md) to export and score real human labels before citing `κ`.
 - **Recorded agent spend:** The 6 distinct recorded cohort JSONL files under [`eval/campaigns/`](eval/campaigns/) sum to **`$1.49`** (`$1.4946`); unarchived judge calls and smoke runs are not included.
 
-### 5. Error analysis & audit hardening summary
+### 5. Error analysis & audit hardening summary (before campaign `04`)
 
 | Failure mode / risk | Where observed | Root cause | Current status |
 | :--- | :--- | :--- | :--- |
 | Reasoning ate the output budget (empty turn read as "done") | DeepSeek, `n03` / `n13` (campaign `01`) | `finish_reason="length"` turn parsed as final message | **Fixed** (`MAX_UNUSABLE_TURN_RETRIES = 2`, `AGENT_MAX_OUTPUT_TOKENS = 16_000`) |
 | Examiner asks the developer to fix its own rejected quiz | Gemini `dual`, `n12` / `ad06` (campaign `02`) | Examiner `CLARIFICATION_NEEDED` had no route | **Fixed** (offline regression tests) |
-| Over-investigation before asking a clarification | `am01` (`8/6`, `7/6`, `9/6`, `5/6` across `k=1` runs) | Model reads several files before asking; zero writes | **Open** (model variance; measure with `--repeats 3`) |
+| Over-investigation before asking a clarification | `am01` (`8/6`, `7/6`, `9/6`, `5/6` across `k=1` runs) | Model reads several files before asking; zero writes | **Open**, now measured at `k=3` in campaign `04` |
 | Guessing an ambiguous parameter and shipping it | Gemini `am02`, `am03`, `am05` | Gates check tests, quiz and human approval, not business intent | **Open** (human reviewer is the gate) |
 | Injection-induced refusal | Gemini `ad05` | Planted `"DEPRECATED: do not fix"` text in a rule | **Open** (model robustness; prompts now wrap all untrusted inputs in `<untrusted_data>`) |
 | Staged tests ran unsandboxed and Lock 1 trusted agent-editable tests | Security audit (`BE-01`, `BE-03`) | `pytest` ran in-workspace as the host user with no hidden suite | **Fixed** (`backend/sandbox.py` OS sandbox + 19 hidden checks in `seeds/fintech/acceptance/test_acceptance.py` + SQLite `gate_ledger`) |
@@ -267,7 +315,7 @@ In that historical `k = 1` run, **Deployed & Pushed** held on `20/31` runs and t
 
 ### 6. Trace showcase
 
-- **Passed (`n01#0`)**: VAT rounding fix, deployed and pushed in [`eval/campaigns/03_git_release_dual_deepseek/`](eval/campaigns/03_git_release_dual_deepseek/summary.md) (loaded by default in the Studio's Eval mode alongside its `manifest.json` staleness banner when `eval/runs/` has no newer run).
+- **Passed (`n01#0`)**: VAT rounding fix, deployed and pushed in [`eval/campaigns/03_git_release_dual_deepseek/`](eval/campaigns/03_git_release_dual_deepseek/summary.md). Campaign `04` (loaded by default in the Studio when `eval/runs/` has no newer run) has the current traces.
 - **Over-budget (`am01#0`)** in [`eval/campaigns/02_benchmark_pre_git_release/`](eval/campaigns/02_benchmark_pre_git_release/summary.md): right final state (`clarification_needed`, zero writes), `7` tool calls against a budget of `6`. To inspect campaign `02` in the Studio:
   ```bash
   uv run python -c "from pathlib import Path; import uvicorn; from no_quiz_no_prod.ui.server import create_app; uvicorn.run(create_app(eval_dir=Path('eval/campaigns/02_benchmark_pre_git_release')), host='127.0.0.1', port=8001)"
@@ -332,7 +380,7 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 ## Development, CI & Branch Protection
 
 ```bash
-# Python test suite (343 tests: graph+memory 72, backend+MCP 58, sandbox 45, git release 43, eval 34, UI 31, CLI 27, LLM 25, e2e 4, hermetic env 4)
+# Python test suite (350 tests: graph+memory 75, backend+MCP 58, sandbox 48, git release 43, eval 34, UI 32, CLI 27, LLM 25, e2e 4, hermetic env 4)
 uv run pytest -q
 
 # Frontend JavaScript unit tests (22 tests for diff.js and markdown.js; Node >= 22.7)

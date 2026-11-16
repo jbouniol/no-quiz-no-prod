@@ -1702,3 +1702,29 @@ def test_resume_entrypoints_pass_remaining_steps_and_forget_is_bounded(
     tight_wf.request_forget(DEFAULT_USER_ID, thread_id="t-forget-bound")
     tight_wf.confirm_forget("t-forget-bound", approve=False)
     assert forget_limits == [FORGET_RECURSION_LIMIT, FORGET_RECURSION_LIMIT]
+
+
+def test_complete_deliverables_hand_off_without_asking_the_examiner_again(tmp_path: Path, backend: FakeBackend) -> None:
+    """Live DeepSeek V4 Flash regression (n01): the Examiner saw its own quiz call sealed, took it for a failure and
+    re-created the quiz until max_steps, at last sending the sealed marker itself. The harness now hands off as soon
+    as the doc and the quiz of the current attempt exist: the model is never asked whether it is done."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    llm = ScriptedLLM(coder=coder_fix(), examiner=[upsert, quiz, quiz])  # the trailing duplicate must stay unplayed
+    paused = make_workflow(tmp_path, backend, llm).start_run(TASK, thread_id="t-handoff")
+    assert paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"coder": 0, "examiner": 1}
+    assert tools_called(backend).count("create_comprehension_quiz") == 1
+    assert paused.final_answer.startswith("Totals use Decimal ROUND_HALF_UP")  # the Coder's summary is kept
+
+
+def test_words_beside_the_last_deliverable_call_are_not_read_as_a_status(tmp_path: Path, backend: FakeBackend) -> None:
+    """A question written next to the call that completes the deliverables is not a clarification stop."""
+    upsert, quiz = doc_and_quiz(1, "A")
+    aside = turn(
+        *[(c.name, c.args) for c in upsert.tool_calls],
+        text="STATUS: CLARIFICATION_NEEDED\nShould the doc also cite RULE-003?",
+    )
+    llm = ScriptedLLM(single=[*coder_fix("")[:-1], quiz, aside])
+    paused = make_workflow(tmp_path, backend, llm, topology="single").start_run(TASK, thread_id="t-aside")
+    assert paused.stop_reason is None and paused.interrupt is not None and paused.interrupt.kind == "quiz"
+    assert llm.remaining() == {"single": 0}

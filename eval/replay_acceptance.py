@@ -37,6 +37,7 @@ from no_quiz_no_prod.eval.acceptance import (  # noqa: E402
     run_acceptance_on_files,
     with_acceptance_verdict,
 )
+from no_quiz_no_prod.eval.manifest import load_manifest  # noqa: E402
 from no_quiz_no_prod.eval.paths import (  # noqa: E402
     ACCEPTANCE_REPLAY_PATH,
     CAMPAIGNS_DIR,
@@ -97,10 +98,19 @@ def load_all_scenarios() -> dict[str, ScenarioSpec]:
 
 
 def recorded_cohorts(campaigns_dir: Path = CAMPAIGNS_DIR) -> list[Path]:
-    """Discover recorded campaign result files, deduplicating byte-identical copies in favour of ``results_<slug>``."""
+    """Discover recorded campaign result files, deduplicating byte-identical copies in favour of ``results_<slug>``.
+
+    A campaign whose manifest is not stale was scored live against ``eval/acceptance/`` already: it is skipped.
+    """
     if not campaigns_dir.is_dir():
         return []
     discovered = set(campaigns_dir.glob(f"*/{RESULTS_FILENAME}")) | set(campaigns_dir.glob(f"*/{COHORT_RESULTS_GLOB}"))
+    live_scored = set()
+    for parent in {path.parent for path in discovered}:
+        manifest = load_manifest(parent)
+        if manifest is not None and not manifest.stale:
+            live_scored.add(parent)
+    discovered = {path for path in discovered if path.parent not in live_scored}
     ordered = sorted(discovered, key=lambda p: (p.parent.name, p.name == RESULTS_FILENAME, p.name))
     seen_digests: dict[str, bytes] = {}
     kept: list[Path] = []

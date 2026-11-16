@@ -3258,3 +3258,64 @@ a.mono-chip:hover {
   font-size: var(--text-2xs);
   animation: nq-slide-fade-in var(--transition-spring);
 }
+
+/* ---- Onboarding: plain-language gate + Simple/Expert detail level ---- */
+.telemetry-bar__right { display: inline-flex; align-items: center; gap: var(--space-2); white-space: nowrap; min-width: 0; }
+/* a narrow left pane: Home and the view toggle keep their size, a long status is cut with an ellipsis */
+.telemetry-bar__left { flex: 0 1 auto; min-width: 0; }
+#btn-back-to-launch, #btn-detail-toggle { flex-shrink: 0; }
+#thread-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#run-status-pill { min-width: 0; max-width: 100%; }
+#run-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.lock-item__plain { font-size: var(--text-2xs); color: var(--ink-tertiary); margin-top: 2px; }
+.gate-progress { font-size: var(--text-2xs); color: var(--ink-muted); }
+.deploy-missing { margin-top: var(--space-2, 8px); font-size: var(--text-xs); color: var(--ink-tertiary); }
+
+/* the grid shrank to its content: hiding Skills in Simple view made the panes jump width on toggle */
+.studio-grid { width: 100%; }
+
+/* Simple view: keep the story, hide the plumbing. Nothing is removed from the DOM. */
+/* the Studio feed only: the Eval trace drawer has no toggle and always shows the full audit evidence */
+:root[data-detail="simple"] #stream-feed .step-card__ms,
+:root[data-detail="simple"] #stream-feed .step-card__subbadges,
+:root[data-detail="simple"] #stream-feed .step-card__left .pill[data-mcp],
+:root[data-detail="simple"] .telemetry-bar__stats,
+:root[data-detail="simple"] #thread-chip,
+:root[data-detail="simple"] .diff-banner__hashes,
+:root[data-detail="simple"] #memory-panel { display: none; }
+
+/* Expert-only metadata (raw storage, hashes) */
+:root[data-detail="simple"] .expert-only { display: none; }
+
+/* Consecutive steps of one agent, summarised on one line; folded in Simple view */
+.step-group { display: flex; flex-direction: column; gap: var(--space-1); }
+.step-group__summary {
+  display: flex; align-items: center; gap: var(--space-2);
+  width: 100%; padding: var(--space-2) var(--space-2-5);
+  background: var(--bg-surface); border: 1px solid var(--border-hairline); border-radius: var(--radius-sm);
+  font: inherit; font-size: var(--text-xs); color: var(--ink-secondary); text-align: left; cursor: pointer;
+}
+.step-group__summary:hover { border-color: var(--border-subtle); }
+.step-group__chevron { color: var(--ink-muted); transition: transform var(--transition-base); }
+.step-group.is-open .step-group__chevron { transform: rotate(90deg); }
+.step-group__actions { flex: 1; min-width: 0; }
+.step-group__count { color: var(--ink-muted); font-size: var(--text-2xs); white-space: nowrap; }
+.step-group__body { display: flex; flex-direction: column; gap: var(--space-1); }
+:root[data-detail="simple"] .step-group:not(.is-open) .step-group__body { display: none; }
+/* Expert shows every step: the summary is a plain header, not a control */
+:root[data-detail="expert"] .step-group__chevron { visibility: hidden; }
+:root[data-detail="expert"] .step-group__summary { cursor: default; }
+:root[data-detail="expert"] .step-group__summary:hover { border-color: var(--border-hairline); }
+
+/* The release landed */
+.ship-success-card {
+  background: var(--status-deployed-bg);
+  border: 1px solid var(--status-deployed-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2-5) var(--space-3);
+  color: var(--status-deployed-fg);
+  animation: nq-slide-fade-in var(--transition-base);
+}
+.ship-success-card__title { display: flex; align-items: center; gap: var(--space-2); font-weight: var(--weight-semibold); font-size: var(--text-sm); }
+.ship-success-card__body { margin-top: var(--space-1); font-size: var(--text-xs); color: var(--ink-secondary); }
+.ship-success-card__commit { margin-top: var(--space-2); display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-xs); }

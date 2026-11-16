@@ -548,6 +548,62 @@ def test_the_macos_profile_denies_by_default_and_names_only_the_sandbox_root(tmp
     assert '(subpath "/Users")' not in profile and '(subpath "/private/var")' not in profile
 
 
+@needs_isolation
+def test_stdlib_extension_modules_linked_to_outside_libraries_import_in_the_sandbox(tmp_path: Path) -> None:
+    # A Homebrew Python links _sqlite3, _ssl, _lzma and _decimal to other kegs (/opt/homebrew/opt/<pkg>/lib): the
+    # seed's own test_fintech.py imports sqlite3, so a profile that blocks them never lets Lock 1 open.
+    result = isolated(tmp_path, "import sqlite3, ssl, lzma, decimal\nsqlite3.connect(':memory:')\nprint('IMPORTED')")
+    assert result.exit_code == 0 and "IMPORTED" in result.output, result.output
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Mach-O load commands exist on macOS only")
+def test_the_macos_profile_opens_linked_libraries_file_by_file(tmp_path: Path) -> None:
+    profile = sandbox.seatbelt_profile(tmp_path.resolve())
+    for library in sandbox._linked_libraries():
+        assert library.is_absolute() and not str(library).startswith(sandbox.MACOS_SYSTEM_READ_PATHS)
+        resolved = library.resolve()
+        assert f'(literal "{resolved}")' in profile  # the file itself, plus each symlink on its way
+        assert f'(subpath "{library.parent}")' not in profile and f'(subpath "{resolved.parent}")' not in profile
+    assert sandbox._macho_dylibs(tmp_path / "missing") == set()
+    (tmp_path / "not-macho").write_bytes(b"#!/bin/sh\n")
+    assert sandbox._macho_dylibs(tmp_path / "not-macho") == set()
+
+
+def _fake_macho(path: Path, *dylibs: str) -> Path:
+    """A thin 64-bit Mach-O whose only load commands are LC_LOAD_DYLIB of ``dylibs``."""
+    commands = b""
+    for name in dylibs:
+        raw = name.encode() + b"\0"
+        raw += b"\0" * (-(24 + len(raw)) % 8)
+        commands += (0xC).to_bytes(4, "little") + (24 + len(raw)).to_bytes(4, "little") + (24).to_bytes(4, "little")
+        commands += b"\0" * 12 + raw
+    header = [0xFEEDFACF, 0x0100000C, 0, 6, len(dylibs), len(commands), 0, 0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(value.to_bytes(4, "little") for value in header) + commands)
+    return path
+
+
+def test_linked_libraries_follow_loader_path_siblings_of_an_outside_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # libssl in an outside keg loads its sibling libcrypto through @loader_path: both must be opened file by file
+    root, keg = tmp_path / "python", tmp_path / "keg" / "lib"
+    libcrypto = _fake_macho(keg / "libcrypto.dylib")
+    libssl = _fake_macho(keg / "libssl.dylib", "@loader_path/libcrypto.dylib", "@rpath/libinside.dylib")
+    python = _fake_macho(root / "bin" / "python", str(libssl), "/usr/lib/libSystem.B.dylib")
+    monkeypatch.setattr(sandbox.sys, "executable", str(python))
+    monkeypatch.setattr(sandbox, "_interpreter_roots", lambda: [root.resolve()])
+    sandbox._linked_libraries.cache_clear()
+    try:
+        found = {path.resolve() for path in sandbox._linked_libraries()}
+    finally:
+        sandbox._linked_libraries.cache_clear()
+    assert found == {libssl.resolve(), libcrypto.resolve()}
+    truncated = tmp_path / "truncated"
+    truncated.write_bytes(libssl.read_bytes()[:40])  # header plus a cut load command
+    assert sandbox._macho_dylibs(truncated) == set()
+
+
 def test_the_linux_namespace_mounts_only_the_system_the_interpreter_and_the_root(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     argv = sandbox.bubblewrap_argv(root, root / "run")
