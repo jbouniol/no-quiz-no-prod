@@ -6,6 +6,7 @@ opt-out), where the same code must succeed. The second run proves the attack is 
 accident. Remotes are local bare repositories and the only socket is a loopback listener owned by the test.
 """
 
+import fcntl
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -175,6 +177,21 @@ seen.append('PUSHED')
 """
 
 
+def _private_home_entry() -> str:
+    """One real entry of ``Path.home()`` outside the empty tmpfs ancestor stubs ``bubblewrap`` creates to reach the
+    read-only interpreter mounts."""
+    home = Path.home().resolve()
+    mounted = (
+        *sandbox._interpreter_roots(),
+        *sandbox._resolution_trail(Path(sys.executable)),
+        Path(tempfile.gettempdir()).resolve(),
+    )
+    stubs = {path.relative_to(home).parts[0] for path in mounted if path != home and path.is_relative_to(home)}
+    private = sorted(set(os.listdir(home)) - stubs)
+    assert private, f"{home} holds no entry outside the sandbox mount stubs {sorted(stubs)}"
+    return private[0]
+
+
 ATTACKS: Final = (
     Attack(
         "forge the gate ledger",
@@ -223,7 +240,10 @@ ATTACKS: Final = (
     ),
     Attack(
         "list the user's home",
-        lambda _: f"seen.append('HOME' + '=LISTED %d' % len(os.listdir({str(Path.home())!r})))",
+        lambda _: (
+            f"entries = set(os.listdir({str(Path.home())!r}))\n"
+            f"seen.append(('HOME' + '=LISTED') if {_private_home_entry()!r} in entries else 'STUBS_ONLY')"
+        ),
         lambda _, outcome: "HOME=LISTED" in outcome.output_tail,  # the traceback shows the source, not this text
     ),
 )
@@ -418,41 +438,65 @@ def isolated(
     return sandbox.run_isolated(["-c", code], root=resolved, cwd=resolved, limits=limits, isolation=level)
 
 
-def is_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+def _spawn_locked_sleeper(lock_name: str = "child.lock") -> str:
+    """Snippet that spawns a background child holding an exclusive ``flock`` on ``lock_name`` (while inheriting the
+    sandbox stdout pipe) and waits until the child holds the kernel lock before continuing."""
+    child_code = (
+        "import fcntl, pathlib, sys, time; "
+        f"fh = open({lock_name!r}, 'a+'); "
+        "fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); "
+        "pathlib.Path('child.ready').write_text('1'); "
+        "sys.stdout.flush(); "
+        "time.sleep(300)"
+    )
+    return (
+        "import pathlib, subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "deadline = time.monotonic() + 10\n"
+        "while not pathlib.Path('child.ready').exists():\n"
+        "    assert time.monotonic() < deadline, 'child never acquired lock'\n"
+        "    time.sleep(0.02)\n"
+        "print('CHILD_LOCKED', flush=True)\n"
+    )
+
+
+def holds_lock(lock_path: Path) -> bool:
+    """Whether any live process still holds the exclusive ``flock`` on ``lock_path`` (works across Linux ``bubblewrap``
+    PID namespaces as well as macOS ``sandbox-exec`` via the shared bind-mounted inode)."""
+    if not lock_path.exists():
         return False
-    return True
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+
+
+def _assert_lock_released(lock_path: Path, *, timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while holds_lock(lock_path) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not holds_lock(lock_path)
 
 
 @needs_isolation
 def test_a_timeout_kills_the_run_and_the_children_it_spawned(tmp_path: Path) -> None:
-    code = (
-        "import subprocess, sys, time\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
-        "print(child.pid, flush=True)\n"
-        "time.sleep(300)\n"
-    )
+    code = _spawn_locked_sleeper() + "time.sleep(300)\n"
     result = isolated(tmp_path, code, timeout_s=2.0)
     assert result.timed_out and result.exit_code == sandbox.TIMEOUT_EXIT_CODE and result.duration_s < 15
-    grandchild = int(result.output.split()[0])
-    deadline = time.monotonic() + 5
-    while is_alive(grandchild) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert not is_alive(grandchild)
+    assert "CHILD_LOCKED" in result.output and (tmp_path / "child.ready").is_file()
+    _assert_lock_released(tmp_path / "child.lock")
 
 
 @needs_isolation
 def test_a_child_left_behind_by_a_finished_run_is_killed_too(tmp_path: Path) -> None:
-    code = (
-        "import subprocess, sys\n"
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
-        "print(child.pid, flush=True)\n"
-    )
+    code = _spawn_locked_sleeper()
     result = isolated(tmp_path, code)
     assert result.exit_code == 0 and result.duration_s < 15  # the open pipe of the child does not hold the run
-    assert not is_alive(int(result.output.split()[0]))
+    assert "CHILD_LOCKED" in result.output and (tmp_path / "child.ready").is_file()
+    _assert_lock_released(tmp_path / "child.lock")
 
 
 @needs_isolation
