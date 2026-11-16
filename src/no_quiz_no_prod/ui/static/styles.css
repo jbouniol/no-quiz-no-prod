@@ -3275,9 +3275,10 @@ a.mono-chip:hover {
 .studio-grid { width: 100%; }
 
 /* Simple view: keep the story, hide the plumbing. Nothing is removed from the DOM. */
-:root[data-detail="simple"] .step-card__ms,
-:root[data-detail="simple"] .step-card__subbadges,
-:root[data-detail="simple"] .step-card__left .pill[data-mcp],
+/* the Studio feed only: the Eval trace drawer has no toggle and always shows the full audit evidence */
+:root[data-detail="simple"] #stream-feed .step-card__ms,
+:root[data-detail="simple"] #stream-feed .step-card__subbadges,
+:root[data-detail="simple"] #stream-feed .step-card__left .pill[data-mcp],
 :root[data-detail="simple"] .telemetry-bar__stats,
 :root[data-detail="simple"] #thread-chip,
 :root[data-detail="simple"] .diff-banner__hashes,
@@ -3301,7 +3302,10 @@ a.mono-chip:hover {
 .step-group__count { color: var(--ink-muted); font-size: var(--text-2xs); white-space: nowrap; }
 .step-group__body { display: flex; flex-direction: column; gap: var(--space-1); }
 :root[data-detail="simple"] .step-group:not(.is-open) .step-group__body { display: none; }
+/* Expert shows every step: the summary is a plain header, not a control */
 :root[data-detail="expert"] .step-group__chevron { visibility: hidden; }
+:root[data-detail="expert"] .step-group__summary { cursor: default; }
+:root[data-detail="expert"] .step-group__summary:hover { border-color: var(--border-hairline); }
 
 /* The release landed */
 .ship-success-card {

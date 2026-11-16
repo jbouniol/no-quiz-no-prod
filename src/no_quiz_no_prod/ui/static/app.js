@@ -10,6 +10,7 @@ import {
   renderNotionMarkdown,
   sanitizeHref,
 } from "./markdown.js";
+import { gateMissingText, STOP_REASON_LABELS, summarizeToolActions } from "./studio-text.js";
 
 const DEFAULT_USER_ID = "dev_default";
 
@@ -65,19 +66,6 @@ const AGENT_DISPLAY_NAMES = {
   single: "agent",
   human: "human",
   system: "system",
-};
-
-// what a run's stop reason means, in the words of the person using the Studio
-const STOP_REASON_LABELS = {
-  completed: "Shipped to prod",
-  clarification_needed: "The agent has a question",
-  refused: "Refused: nothing changed",
-  quiz_failed: "Blocked: quiz failed twice",
-  human_rejected: "You rejected the release",
-  release_failed: "Push failed",
-  max_steps: "Stopped: step budget used up",
-  api_error: "Model API error",
-  harness_error: "Internal error",
 };
 
 const LOCK_DESCRIPTIONS = [
@@ -722,6 +710,7 @@ const DETAIL_STORAGE_KEY = "nqnp.detail";
 function applyDetailMode(mode) {
   const next = mode === "expert" ? "expert" : "simple";
   document.documentElement.dataset.detail = next;
+  document.querySelectorAll(".step-group__summary").forEach((summary) => syncStepGroupSummary(summary, next));
   const btn = document.getElementById("btn-detail-toggle");
   if (btn) {
     btn.setAttribute("aria-pressed", String(next === "expert"));
@@ -1348,13 +1337,7 @@ function renderDeployPanel() {
 
   const missingLabels = LOCK_DESCRIPTIONS.filter((item) => !isLockSatisfied(item)).map((item) => item.missing);
   const doneCount = LOCK_DESCRIPTIONS.length - missingLabels.length;
-  const missingText = treesIdentical
-    ? "Nothing to ship yet: ask the agent for a change on the left."
-    : locks?.blocked
-      ? "This change is blocked and cannot ship. Start a new thread to try again."
-      : missingLabels.length
-        ? `Still needed: ${missingLabels.join(", ")}.`
-        : "All checks done.";
+  const missingText = gateMissingText({ treesIdentical, blocked: Boolean(locks?.blocked), missing: missingLabels });
 
   // A failed push revokes the sign-off server-side: the gate is back to "ready for approval" for the same diff.
   const pending = store.pendingRelease;
@@ -1579,8 +1562,7 @@ function appendStepToFeed(step) {
   const agent = step.agent || "system";
   let group = feed.lastElementChild;
   if (!group || !group.classList.contains("step-group") || group.dataset.agent !== agent) {
-    // a new agent takes over: fold the earlier groups the person did not open themselves
-    feed.querySelectorAll(".step-group.is-open:not([data-user-open])").forEach((g) => setStepGroupOpen(g, false));
+    foldUntouchedStepGroups(feed);
     group = document.createElement("section");
     group.className = "step-group";
     group.dataset.agent = agent;
@@ -1596,33 +1578,32 @@ function appendStepToFeed(step) {
   feed.scrollTop = feed.scrollHeight;
 }
 
-// what each tool call did, in plain words, for the Simple view's one-line summary of an agent's steps
-const TOOL_PLAIN_LABELS = {
-  read_notion_rule: "read the rules",
-  search_notion_rules: "searched the rules",
-  read_code_file: "read code",
-  list_workspace_files: "listed files",
-  write_staging_file: "edited code",
-  run_staging_tests: "ran the tests",
-  get_staging_diff: "checked the diff",
-  upsert_ship_log_doc: "wrote the Ship Log",
-  create_comprehension_quiz: "wrote the quiz",
-  deploy_to_production: "deployed",
-  read_audit_credentials: "read credentials",
-};
+// In Expert every step is shown, so the summary is a header: disabled, and not announced as a folding control.
+function syncStepGroupSummary(summary, mode = document.documentElement.dataset.detail) {
+  const expert = mode === "expert";
+  summary.disabled = expert;
+  if (expert) {
+    summary.removeAttribute("aria-expanded");
+  } else {
+    summary.setAttribute("aria-expanded", String(summary.closest(".step-group").classList.contains("is-open")));
+  }
+}
+
+// fold the step groups the person did not open themselves (a new agent takes over, or the agent's turn ended)
+function foldUntouchedStepGroups(feed) {
+  feed.querySelectorAll(".step-group.is-open:not([data-user-open])").forEach((g) => setStepGroupOpen(g, false));
+}
 
 function setStepGroupOpen(group, open) {
   group.classList.toggle("is-open", open);
-  group.querySelector(".step-group__summary")?.setAttribute("aria-expanded", String(open));
+  const summary = group.querySelector(".step-group__summary");
+  if (summary) {
+    syncStepGroupSummary(summary);
+  }
 }
 
 function renderStepGroupSummary(group) {
-  const counts = new Map();
-  for (const tool of (group.dataset.tools || "").split(",").filter(Boolean)) {
-    const label = TOOL_PLAIN_LABELS[tool] || tool;
-    counts.set(label, (counts.get(label) || 0) + 1);
-  }
-  const actions = [...counts].map(([label, n]) => (n > 1 ? `${label} ×${n}` : label)).join(", ");
+  const actions = summarizeToolActions((group.dataset.tools || "").split(","));
   const errors = group.querySelectorAll(".step-card--error").length;
   const total = group.querySelectorAll(".step-card").length;
   const agent = group.dataset.agent;
@@ -1681,6 +1662,8 @@ function appendAgentTurnToFeed({ text, stopReason, interrupt, isError = false })
     return;
   }
   const feed = $("stream-feed");
+  // the turn is over: its steps fold to their summary line too (single topology, or the Examiner before the quiz)
+  foldUntouchedStepGroups(feed);
   const isClarify = stopReason === "clarification_needed";
   const cls = [
     "agent-turn-card",

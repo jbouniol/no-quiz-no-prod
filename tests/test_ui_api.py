@@ -633,11 +633,13 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
     assert 'id="home-prompt-card"' in index_resp.text
     assert 'id="workbench-split"' in index_resp.text
     assert 'id="api-popover"' in index_resp.text
+    # the Simple/Expert toggle sits in the Studio header and starts on the Simple view
+    assert re.search(r'id="btn-detail-toggle"[^>]*aria-pressed="false"[^>]*>View: Simple<', index_resp.text)
     assert "/static/tokens.css" in index_resp.text
     assert "/static/styles.css" in index_resp.text
     assert "/static/app.js" in index_resp.text
 
-    for asset in ("tokens.css", "styles.css", "app.js", "diff.js", "markdown.js"):
+    for asset in ("tokens.css", "styles.css", "app.js", "diff.js", "markdown.js", "studio-text.js"):
         res = client.get(f"/static/{asset}")
         assert res.status_code == 200, f"Failed to serve /static/{asset}"
         assert len(res.text) > 100
@@ -651,7 +653,7 @@ def test_static_assets_and_token_purity(studio_env: tuple[TestClient, StubSandbo
 
     # Enforce zero hardcoded hex palettes & zero decorative emoji slop in JS/HTML files
     banned_emojis = ("🛡️", "📄", "🎯", "⚡", "🚀", "🛑", "🧠", "🔒", "🗑", "🔐", "↺", "▶")
-    for name in ("index.html", "app.js", "diff.js", "markdown.js"):
+    for name in ("index.html", "app.js", "diff.js", "markdown.js", "studio-text.js"):
         content = (STATIC_DIR / name).read_text(encoding="utf-8")
         assert re.search(r"#[0-9a-fA-F]{6}\b", content) is None, f"Hardcoded hex found in {name}"
         for emoji in banned_emojis:
