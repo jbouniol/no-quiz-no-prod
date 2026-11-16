@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import pytest
@@ -93,6 +93,7 @@ from no_quiz_no_prod.graph.workflow import (
     NoQuizWorkflow,
     ThreadStateError,
     WorkflowOutcome,
+    WorkflowState,
     _parse_deploy_decision,
     close_studio_workflows,
     make_graph,
@@ -603,14 +604,16 @@ def test_the_graph_moves_to_the_quiz_once_the_doc_and_quiz_exist(tmp_path: Path,
     assert grade.passed and gated.interrupt is not None and gated.interrupt.kind == "deploy_approval"
 
     # the route itself, without a model: a failed quiz call, or a quiz of another diff, goes back to the agent
-    route = NoQuizWorkflow._route_tools
+    def route(state: dict[str, Any]) -> str:
+        return NoQuizWorkflow._route_tools(cast(WorkflowState, state))
+
     ready = {"ship_log": {"diff_sha256": "d1", "doc_version": "v1"}, "quiz": {"diff_sha256": "d1", "attempt": 1}}
-    base = {"phase": "examiner", "attempt": 1, **ready}
+    base: dict[str, Any] = {"phase": "examiner", "attempt": 1, **ready}
     assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "handoff"
     assert route({**base, "trace": [{"tool": "create_comprehension_quiz", "ok": False}]}) == "agent"
     assert route({**base, "trace": [{"tool": "read_code_file", "ok": True}]}) == "agent"
     assert route({**base, "phase": "coder", "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
-    stale = {**base, "ship_log": {"diff_sha256": "d0", "doc_version": "v1"}}
+    stale: dict[str, Any] = {**base, "ship_log": {"diff_sha256": "d0", "doc_version": "v1"}}
     assert route({**stale, "trace": [{"tool": "create_comprehension_quiz", "ok": True}]}) == "agent"
     assert route({**base, "budget_exhausted": True, "trace": []}) == "give_up"
 
