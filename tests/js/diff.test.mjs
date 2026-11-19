@@ -99,3 +99,18 @@ test("escapeHtml and diffFileDomId are safe on odd input", () => {
   assert.equal(escapeHtml(null), "");
   assert.equal(diffFileDomId('a/b "c".py', 2), "diff-file-2-a-b--c--py");
 });
+
+test("hunk headers render human-readable line ranges and file cards honor collapsedPaths", () => {
+  const file = {
+    path: "orders.py",
+    additions: 2,
+    deletions: 1,
+    unified_diff: "@@ -1,3 +1,4 @@ def calc()\n keep\n-old\n+new\n+more\n",
+  };
+  const openHtml = renderDiffFiles([file], "unified");
+  assert.ok(openHtml.includes("Lines 1–4 · def calc()"));
+  assert.ok(openHtml.includes('aria-expanded="true"'));
+  const collapsedHtml = renderDiffFiles([file], "unified", { collapsedPaths: new Set(["orders.py"]) });
+  assert.ok(collapsedHtml.includes('aria-expanded="false"'));
+  assert.ok(collapsedHtml.includes("is-collapsed"));
+});

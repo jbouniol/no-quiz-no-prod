@@ -230,14 +230,28 @@ export function parseUnifiedDiff(unifiedText) {
   return hunks;
 }
 
+function formatHunkHeader(rawHeader) {
+  const match = String(rawHeader || "").match(HUNK_HEADER_RE);
+  if (!match) {
+    return String(rawHeader || "");
+  }
+  const newStart = Number.parseInt(match[3], 10);
+  const newCount = match[4] !== undefined ? Number.parseInt(match[4], 10) : 1;
+  const newEnd = newCount > 0 ? newStart + newCount - 1 : newStart;
+  const rangeLabel = newEnd > newStart ? `Lines ${newStart}–${newEnd}` : `Line ${newStart}`;
+  const context = (match[5] || "").trim();
+  return context ? `${rangeLabel} · ${context}` : rangeLabel;
+}
+
 function renderUnifiedTable(hunks) {
   const trs = [];
   for (const hunk of hunks) {
+    const label = formatHunkHeader(hunk.header);
     trs.push(
-      `<tr class="diff-row diff-row--hunk">` +
-        `<td class="diff-gutter diff-gutter--hunk" colspan="2">@@</td>` +
+      `<tr class="diff-row diff-row--hunk" title="${escapeHtml(hunk.header)}">` +
+        `<td class="diff-gutter diff-gutter--hunk" colspan="2">···</td>` +
         `<td class="diff-sign diff-sign--hunk"></td>` +
-        `<td class="diff-code diff-code--hunk">${escapeHtml(hunk.header)}</td>` +
+        `<td class="diff-code diff-code--hunk">${escapeHtml(label)}</td>` +
       `</tr>`
     );
     for (const row of hunk.rows) {
@@ -260,10 +274,11 @@ function renderUnifiedTable(hunks) {
 function renderSplitTable(hunks) {
   const trs = [];
   for (const hunk of hunks) {
+    const label = formatHunkHeader(hunk.header);
     trs.push(
-      `<tr class="diff-row diff-row--hunk">` +
-        `<td class="diff-gutter diff-gutter--hunk">@@</td>` +
-        `<td class="diff-code diff-code--hunk" colspan="3">${escapeHtml(hunk.header)}</td>` +
+      `<tr class="diff-row diff-row--hunk" title="${escapeHtml(hunk.header)}">` +
+        `<td class="diff-gutter diff-gutter--hunk">···</td>` +
+        `<td class="diff-code diff-code--hunk" colspan="3">${escapeHtml(label)}</td>` +
       `</tr>`
     );
     let idx = 0;
@@ -309,7 +324,12 @@ function renderSplitTable(hunks) {
       }
     }
   }
-  return `<table class="diff-table diff-table--split" aria-label="Side-by-side prod vs staging code diff"><tbody>${trs.join("")}</tbody></table>`;
+  const head =
+    `<thead><tr class="diff-split-head">` +
+      `<th colspan="2" scope="col">Before (prod)</th>` +
+      `<th colspan="2" scope="col" class="diff-split-divider">After (staging)</th>` +
+    `</tr></thead>`;
+  return `<table class="diff-table diff-table--split" aria-label="Side-by-side prod vs staging code diff">${head}<tbody>${trs.join("")}</tbody></table>`;
 }
 
 const FILE_CODE_SVG =
@@ -318,6 +338,11 @@ const FILE_CODE_SVG =
   `<polyline points="14 2 14 8 20 8"></polyline>` +
   `<path d="m10 13-2 2 2 2"></path>` +
   `<path d="m14 17 2-2-2-2"></path>` +
+  `</svg>`;
+
+const CHEVRON_SVG =
+  `<svg class="diff-file-card__chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
+  `<path d="m6 9 6 6 6-6"></path>` +
   `</svg>`;
 
 /**
@@ -334,15 +359,18 @@ export function diffFileDomId(path, index) {
  * Render all changed FileDiff cards in either "unified" or "split" mode.
  * @param {Array<{path: string, additions: number, deletions: number, unified_diff: string}>} files
  * @param {"unified" | "split"} mode
+ * @param {{ collapsedPaths?: Set<string> }} [options]
  * @returns {string}
  */
-export function renderDiffFiles(files, mode = "unified") {
+export function renderDiffFiles(files, mode = "unified", options = {}) {
   if (!Array.isArray(files) || files.length === 0) {
     return "";
   }
+  const collapsed = options.collapsedPaths instanceof Set ? options.collapsedPaths : new Set();
   return files
     .map((file, index) => {
       const safeId = diffFileDomId(file.path, index);
+      const isCollapsed = collapsed.has(file.path);
       const hunks = parseUnifiedDiff(file.unified_diff || "");
       const bodyHtml =
         hunks.length === 0
@@ -350,20 +378,22 @@ export function renderDiffFiles(files, mode = "unified") {
           : mode === "split"
             ? renderSplitTable(hunks)
             : renderUnifiedTable(hunks);
+      const addCount = Number(file.additions || 0);
+      const delCount = Number(file.deletions || 0);
       return (
-        `<section class="diff-file-card" id="${safeId}" data-file-path="${escapeHtml(file.path)}">` +
-          `<header class="diff-file-card__header">` +
+        `<section class="diff-file-card${isCollapsed ? " is-collapsed" : ""}" id="${safeId}" data-file-path="${escapeHtml(file.path)}">` +
+          `<button type="button" class="diff-file-card__header" data-diff-toggle="${escapeHtml(file.path)}" aria-expanded="${String(!isCollapsed)}">` +
             `<div class="diff-file-card__title">` +
+              `<span aria-hidden="true">${CHEVRON_SVG}</span>` +
               `<span class="diff-file-card__icon" aria-hidden="true">${FILE_CODE_SVG}</span>` +
               `<span class="mono-text">${escapeHtml(file.path)}</span>` +
-              `<span class="diff-file-card__scope">prod..staging</span>` +
             `</div>` +
             `<div class="diff-file-card__stats tabular-nums">` +
-              `<span class="diff-stat-add">+${Number(file.additions || 0)}</span>` +
-              `<span class="diff-stat-del">−${Number(file.deletions || 0)}</span>` +
+              (addCount > 0 ? `<span class="diff-stat-pill diff-stat-pill--add">+${addCount}</span>` : "") +
+              (delCount > 0 ? `<span class="diff-stat-pill diff-stat-pill--del">−${delCount}</span>` : "") +
             `</div>` +
-          `</header>` +
-          `<div class="diff-file-card__scroll">${bodyHtml}</div>` +
+          `</button>` +
+          `<div class="diff-file-card__scroll"${isCollapsed ? " hidden" : ""}>${bodyHtml}</div>` +
         `</section>`
       );
     })

@@ -383,10 +383,10 @@ Suggested reading order: `contracts.py` → `backend/workspace.py` & `backend/sa
 # Python test suite (350 tests: graph+memory 75, backend+MCP 58, sandbox 48, git release 43, eval 34, UI 32, CLI 27, LLM 25, e2e 4, hermetic env 4)
 uv run pytest -q
 
-# Frontend JavaScript unit tests (22 tests for diff.js and markdown.js; Node >= 22.7)
+# Frontend JavaScript unit tests (27 tests for diff.js, markdown.js and studio-text.js; Node >= 22.7)
 node --test "tests/js/*.test.mjs"
 
-# Lint & formatting (100 Python files) and static type checks (55 typed source/test files)
+# Lint & formatting (104 Python files) and static type checks (55 typed source/test files)
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 
 # Install local git hooks matching CI (.pre-commit-config.yaml)

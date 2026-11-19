@@ -281,9 +281,9 @@
   --space-12: 3rem;        /* 48px */
 
   --header-height: 64px;
-  --pane-left-width: 356px;
+  --pane-left-width: 308px;
   --pane-center-min: 440px;
-  --pane-right-width: 360px;
+  --pane-right-width: 324px;
   --studio-grid-columns: var(--pane-left-width) minmax(var(--pane-center-min), 1fr) var(--pane-right-width);
 
   /* Border Radii */

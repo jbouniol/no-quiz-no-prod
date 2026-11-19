@@ -95,6 +95,11 @@ SECONDARY_OPENROUTER_MODELS: Final[tuple[tuple[str, str], ...]] = (
     ("openai/gpt-4o-mini", "OpenRouter · GPT-4o Mini"),
     ("anthropic/claude-sonnet-4.5", "OpenRouter · Claude Sonnet 4.5"),
 )
+ANTHROPIC_CATALOGUE_MODELS: Final[tuple[tuple[str, str], ...]] = (
+    ("claude-sonnet-5-5", "Anthropic · Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Anthropic · Claude Haiku 5.5"),
+    ("claude-opus-5-5", "Anthropic · Claude Opus 5.5"),
+)
 ARTIFACT_TRIGGER_TOOLS: Final[frozenset[str]] = frozenset(
     {
         "write_staging_file",
@@ -449,35 +454,29 @@ def _build_models_catalogue(settings: RuntimeSettings) -> dict[str, Any]:
     default_model = (
         settings.openrouter_model if providers["openrouter"] or not providers["anthropic"] else settings.anthropic_model
     )
-    options: list[dict[str, Any]] = [
-        {
-            "id": settings.openrouter_model,
-            "label": f"OpenRouter · {settings.openrouter_model}",
-            "provider": "openrouter",
-            "enabled": providers["openrouter"],
-        }
-    ]
-    seen_ids = {settings.openrouter_model}
-    for model_id, label in SECONDARY_OPENROUTER_MODELS:
-        if model_id not in seen_ids:
-            options.append(
-                {
-                    "id": model_id,
-                    "label": label,
-                    "provider": "openrouter",
-                    "enabled": providers["openrouter"],
-                }
-            )
-            seen_ids.add(model_id)
-    if settings.anthropic_model not in seen_ids:
+    options: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def _append_option(model_id: str, label: str, provider: Literal["openrouter", "anthropic"]) -> None:
+        if model_id in seen_ids:
+            return
         options.append(
             {
-                "id": settings.anthropic_model,
-                "label": f"Anthropic · {settings.anthropic_model}",
-                "provider": "anthropic",
-                "enabled": providers["anthropic"],
+                "id": model_id,
+                "label": label,
+                "provider": provider,
+                "enabled": providers[provider],
             }
         )
+        seen_ids.add(model_id)
+
+    _append_option(settings.openrouter_model, f"OpenRouter · {settings.openrouter_model}", "openrouter")
+    for model_id, label in SECONDARY_OPENROUTER_MODELS:
+        _append_option(model_id, label, "openrouter")
+    for model_id, label in ANTHROPIC_CATALOGUE_MODELS:
+        _append_option(model_id, label, "anthropic")
+    _append_option(settings.anthropic_model, f"Anthropic · {settings.anthropic_model}", "anthropic")
+
     return {
         "default_model": default_model,
         "default_topology": "dual",

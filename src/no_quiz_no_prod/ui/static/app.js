@@ -3,7 +3,7 @@
  * Zero-build ES2023 module consuming /api/* REST + SSE endpoints.
  */
 
-import { diffFileDomId, escapeHtml, renderDiffFiles } from "./diff.js";
+import { diffFileDomId, escapeHtml, renderDiffFiles } from "./diff.js?v=9";
 import {
   extractRemediationCallout,
   renderInlineMarkdown,
@@ -146,21 +146,6 @@ function svgIcon(name, size = 14) {
   }
 }
 
-function providerBrandSvg(modelId) {
-  const lower = String(modelId || "").toLowerCase();
-  const attrs = `width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"`;
-  if (lower.includes("claude") || lower.includes("anthropic")) {
-    return `<svg ${attrs}><path d="M12 4 5 20h3.2l1.5-3.6h4.6L15.8 20H19L12 4Z"></path><path d="M10.4 13.5h3.2"></path></svg>`;
-  }
-  if (lower.includes("gemini") || lower.includes("google")) {
-    return `<svg ${attrs}><path d="M12 3c1.5 5.2 3.8 7.5 9 9-5.2 1.5-7.5 3.8-9 9-1.5-5.2-3.8-7.5-9-9 5.2-1.5 7.5-3.8 9-9Z"></path></svg>`;
-  }
-  if (lower.includes("deepseek")) {
-    return `<svg ${attrs}><circle cx="12" cy="12" r="8"></circle><path d="M8 12c1.5-2.5 6.5-2.5 8 0-1.5 2.5-6.5 2.5-8 0Z"></path></svg>`;
-  }
-  return `<svg ${attrs}><circle cx="6" cy="12" r="2.5"></circle><circle cx="18" cy="6" r="2.5"></circle><circle cx="18" cy="18" r="2.5"></circle><path d="m8.3 10.9 7.4-3.8M8.3 13.1l7.4 3.8"></path></svg>`;
-}
-
 // ---- Centralized Reactive Platform State ----------------------------------
 const store = {
   mode: "studio", // "studio" | "explorer"
@@ -169,12 +154,17 @@ const store = {
   mobilePane: "left",
   centerTab: "diff", // "diff" | "notion"
   diffMode: "unified",
-  scenariosOpen: false,
+  diffWrap: true,
+  centerExpanded: false,
+  collapsedDiffFiles: new Set(),
   pytestDrawerOpen: false,
   activeRuleCode: null,
 
   apiPopoverOpen: false,
+  modelPickerOpen: false,
+  cohortPickerOpen: false,
   activeKeyProvider: "openrouter",
+  providerRoute: "auto", // "auto" | "anthropic" | "openrouter"
   isSavingApiKey: false,
   providers: { openrouter: false, anthropic: false, notion: false },
 
@@ -538,33 +528,84 @@ function wireStepCardContainer(container) {
   });
 }
 
-// ---- Header, Brand Provider Icon & .env Popover ---------------------------
-function renderProviderBrandIcon() {
-  const modelVal = $("model-select").value || "";
-  $("provider-brand-icon").innerHTML = providerBrandSvg(modelVal);
+// ---- Header & .env Popover -------------------------------------------------
+const PROVIDER_ROUTE_STORAGE_KEY = "nqnp.provider_route";
+
+function normalizeProviderRoute(value) {
+  return value === "anthropic" || value === "openrouter" ? value : "auto";
+}
+
+function isProviderRouteReady(route) {
+  if (route === "anthropic") {
+    return Boolean(store.providers.anthropic);
+  }
+  if (route === "openrouter") {
+    return Boolean(store.providers.openrouter);
+  }
+  return true;
+}
+
+function syncProviderRouteUi() {
+  const effectiveRoute = isProviderRouteReady(store.providerRoute) ? store.providerRoute : "auto";
+  document.querySelectorAll("[data-route-val]").forEach((btn) => {
+    const route = btn.dataset.routeVal;
+    const isActive = route === effectiveRoute;
+    btn.classList.toggle("is-active", isActive);
+    btn.setAttribute("aria-pressed", String(isActive));
+    btn.disabled = route !== "auto" && !isProviderRouteReady(route);
+  });
+}
+
+function setModelPickerOpen(open) {
+  store.modelPickerOpen = Boolean(open);
+  $("model-picker-menu").hidden = !store.modelPickerOpen;
+  $("btn-model-picker").setAttribute("aria-expanded", String(store.modelPickerOpen));
+  if (store.modelPickerOpen) {
+    setApiPopoverOpen(false);
+    setCohortPickerOpen(false);
+    syncProviderRouteUi();
+  }
+}
+
+function setCohortPickerOpen(open) {
+  store.cohortPickerOpen = Boolean(open);
+  $("cohort-picker-menu").hidden = !store.cohortPickerOpen;
+  $("btn-cohort-picker").setAttribute("aria-expanded", String(store.cohortPickerOpen));
+  if (store.cohortPickerOpen) {
+    setApiPopoverOpen(false);
+    setModelPickerOpen(false);
+  }
+}
+
+function setProviderRoute(route) {
+  const next = normalizeProviderRoute(route);
+  store.providerRoute = next;
+  try {
+    localStorage.setItem(PROVIDER_ROUTE_STORAGE_KEY, next);
+  } catch (_err) {
+    /* storage unavailable */
+  }
+  renderHeaderControls();
+  renderApiPopoverState();
+}
+
+function initProviderRoute() {
+  try {
+    store.providerRoute = normalizeProviderRoute(localStorage.getItem(PROVIDER_ROUTE_STORAGE_KEY));
+  } catch (_err) {
+    store.providerRoute = "auto";
+  }
 }
 
 function renderApiPopoverState() {
   const anyLlm = Boolean(store.providers.openrouter || store.providers.anthropic);
   const dot = $("api-status-dot");
-  const label = $("api-status-label");
   dot.classList.toggle("is-ready", anyLlm);
-  const activeCount =
-    Number(Boolean(store.providers.openrouter)) +
-    Number(Boolean(store.providers.anthropic)) +
-    Number(Boolean(store.providers.notion));
-  label.textContent = `API keys · ${activeCount}/3`;
-  const missingKeys = [
-    ["openrouter", "OpenRouter"],
-    ["anthropic", "Anthropic"],
-    ["notion", "Notion"],
-  ]
-    .filter(([key]) => !store.providers[key])
-    .map(([, name]) => name);
   $("btn-api-popover").setAttribute(
     "title",
-    missingKeys.length ? `Missing: ${missingKeys.join(", ")}. Click to add a key.` : "All API keys are set."
+    anyLlm ? "Environment & API keys" : "Configure an LLM API key"
   );
+  syncProviderRouteUi();
 
   $("api-provider-badges").innerHTML = ["openrouter", "anthropic", "notion"]
     .map((key) => {
@@ -609,6 +650,8 @@ function setApiPopoverOpen(open) {
   $("api-popover").hidden = !store.apiPopoverOpen;
   $("btn-api-popover").setAttribute("aria-expanded", String(store.apiPopoverOpen));
   if (store.apiPopoverOpen) {
+    setModelPickerOpen(false);
+    setCohortPickerOpen(false);
     renderApiPopoverState();
     $("api-key-input").focus();
   }
@@ -690,6 +733,41 @@ function compactModelLabel(opt) {
   return `${slug}${suffix}`;
 }
 
+function formatModelDisplay(opt) {
+  const id = String(opt.id || "");
+  const rawLabel = String(opt.label || "");
+  const parts = rawLabel.split("·").map((part) => part.trim()).filter(Boolean);
+  let title = parts.length > 1 ? parts.slice(1).join(" · ") : compactModelLabel(opt);
+  if (title.includes("/") || title.startsWith("~") || /^[a-z0-9.-]+$/.test(title)) {
+    const slug = (id.replace(/^~/, "").split("/").pop() || id)
+      .replace(/-latest$/, "")
+      .replace(/(\d)-(\d)(?=$|-)/g, "$1.$2");
+    title = slug
+      .split("-")
+      .map((part) => (part === "gpt" ? "GPT" : part === "deepseek" ? "DeepSeek" : part.charAt(0).toUpperCase() + part.slice(1)))
+      .join(" ");
+  }
+  const providerName = opt.provider === "anthropic" ? "Anthropic" : "OpenRouter";
+  const subtitle = opt.enabled ? providerName : `${providerName} · unset`;
+  return { title, subtitle };
+}
+
+function renderCustomOptionButton({ value, title, subtitle, selected, disabled = false, attrName }) {
+  const checkHtml = selected ? `<span class="custom-select__check">${svgIcon("check", 13)}</span>` : "";
+  const metaHtml = subtitle ? `<span class="custom-select__option-meta">${escapeHtml(subtitle)}</span>` : "";
+  return (
+    `<button type="button" role="option" aria-selected="${String(selected)}" ` +
+      `class="custom-select__option${selected ? " is-selected" : ""}" ` +
+      `${attrName}="${escapeHtml(value)}"${disabled ? " disabled" : ""}>` +
+      `<span class="custom-select__option-copy">` +
+        `<span class="custom-select__option-title">${escapeHtml(title)}</span>` +
+        metaHtml +
+      `</span>` +
+      checkHtml +
+    `</button>`
+  );
+}
+
 function syncHeroTopologyUi(topoVal) {
   const val = topoVal === "single" ? "single" : "dual";
   const sel = $("topology-select");
@@ -741,28 +819,56 @@ function initDetailMode() {
 }
 
 function renderHeaderControls() {
+  syncProviderRouteUi();
   if (store.models) {
     const modelSelect = $("model-select");
     const previous = modelSelect.value;
-    modelSelect.innerHTML = (store.models.options || [])
+    const allOptions = store.models.options || [];
+    const forcedRoute = isProviderRouteReady(store.providerRoute) ? store.providerRoute : "auto";
+    const visibleOptions =
+      forcedRoute === "auto"
+        ? allOptions
+        : allOptions.filter((opt) => opt.provider === forcedRoute);
+    const renderedOptions = visibleOptions.length ? visibleOptions : allOptions;
+
+    modelSelect.innerHTML = renderedOptions
       .map((opt) => {
         const disabledAttr = opt.enabled ? "" : " disabled";
         return `<option value="${escapeHtml(opt.id)}"${disabledAttr}>${escapeHtml(compactModelLabel(opt))}</option>`;
       })
       .join("");
-    const validIds = new Set(
-      (store.models.options || []).filter((o) => o.enabled).map((o) => o.id)
-    );
+    const validIds = new Set(renderedOptions.filter((o) => o.enabled).map((o) => o.id));
     if (previous && validIds.has(previous)) {
       modelSelect.value = previous;
-    } else if (store.models.default_model) {
+    } else if (forcedRoute === "auto" && store.models.default_model && validIds.has(store.models.default_model)) {
       modelSelect.value = store.models.default_model;
+    } else if (validIds.size > 0) {
+      modelSelect.value = validIds.values().next().value;
     }
     modelSelect.title = modelSelect.value || "LLM Model";
+
+    const selectedOpt =
+      renderedOptions.find((o) => o.id === modelSelect.value) ||
+      renderedOptions[0] || { id: modelSelect.value, label: modelSelect.value, provider: "anthropic", enabled: true };
+    const selectedDisplay = formatModelDisplay(selectedOpt);
+    $("model-picker-label").textContent = selectedDisplay.title;
+    $("btn-model-picker").title = `${selectedDisplay.title} (${selectedDisplay.subtitle})`;
+    $("model-picker-list").innerHTML = renderedOptions
+      .map((opt) => {
+        const { title, subtitle } = formatModelDisplay(opt);
+        return renderCustomOptionButton({
+          value: opt.id,
+          title,
+          subtitle,
+          selected: opt.id === modelSelect.value,
+          disabled: !opt.enabled,
+          attrName: "data-model-opt",
+        });
+      })
+      .join("");
   }
 
   syncHeroTopologyUi($("topology-select").value || store.models?.default_topology || "dual");
-  renderProviderBrandIcon();
 
   const hubLink = $("link-notion-hub");
   const hubDot = $("notion-hub-dot");
@@ -894,20 +1000,12 @@ function renderTelemetryBar() {
 }
 
 function renderScenarioChips() {
-  // 1. Minimalist 1-line borderless suggestion rows (french-data-rag pattern)
+  // Minimalist 1-line borderless suggestion rows on the launch stage
   $("hero-scenario-list").innerHTML = CANONICAL_SCENARIOS.map(
     (sc) =>
       `<button type="button" class="suggestion-row" data-hero-scenario-id="${escapeHtml(sc.id)}">` +
         `<span class="suggestion-row__icon">${svgIcon(sc.icon, 15)}</span>` +
         `<span class="suggestion-row__title">${escapeHtml(sc.title)}</span>` +
-      `</button>`
-  ).join("");
-
-  // 2. Compact preset chips inside workbench drawer
-  $("scenario-chips").innerHTML = CANONICAL_SCENARIOS.map(
-    (sc) =>
-      `<button type="button" class="scenario-chip" data-scenario-id="${escapeHtml(sc.id)}">` +
-        `<span class="scenario-chip__title">${escapeHtml(sc.title)}</span>` +
       `</button>`
   ).join("");
 }
@@ -929,6 +1027,13 @@ function setCenterTab(tab, { flashRemediation = false } = {}) {
     void notionTab.offsetWidth;
     notionTab.classList.add("is-remediation-flash");
   }
+}
+
+function setCenterExpanded(expanded) {
+  store.centerExpanded = Boolean(expanded);
+  $("workbench-split").classList.toggle("is-center-expanded", store.centerExpanded);
+  $("btn-expand-center").setAttribute("aria-pressed", String(store.centerExpanded));
+  $("btn-expand-center-label").textContent = store.centerExpanded ? "Collapse" : "Expand";
 }
 
 function renderDiffPane() {
@@ -975,13 +1080,13 @@ function renderDiffPane() {
   }
 
   const strip = $("changed-files-strip");
-  if (files.length > 0) {
+  if (files.length > 1) {
     strip.hidden = false;
     strip.innerHTML = files
       .map((f, idx) => {
         const targetId = diffFileDomId(f.path, idx);
         return (
-          `<button type="button" class="file-jump-pill" data-scroll-target="${escapeHtml(targetId)}">` +
+          `<button type="button" class="file-jump-pill" data-scroll-target="${escapeHtml(targetId)}" data-file-path="${escapeHtml(f.path)}">` +
             `<span>${escapeHtml(f.path)}</span>` +
             `<span class="diff-stat-add tabular-nums">+${Number(f.additions || 0)}</span>` +
             `<span class="diff-stat-del tabular-nums">−${Number(f.deletions || 0)}</span>` +
@@ -994,7 +1099,12 @@ function renderDiffPane() {
     strip.innerHTML = "";
   }
 
+  const wrapBtn = $("btn-diff-wrap");
+  wrapBtn.classList.toggle("is-active", store.diffWrap);
+  wrapBtn.setAttribute("aria-pressed", String(store.diffWrap));
+
   const viewport = $("diff-viewport");
+  viewport.classList.toggle("is-wrapped", store.diffWrap);
   if (!diff || diff.trees_identical || files.length === 0) {
     const isSyncedDeploy = store.shipLog?.status === "Deployed to Prod";
     const note = isSyncedDeploy
@@ -1004,7 +1114,9 @@ function renderDiffPane() {
     return;
   }
 
-  viewport.innerHTML = renderDiffFiles(files, store.diffMode);
+  viewport.innerHTML = renderDiffFiles(files, store.diffMode, {
+    collapsedPaths: store.collapsedDiffFiles,
+  });
 }
 
 function renderNotionPane() {
@@ -1179,6 +1291,22 @@ function renderQuizPanel() {
   $("mobile-badge-right").hidden = !(quiz && !locks?.quiz_passed && !locks?.blocked);
 
   if (!quiz) {
+    panel.classList.remove("gate-card--quiz-active");
+    if (locks?.tests_passed && !locks?.quiz_passed && !locks?.blocked) {
+      panel.hidden = false;
+      const isGenerating = store.isStreaming || isWorkspaceBusy();
+      panel.innerHTML =
+        `<div class="gate-card__header">` +
+          `<h3 class="gate-card__title">Comprehension Quiz</h3>` +
+          `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>${isGenerating ? "generating…" : "pending"}</span></span>` +
+        `</div>` +
+        `<p class="quiz-pending-note">${
+          isGenerating
+            ? "Examiner is writing a targeted question for this diff. It will appear right here."
+            : "The comprehension quiz appears right here once the Examiner completes. Click + New to run a fresh session."
+        }</p>`;
+      return;
+    }
     panel.hidden = true;
     panel.innerHTML = "";
     return;
@@ -1188,6 +1316,7 @@ function renderQuizPanel() {
 
   const isPassed = Boolean(locks?.quiz_passed || grade?.passed);
   const isBlocked = Boolean(grade?.deployment_blocked || (locks?.blocked && !isPassed));
+  panel.classList.toggle("gate-card--quiz-active", !isPassed && !isBlocked);
   const awaitingProceedV2 = Boolean(grade?.remediation_required && store.pendingNextQuiz);
 
   let statusAttr = quiz.attempt > 1 ? "Remediation v2" : "Quiz Pending";
@@ -1805,9 +1934,6 @@ async function runAgentStream(promptText) {
   store.heroPeek = false;
   store.workbenchForcedOpen = true;
   store.isStreaming = true;
-  if (store.scenariosOpen) {
-    setScenariosOpen(false);
-  }
   appendUserMessageToFeed(trimmed);
   renderTelemetryBar();
 
@@ -2086,6 +2212,8 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
     store.pendingNextQuiz = null;
     store.lastDeployReceipt = null;
     store.highlightedSkills.clear();
+    store.collapsedDiffFiles.clear();
+    setCenterExpanded(false);
     store.budget = {
       steps: 0,
       max_steps: store.models?.default_max_steps || 16,
@@ -2108,8 +2236,8 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
     renderAllStudio();
     showToast(
       newThread
-        ? "New thread: workspace reset to the fintech seed (skill memory kept)."
-        : `Seed reset to fintech baseline (sha:${shortSha(data.prod_tree_sha256, 10)})`
+        ? "New thread: workspace reset to baseline (skill memory kept)."
+        : `Workspace reset to baseline (sha:${shortSha(data.prod_tree_sha256, 10)})`
     );
   } catch (err) {
     showToast(`Reset failed: ${err.message}`);
@@ -2551,15 +2679,34 @@ function renderExplorerView() {
     singleCohortTip;
 
   const cohortSelect = $("explorer-cohort-select");
-  cohortSelect.innerHTML =
-    `<option value="all">all cohorts</option>` +
-    cohorts
-      .map((c) => {
-        const key = `${c.topology}::${c.model}`;
-        const sel = store.evalFilterCohort === key ? " selected" : "";
-        return `<option value="${escapeHtml(key)}"${sel}>${escapeHtml(c.topology)} · ${escapeHtml(c.model)}</option>`;
+  const cohortItems = [
+    { key: "all", title: "All cohorts", subtitle: `${cohorts.length} cohorts` },
+    ...cohorts.map((c) => ({
+      key: `${c.topology}::${c.model}`,
+      title: formatModelDisplay({ id: c.model, label: c.model, provider: c.model.includes("/") ? "openrouter" : "anthropic", enabled: true }).title,
+      subtitle: `${c.topology} · ${c.model}`,
+    })),
+  ];
+  cohortSelect.innerHTML = cohortItems
+    .map((item) => {
+      const sel = store.evalFilterCohort === item.key ? " selected" : "";
+      return `<option value="${escapeHtml(item.key)}"${sel}>${escapeHtml(item.title)}</option>`;
+    })
+    .join("");
+  const activeCohort = cohortItems.find((item) => item.key === store.evalFilterCohort) || cohortItems[0];
+  $("cohort-picker-label").textContent =
+    activeCohort.key === "all" ? "All cohorts" : `${activeCohort.subtitle.split(" · ")[0]} · ${activeCohort.title}`;
+  $("cohort-picker-list").innerHTML = cohortItems
+    .map((item) =>
+      renderCustomOptionButton({
+        value: item.key,
+        title: item.title,
+        subtitle: item.subtitle,
+        selected: item.key === store.evalFilterCohort,
+        attrName: "data-cohort-opt",
       })
-      .join("");
+    )
+    .join("");
 
   const kindOptions = ["all", "normal", "ambiguous", "impossible", "adversarial"];
   $("explorer-kind-filters").innerHTML = kindOptions
@@ -2787,12 +2934,6 @@ function setMobilePane(pane) {
   });
 }
 
-function setScenariosOpen(open) {
-  store.scenariosOpen = open;
-  $("scenarios-body").hidden = !open;
-  $("btn-toggle-scenarios").setAttribute("aria-expanded", String(open));
-}
-
 function autoResizeTextarea(textarea) {
   textarea.style.height = "auto";
   textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
@@ -2824,8 +2965,46 @@ function bindEvents() {
     btn.addEventListener("click", () => setMobilePane(btn.dataset.paneTarget));
   });
 
-  // Model selector provider brand icon & Hero Topology segmented pill
-  $("model-select").addEventListener("change", renderProviderBrandIcon);
+  // Custom model picker, cohort picker & provider route tabs + Hero Topology pill
+  $("btn-model-picker").addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    setModelPickerOpen(!store.modelPickerOpen);
+  });
+  $("model-picker-list").addEventListener("click", (ev) => {
+    const optBtn = ev.target.closest("[data-model-opt]");
+    if (!optBtn || optBtn.disabled) {
+      return;
+    }
+    $("model-select").value = optBtn.dataset.modelOpt;
+    setModelPickerOpen(false);
+    renderHeaderControls();
+  });
+  $("model-route-tabs").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-route-val]");
+    if (btn && !btn.disabled) {
+      setProviderRoute(btn.dataset.routeVal);
+    }
+  });
+  $("btn-cohort-picker").addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    setCohortPickerOpen(!store.cohortPickerOpen);
+  });
+  $("cohort-picker-list").addEventListener("click", (ev) => {
+    const optBtn = ev.target.closest("[data-cohort-opt]");
+    if (!optBtn) {
+      return;
+    }
+    store.evalFilterCohort = optBtn.dataset.cohortOpt;
+    $("explorer-cohort-select").value = store.evalFilterCohort;
+    setCohortPickerOpen(false);
+    renderExplorerView();
+  });
+  $("api-route-tabs").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("[data-route-val]");
+    if (btn && !btn.disabled) {
+      setProviderRoute(btn.dataset.routeVal);
+    }
+  });
   $("topology-select").addEventListener("change", (ev) => syncHeroTopologyUi(ev.target.value));
   $("hero-topo-pill").addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-topo-val]");
@@ -2875,6 +3054,12 @@ function bindEvents() {
       !ev.target.closest("#btn-api-popover")
     ) {
       setApiPopoverOpen(false);
+    }
+    if (store.modelPickerOpen && !ev.target.closest("#model-picker")) {
+      setModelPickerOpen(false);
+    }
+    if (store.cohortPickerOpen && !ev.target.closest("#cohort-picker")) {
+      setCohortPickerOpen(false);
     }
   });
 
@@ -2958,26 +3143,6 @@ function bindEvents() {
     }
   });
 
-  $("btn-toggle-scenarios").addEventListener("click", () => {
-    setScenariosOpen(!store.scenariosOpen);
-  });
-
-  $("scenario-chips").addEventListener("click", (ev) => {
-    const chip = ev.target.closest(".scenario-chip");
-    if (!chip) {
-      return;
-    }
-    const found = CANONICAL_SCENARIOS.find((s) => s.id === chip.dataset.scenarioId);
-    if (!found) {
-      return;
-    }
-    const input = $("prompt-input");
-    input.value = found.prompt;
-    autoResizeTextarea(input);
-    setScenariosOpen(false);
-    input.focus();
-  });
-
   wireStepCardContainer($("stream-feed"));
   wireStepCardContainer($("drawer-panel-trace"));
 
@@ -3011,6 +3176,7 @@ function bindEvents() {
   // Center Pane Controls
   $("tab-diff").addEventListener("click", () => setCenterTab("diff"));
   $("tab-notion").addEventListener("click", () => setCenterTab("notion"));
+  $("btn-expand-center").addEventListener("click", () => setCenterExpanded(!store.centerExpanded));
 
   $("btn-toggle-pytest-log").addEventListener("click", () => {
     store.pytestDrawerOpen = !store.pytestDrawerOpen;
@@ -3027,6 +3193,10 @@ function bindEvents() {
     copyToClipboard(store.diff?.diff_sha256, "diff_sha256")
   );
 
+  $("btn-diff-wrap").addEventListener("click", () => {
+    store.diffWrap = !store.diffWrap;
+    renderDiffPane();
+  });
   $("diff-mode-unified").addEventListener("click", () => {
     store.diffMode = "unified";
     $("diff-mode-unified").classList.add("is-active");
@@ -3040,10 +3210,29 @@ function bindEvents() {
     renderDiffPane();
   });
 
+  $("diff-viewport").addEventListener("click", (ev) => {
+    const headerBtn = ev.target.closest("[data-diff-toggle]");
+    if (!headerBtn) {
+      return;
+    }
+    const filePath = headerBtn.dataset.diffToggle;
+    if (store.collapsedDiffFiles.has(filePath)) {
+      store.collapsedDiffFiles.delete(filePath);
+    } else {
+      store.collapsedDiffFiles.add(filePath);
+    }
+    renderDiffPane();
+  });
+
   $("changed-files-strip").addEventListener("click", (ev) => {
     const pill = ev.target.closest(".file-jump-pill");
     if (!pill) {
       return;
+    }
+    const filePath = pill.dataset.filePath;
+    if (filePath && store.collapsedDiffFiles.has(filePath)) {
+      store.collapsedDiffFiles.delete(filePath);
+      renderDiffPane();
     }
     const target = document.getElementById(pill.dataset.scrollTarget);
     if (target) {
@@ -3224,6 +3413,18 @@ function bindEvents() {
       return;
     }
     if (ev.key === "Escape") {
+      if (store.centerExpanded) {
+        setCenterExpanded(false);
+        return;
+      }
+      if (store.modelPickerOpen) {
+        setModelPickerOpen(false);
+        return;
+      }
+      if (store.cohortPickerOpen) {
+        setCohortPickerOpen(false);
+        return;
+      }
       if (store.apiPopoverOpen) {
         setApiPopoverOpen(false);
         return;
@@ -3287,9 +3488,9 @@ function bindEvents() {
 // ---- Bootstrap ------------------------------------------------------------
 function initStudio() {
   initDetailMode();
+  initProviderRoute();
   wireStepGroups();
   renderScenarioChips();
-  renderProviderBrandIcon();
   bindEvents();
   renderAllStudio();
   window.requestAnimationFrame(updateModeGlider);

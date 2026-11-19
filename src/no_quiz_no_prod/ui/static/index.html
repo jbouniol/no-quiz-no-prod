@@ -11,8 +11,8 @@
       href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&amp;family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/tokens.css" />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/tokens.css?v=9" />
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
   </head>
   <body>
     <!-- Living Colorful Radial Aura Background -->
@@ -90,14 +90,18 @@
           <button
             type="button"
             id="btn-api-popover"
-            class="floating-pill"
+            class="floating-icon-pill api-icon-pill"
             aria-expanded="false"
             aria-controls="api-popover"
-            title="Environment keys &amp; Notion Hub"
+            aria-label="Environment &amp; API keys"
+            title="Environment &amp; API keys"
           >
-            <span id="provider-brand-icon" class="provider-brand-icon" aria-hidden="true"></span>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="7.5" cy="15.5" r="5.5"></circle>
+              <path d="m21 2-9.6 9.6"></path>
+              <path d="m15.5 7.5 3 3L22 7l-3-3"></path>
+            </svg>
             <span id="api-status-dot" class="api-status-pill__dot" aria-hidden="true"></span>
-            <span id="api-status-label" class="api-status-pill__label">API keys</span>
           </button>
 
           <div
@@ -122,6 +126,21 @@
             </div>
 
             <div id="api-provider-badges" class="api-provider-badges"></div>
+
+            <div class="api-route-row">
+              <span class="api-route-row__label">KEY ROUTE</span>
+              <div id="api-route-tabs" class="api-route-tabs" role="group" aria-label="Force LLM Provider Key">
+                <button type="button" class="api-tab is-active" data-route-val="auto" aria-pressed="true">
+                  Auto
+                </button>
+                <button type="button" class="api-tab" data-route-val="anthropic" aria-pressed="false">
+                  Anthropic
+                </button>
+                <button type="button" class="api-tab" data-route-val="openrouter" aria-pressed="false">
+                  OpenRouter
+                </button>
+              </div>
+            </div>
 
             <div id="api-popover-tabs" class="api-popover__tabs" role="tablist" aria-label="Provider Key Tabs">
               <button type="button" class="api-tab is-active" role="tab" aria-selected="true" data-key-provider="openrouter">
@@ -264,14 +283,68 @@
 
               <div class="hero-prompt__bar">
                 <div class="hero-prompt__meta">
-                  <span class="engine-label">fintech · staging → prod</span>
+                  <span class="engine-label">staging → prod</span>
                 </div>
 
                 <div class="hero-prompt__actions">
-                  <label class="sr-only" for="model-select">Model</label>
-                  <select id="model-select" class="prompt-model-select" aria-label="LLM Provider and Model">
-                    <option value="~deepseek/deepseek-v4-flash-latest">deepseek-v4-flash</option>
-                  </select>
+                  <div id="model-picker" class="custom-select">
+                    <button
+                      type="button"
+                      id="btn-model-picker"
+                      class="custom-select__trigger"
+                      aria-haspopup="listbox"
+                      aria-expanded="false"
+                      aria-controls="model-picker-menu"
+                      title="Choose model &amp; provider"
+                    >
+                      <span id="model-picker-label" class="custom-select__label">Claude Sonnet 5.5</span>
+                      <svg
+                        class="custom-select__chevron"
+                        width="12"
+                        height="12"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="m6 9 6 6 6-6"></path>
+                      </svg>
+                    </button>
+
+                    <div id="model-picker-menu" class="custom-select__menu" hidden>
+                      <div
+                        id="model-route-tabs"
+                        class="api-route-tabs custom-select__route-tabs"
+                        role="group"
+                        aria-label="Filter by API Key Route"
+                      >
+                        <button type="button" class="api-tab is-active" data-route-val="auto" aria-pressed="true">
+                          Auto
+                        </button>
+                        <button type="button" class="api-tab" data-route-val="anthropic" aria-pressed="false">
+                          Anthropic
+                        </button>
+                        <button type="button" class="api-tab" data-route-val="openrouter" aria-pressed="false">
+                          OpenRouter
+                        </button>
+                      </div>
+                      <div class="custom-select__divider" aria-hidden="true"></div>
+                      <div
+                        id="model-picker-list"
+                        class="custom-select__list"
+                        role="listbox"
+                        aria-label="LLM Provider and Model"
+                      ></div>
+                    </div>
+
+                    <label class="sr-only" for="model-select">Model</label>
+                    <select id="model-select" class="sr-only" tabindex="-1" aria-hidden="true">
+                      <option value="~deepseek/deepseek-v4-flash-latest">deepseek-v4-flash</option>
+                    </select>
+                  </div>
 
                   <button
                     type="submit"
@@ -405,20 +478,6 @@
               </div>
             </div>
 
-            <div class="scenarios-drawer" id="scenarios-drawer">
-              <div class="scenarios-drawer__header">
-                <button type="button" id="btn-toggle-scenarios" class="scenarios-toggle" aria-expanded="false">
-                  <span>Examples</span>
-                  <svg id="scenarios-chevron" class="scenarios-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="m9 18 6-6-6-6"></path>
-                  </svg>
-                </button>
-              </div>
-              <div id="scenarios-body" class="scenarios-drawer__body" hidden>
-                <div id="scenario-chips" class="scenario-grid"></div>
-              </div>
-            </div>
-
             <form id="prompt-form" class="composer">
               <label class="sr-only" for="prompt-input">Developer prompt</label>
               <textarea
@@ -482,6 +541,21 @@
                   <span id="tab-notion-version" class="mono-chip mono-chip--compact" hidden>v1</span>
                 </button>
               </div>
+              <button
+                type="button"
+                id="btn-expand-center"
+                class="ghost-micro-btn center-expand-btn"
+                aria-pressed="false"
+                title="Expand diff &amp; doc view (Esc to exit)"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="15 3 21 3 21 9"></polyline>
+                  <polyline points="9 21 3 21 3 15"></polyline>
+                  <line x1="21" y1="3" x2="14" y2="10"></line>
+                  <line x1="3" y1="21" x2="10" y2="14"></line>
+                </svg>
+                <span id="btn-expand-center-label">Expand</span>
+              </button>
             </div>
 
             <!-- TAB 1: Diff -->
@@ -512,19 +586,30 @@
                   </button>
                 </div>
 
-                <div class="segmented-mini" role="group" aria-label="Diff Mode">
-                  <button type="button" id="diff-mode-unified" class="segmented-mini__btn is-active" data-diff-mode="unified">
-                    Unified
+                <div class="diff-banner__controls">
+                  <button
+                    type="button"
+                    id="btn-diff-wrap"
+                    class="ghost-micro-btn diff-wrap-btn is-active"
+                    aria-pressed="true"
+                    title="Soft-wrap long code lines"
+                  >
+                    Wrap
                   </button>
-                  <button type="button" id="diff-mode-split" class="segmented-mini__btn" data-diff-mode="split">
-                    Split
-                  </button>
+                  <div class="segmented-mini" role="group" aria-label="Diff Mode">
+                    <button type="button" id="diff-mode-unified" class="segmented-mini__btn is-active" data-diff-mode="unified">
+                      Unified
+                    </button>
+                    <button type="button" id="diff-mode-split" class="segmented-mini__btn" data-diff-mode="split">
+                      Split
+                    </button>
+                  </div>
                 </div>
               </div>
 
               <pre id="pytest-output-drawer" class="pytest-drawer" hidden></pre>
               <div id="changed-files-strip" class="changed-files-strip" hidden></div>
-              <div id="diff-viewport" class="diff-viewport"></div>
+              <div id="diff-viewport" class="diff-viewport is-wrapped"></div>
             </div>
 
             <!-- TAB 2: Ship Log -->
@@ -599,10 +684,44 @@
               <div class="explorer-toolbar__group" id="explorer-kind-filters" role="group" aria-label="Kind Filter"></div>
               <div class="explorer-toolbar__group" id="explorer-outcome-filters" role="group" aria-label="Verdict Filter"></div>
               <div class="explorer-toolbar__inputs">
-                <label class="sr-only" for="explorer-cohort-select">Cohort</label>
-                <select id="explorer-cohort-select" class="prompt-model-select">
-                  <option value="all">all cohorts</option>
-                </select>
+                <div id="cohort-picker" class="custom-select">
+                  <button
+                    type="button"
+                    id="btn-cohort-picker"
+                    class="custom-select__trigger custom-select__trigger--compact"
+                    aria-haspopup="listbox"
+                    aria-expanded="false"
+                    aria-controls="cohort-picker-menu"
+                  >
+                    <span id="cohort-picker-label" class="custom-select__label">All cohorts</span>
+                    <svg
+                      class="custom-select__chevron"
+                      width="12"
+                      height="12"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="m6 9 6 6 6-6"></path>
+                    </svg>
+                  </button>
+                  <div id="cohort-picker-menu" class="custom-select__menu custom-select__menu--wide" hidden>
+                    <div
+                      id="cohort-picker-list"
+                      class="custom-select__list"
+                      role="listbox"
+                      aria-label="Filter by cohort"
+                    ></div>
+                  </div>
+                  <label class="sr-only" for="explorer-cohort-select">Cohort</label>
+                  <select id="explorer-cohort-select" class="sr-only" tabindex="-1" aria-hidden="true">
+                    <option value="all">all cohorts</option>
+                  </select>
+                </div>
                 <label class="sr-only" for="explorer-search-input">Search</label>
                 <input
                   type="search"
@@ -679,6 +798,6 @@
 
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
-    <script type="module" src="/static/app.js"></script>
+    <script type="module" src="/static/app.js?v=9"></script>
   </body>
 </html>
