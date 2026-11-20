@@ -3,9 +3,8 @@ import { test } from "node:test";
 
 import { staticModuleUrl } from "./helpers.mjs";
 
-const { STOP_REASON_LABELS, TOOL_PLAIN_LABELS, gateMissingText, summarizeToolActions } = await import(
-  staticModuleUrl("studio-text.js")
-);
+const { STOP_REASON_LABELS, TOOL_PLAIN_LABELS, deriveLiveActivity, gateMissingText, summarizeToolActions } =
+  await import(staticModuleUrl("studio-text.js"));
 
 test("every stop reason of the workflow has a plain label", () => {
   const reasons = [
@@ -39,10 +38,32 @@ test("a tool without a plain label keeps its name", () => {
 test("the gate says what is missing, in priority order", () => {
   const missing = ["the quiz", "your approval"];
   assert.match(gateMissingText({ treesIdentical: true, blocked: true, missing }), /^Nothing to ship yet/);
+  assert.match(
+    gateMissingText({ treesIdentical: true, blocked: false, missing, busy: true }),
+    /^Working on staging changes/
+  );
   assert.match(gateMissingText({ treesIdentical: false, blocked: true, missing }), /blocked and cannot ship/);
   assert.equal(
     gateMissingText({ treesIdentical: false, blocked: false, missing }),
     "Still needed: the quiz, your approval."
   );
   assert.equal(gateMissingText({ treesIdentical: false, blocked: false, missing: [] }), "All checks done.");
+});
+
+test("deriveLiveActivity surfaces clear loading/generating stages and returns null when idle", () => {
+  assert.equal(deriveLiveActivity({}), null);
+  assert.equal(deriveLiveActivity({ isStreaming: true }).badge, "Coder planning…");
+  assert.equal(deriveLiveActivity({ isStreaming: true, stepCount: 3 }).badge, "Coder · step 3");
+  assert.equal(
+    deriveLiveActivity({ isStreaming: true, stepCount: 4, testsPassed: true, hasShipLog: false }).badge,
+    "Writing Ship Log…"
+  );
+  assert.equal(
+    deriveLiveActivity({ isStreaming: true, stepCount: 5, testsPassed: true, hasShipLog: true, hasQuiz: false })
+      .badge,
+    "Generating quiz…"
+  );
+  assert.equal(deriveLiveActivity({ isSubmittingQuiz: true }).badge, "Grading quiz…");
+  assert.equal(deriveLiveActivity({ isSubmittingDeploy: true }).badge, "Deploying…");
+  assert.equal(deriveLiveActivity({ isResetting: true }).badge, "Resetting…");
 });

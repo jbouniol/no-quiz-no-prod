@@ -41,12 +41,107 @@ export function summarizeToolActions(tools) {
 }
 
 /** The line under the deploy gate that says what is still missing before the change can ship. */
-export function gateMissingText({ treesIdentical, blocked, missing }) {
+export function gateMissingText({ treesIdentical, blocked, missing, busy = false }) {
   if (treesIdentical) {
-    return "Nothing to ship yet: ask the agent for a change on the left.";
+    return busy
+      ? "Working on staging changes — locks unlock automatically once checks pass."
+      : "Nothing to ship yet: ask the agent for a change on the left.";
   }
   if (blocked) {
     return "This change is blocked and cannot ship. Start a new thread to try again.";
   }
   return missing.length ? `Still needed: ${missing.join(", ")}.` : "All checks done.";
+}
+
+/**
+ * Derive a clear, live stage indicator for active async operations so the user always sees
+ * what is generating and when it has finished.
+ */
+export function deriveLiveActivity({
+  isStreaming = false,
+  isSubmittingQuiz = false,
+  isSubmittingDeploy = false,
+  isResetting = false,
+  serverBusy = null,
+  stepCount = 0,
+  lastAgent = null,
+  testsPassed = false,
+  hasShipLog = false,
+  hasQuiz = false,
+  quizPassed = false,
+  isBlocked = false,
+} = {}) {
+  if (isResetting) {
+    return {
+      badge: "Resetting…",
+      title: "Resetting workspace seed…",
+      detail: "Restoring clean baseline staging/ and prod/ trees.",
+      tone: "system",
+    };
+  }
+  if (isSubmittingDeploy) {
+    return {
+      badge: "Deploying…",
+      title: "Deploying verified change to prod/…",
+      detail: "Promoting staging diff, committing release & syncing Ship Log.",
+      tone: "examiner",
+    };
+  }
+  if (isSubmittingQuiz) {
+    return {
+      badge: "Grading quiz…",
+      title: "Verifying your answer server-side…",
+      detail: "Checking comprehension (generating Remediation v2 if missed).",
+      tone: "examiner",
+    };
+  }
+  if (serverBusy) {
+    return {
+      badge: `Busy: ${serverBusy}`,
+      title: `Running ${serverBusy} in another session…`,
+      detail: "Waiting for the active workspace operation to finish.",
+      tone: "coder",
+    };
+  }
+  if (!isStreaming) {
+    return null;
+  }
+  if (testsPassed && hasShipLog && !hasQuiz && !quizPassed && !isBlocked) {
+    return {
+      badge: "Generating quiz…",
+      title: "Examiner is writing your comprehension quiz…",
+      detail: "Tests passed & Ship Log ready. Crafting targeted question for this diff.",
+      tone: "examiner",
+    };
+  }
+  if (testsPassed && !hasShipLog) {
+    return {
+      badge: "Writing Ship Log…",
+      title: "Tests passed — Examiner generating Ship Log & Quiz…",
+      detail: "Summarizing changed invariants, applied rules, and preparing quiz.",
+      tone: "examiner",
+    };
+  }
+  if (lastAgent === "examiner") {
+    return {
+      badge: "Examiner working…",
+      title: "Examiner is preparing Ship Log & Quiz…",
+      detail: "Drafting review documentation and comprehension check.",
+      tone: "examiner",
+    };
+  }
+  if (!stepCount) {
+    return {
+      badge: "Coder planning…",
+      title: "Coder is reading the workspace…",
+      detail: "Inspecting files and engineering rules before staging changes.",
+      tone: "coder",
+    };
+  }
+  return {
+    badge: `Coder · step ${stepCount}`,
+    title: `Coder is working (step ${stepCount})…`,
+    detail: "Editing staging files and running pytest verification.",
+    tone: "coder",
+  };
 }

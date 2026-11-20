@@ -10,7 +10,7 @@ import {
   renderNotionMarkdown,
   sanitizeHref,
 } from "./markdown.js";
-import { gateMissingText, STOP_REASON_LABELS, summarizeToolActions } from "./studio-text.js";
+import { deriveLiveActivity, gateMissingText, STOP_REASON_LABELS, summarizeToolActions } from "./studio-text.js?v=10";
 
 const DEFAULT_USER_ID = "dev_default";
 
@@ -141,6 +141,8 @@ function svgIcon(name, size = 14) {
       return `<svg ${attrs}><path d="M5 12h14"></path><path d="m13 6 6 6-6 6"></path></svg>`;
     case "external":
       return `<svg ${attrs}><path d="M7 17 17 7"></path><path d="M7 7h10v10"></path></svg>`;
+    case "spinner":
+      return `<svg class="nq-spinner" ${attrs}><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
     default:
       return `<svg ${attrs}><circle cx="12" cy="12" r="8"></circle></svg>`;
   }
@@ -175,6 +177,11 @@ const store = {
   remoteConfirmTimer: null,
   isSubmittingQuiz: false,
   isSubmittingDeploy: false,
+  deployActionPending: null,
+  isResetting: false,
+  lastLiveStep: null,
+  activityStartedAt: null,
+  activityTimer: null,
   auraWaveTimer: null,
 
   threadId: null,
@@ -249,7 +256,104 @@ function apiErrorMessage(data, status) {
 
 // The workspace runs one operation at a time: this tab's own stream, or one the server reports (another tab).
 function isWorkspaceBusy() {
-  return Boolean(store.isStreaming || store.serverBusy);
+  return Boolean(store.isStreaming || store.serverBusy || store.isResetting);
+}
+
+function getLiveActivity() {
+  return deriveLiveActivity({
+    isStreaming: store.isStreaming,
+    isSubmittingQuiz: store.isSubmittingQuiz,
+    isSubmittingDeploy: store.isSubmittingDeploy,
+    isResetting: store.isResetting,
+    serverBusy: store.serverBusy,
+    stepCount: Number(store.budget?.steps || 0),
+    lastAgent: store.lastLiveStep?.agent || null,
+    testsPassed: Boolean(store.locks?.tests_passed || store.pytest?.passed),
+    hasShipLog: Boolean(store.shipLog),
+    hasQuiz: Boolean(store.quiz),
+    quizPassed: Boolean(store.locks?.quiz_passed),
+    isBlocked: Boolean(store.locks?.blocked),
+  });
+}
+
+function formatElapsedLabel() {
+  if (!store.activityStartedAt) {
+    return "0.0s";
+  }
+  const sec = Math.max(0, (Date.now() - store.activityStartedAt) / 1000);
+  return `${sec.toFixed(1)}s`;
+}
+
+function updateLiveElapsedDom() {
+  const txt = formatElapsedLabel();
+  document.querySelectorAll(".js-live-elapsed").forEach((el) => {
+    el.textContent = txt;
+  });
+  if (store.isStreaming && !Number(store.budget?.latency_s || 0) && store.activityStartedAt) {
+    const lat = $("budget-latency-label");
+    if (lat) {
+      lat.textContent = txt;
+    }
+  }
+}
+
+function syncActivityTicker(activity) {
+  if (activity) {
+    if (store.activityStartedAt === null) {
+      store.activityStartedAt = Date.now();
+    }
+    if (store.activityTimer === null) {
+      store.activityTimer = window.setInterval(updateLiveElapsedDom, 100);
+    }
+    updateLiveElapsedDom();
+    return;
+  }
+  if (store.activityTimer !== null) {
+    window.clearInterval(store.activityTimer);
+    store.activityTimer = null;
+  }
+  store.activityStartedAt = null;
+}
+
+function renderStreamLiveIndicator(activity = getLiveActivity()) {
+  const feed = $("stream-feed");
+  if (!feed) {
+    return;
+  }
+  const existing = feed.querySelector(".stream-live-card");
+  if (!activity) {
+    if (existing) {
+      existing.remove();
+    }
+    return;
+  }
+  const empty = $("stream-empty-state");
+  if (empty) {
+    empty.remove();
+  }
+  const card = existing || document.createElement("div");
+  if (!existing) {
+    card.className = "stream-live-card";
+    card.setAttribute("role", "status");
+    card.setAttribute("aria-live", "polite");
+    card.innerHTML =
+      `<div class="stream-live-card__top">` +
+        `<div class="stream-live-card__left">` +
+          `<span class="stream-live-card__icon">${svgIcon("spinner", 14)}</span>` +
+          `<span class="stream-live-card__title"></span>` +
+        `</div>` +
+        `<span class="stream-live-card__elapsed js-live-elapsed tabular-nums"></span>` +
+      `</div>` +
+      `<div class="stream-live-card__detail"></div>`;
+  }
+  card.dataset.tone = activity.tone || "coder";
+  card.querySelector(".stream-live-card__title").textContent = activity.title;
+  card.querySelector(".stream-live-card__detail").textContent = activity.detail;
+  card.querySelector(".stream-live-card__elapsed").textContent = formatElapsedLabel();
+  if (card !== feed.lastElementChild) {
+    feed.appendChild(card);
+    feed.scrollTop = feed.scrollHeight;
+  }
 }
 
 function isReleaseGate(interrupt) {
@@ -911,21 +1015,18 @@ function renderTelemetryBar() {
   const statusPill = $("run-status-pill");
   const statusText = $("run-status-text");
   const dot = statusPill.querySelector(".pill__dot");
-  dot.classList.toggle("pill__dot--live", store.isStreaming);
+  const activity = getLiveActivity();
+  dot.classList.toggle("pill__dot--live", Boolean(activity));
 
   statusPill.removeAttribute("data-status");
   statusPill.removeAttribute("data-agent");
 
   // plain words in the pill, the raw state name in its tooltip
   let rawStatus = "idle";
-  if (store.isStreaming) {
-    statusPill.setAttribute("data-agent", "coder");
-    statusText.textContent = "Agent working…";
-    rawStatus = "streaming";
-  } else if (store.serverBusy) {
-    statusPill.setAttribute("data-agent", "coder");
-    statusText.textContent = `Busy: ${store.serverBusy}`;
-    rawStatus = `busy · ${store.serverBusy}`;
+  if (activity) {
+    statusPill.setAttribute("data-agent", activity.tone || "coder");
+    statusText.textContent = activity.badge;
+    rawStatus = activity.badge;
   } else if (store.interrupt && store.pendingRelease) {
     statusPill.setAttribute("data-status", "Remediation v2");
     statusText.textContent = "Push failed: your decision";
@@ -976,7 +1077,9 @@ function renderTelemetryBar() {
   $("budget-steps-label").textContent = `${steps}/${maxSteps}`;
   $("budget-tokens-label").textContent =
     totalTok >= 1000 ? `${(totalTok / 1000).toFixed(1)}k tok` : `${totalTok} tok`;
-  $("budget-latency-label").textContent = `${Number(b.latency_s || 0).toFixed(1)}s`;
+  if (!(store.isStreaming && !Number(b.latency_s || 0) && store.activityStartedAt)) {
+    $("budget-latency-label").textContent = `${Number(b.latency_s || 0).toFixed(1)}s`;
+  }
   $("budget-cost-label").textContent = `$${Number(b.cost_usd || 0).toFixed(4)}`;
 
   const fill = $("budget-progress-fill");
@@ -991,12 +1094,24 @@ function renderTelemetryBar() {
   const bar = $("budget-progressbar");
   bar.setAttribute("aria-valuemax", String(maxSteps));
   bar.setAttribute("aria-valuenow", String(steps));
+  bar.classList.toggle("is-active", Boolean(activity));
 
   // One operation per workspace: no second run and no Reset while one is in progress (the server refuses both).
-  const busy = isWorkspaceBusy();
-  $("btn-run-agent").disabled = busy;
-  $("btn-hero-send").disabled = busy;
+  const busy = isWorkspaceBusy() || Boolean(activity);
+  const btnRun = $("btn-run-agent");
+  const btnHero = $("btn-hero-send");
+  btnRun.disabled = busy;
+  btnHero.disabled = busy;
   $("btn-reset-seed").disabled = busy;
+  btnRun.classList.toggle("is-loading", Boolean(activity));
+  btnHero.classList.toggle("is-loading", Boolean(activity));
+  btnRun.innerHTML = activity ? svgIcon("spinner", 14) : svgIcon("arrowRight", 14);
+  btnHero.innerHTML = activity ? svgIcon("spinner", 16) : svgIcon("arrowRight", 16);
+  btnRun.title = activity ? activity.title : "Run";
+  btnHero.title = activity ? activity.title : "Run (⌘↵)";
+
+  syncActivityTicker(activity);
+  renderStreamLiveIndicator(activity);
 }
 
 function renderScenarioChips() {
@@ -1054,15 +1169,23 @@ function renderDiffPane() {
 
   const pytestPill = $("pytest-banner-pill");
   const pytestText = $("pytest-banner-text");
+  const pytestDot = pytestPill.querySelector(".pill__dot");
   const pytestToggle = $("btn-toggle-pytest-log");
   const pytestDrawer = $("pytest-output-drawer");
 
   pytestPill.removeAttribute("data-status");
   pytestPill.removeAttribute("data-agent");
+  pytestDot.classList.remove("pill__dot--live");
 
   if (!pytest) {
-    pytestPill.setAttribute("data-agent", "system");
-    pytestText.textContent = "Tests not run yet";
+    if (isWorkspaceBusy()) {
+      pytestPill.setAttribute("data-agent", "coder");
+      pytestDot.classList.add("pill__dot--live");
+      pytestText.textContent = files.length > 0 ? "Running staging checks…" : "Staging changes…";
+    } else {
+      pytestPill.setAttribute("data-agent", "system");
+      pytestText.textContent = "Tests not run yet";
+    }
     pytestToggle.hidden = true;
     pytestDrawer.hidden = true;
   } else if (pytest.passed) {
@@ -1106,6 +1229,14 @@ function renderDiffPane() {
   const viewport = $("diff-viewport");
   viewport.classList.toggle("is-wrapped", store.diffWrap);
   if (!diff || diff.trees_identical || files.length === 0) {
+    if (isWorkspaceBusy()) {
+      viewport.innerHTML =
+        `<div class="minimal-loading-note">` +
+          `${svgIcon("spinner", 16)}` +
+          `<span>Agent is analyzing the codebase and preparing staging changes…</span>` +
+        `</div>`;
+      return;
+    }
     const isSyncedDeploy = store.shipLog?.status === "Deployed to Prod";
     const note = isSyncedDeploy
       ? `prod == staging · deployed (${escapeHtml(shortSha(diff?.prod_tree_sha256, 8))})`
@@ -1128,6 +1259,14 @@ function renderNotionPane() {
   if (!ship) {
     tabStatus.hidden = true;
     tabVer.hidden = true;
+    if (isWorkspaceBusy()) {
+      const msg = store.pytest?.passed
+        ? "Examiner is writing the Ship Log…"
+        : "Ship Log will generate once staging tests pass…";
+      container.innerHTML =
+        `<div class="minimal-loading-note">${svgIcon("spinner", 16)}<span>${msg}</span></div>`;
+      return;
+    }
     container.innerHTML = `<div class="minimal-empty-note">Ship Log publishes automatically after green pytest.</div>`;
     return;
   }
@@ -1295,11 +1434,19 @@ function renderQuizPanel() {
     if (locks?.tests_passed && !locks?.quiz_passed && !locks?.blocked) {
       panel.hidden = false;
       const isGenerating = store.isStreaming || isWorkspaceBusy();
+      panel.classList.toggle("gate-card--generating", isGenerating);
       panel.innerHTML =
         `<div class="gate-card__header">` +
-          `<h3 class="gate-card__title">Comprehension Quiz</h3>` +
-          `<span class="pill" data-status="Quiz Pending"><span class="pill__dot"></span><span>${isGenerating ? "generating…" : "pending"}</span></span>` +
+          `${
+            isGenerating
+              ? `<span class="gate-title-with-spinner"><h3 class="gate-card__title">Comprehension Quiz</h3>${svgIcon("spinner", 13)}</span>`
+              : `<h3 class="gate-card__title">Comprehension Quiz</h3>`
+          }` +
+          `<span class="pill" data-status="Quiz Pending"><span class="pill__dot${isGenerating ? " pill__dot--live" : ""}"></span><span>${isGenerating ? "generating…" : "pending"}</span></span>` +
         `</div>` +
+        (isGenerating
+          ? `<div class="quiz-skeleton" aria-hidden="true"><div class="quiz-skeleton__line"></div><div class="quiz-skeleton__line quiz-skeleton__line--short"></div></div>`
+          : "") +
         `<p class="quiz-pending-note">${
           isGenerating
             ? "Examiner is writing a targeted question for this diff. It will appear right here."
@@ -1307,10 +1454,12 @@ function renderQuizPanel() {
         }</p>`;
       return;
     }
+    panel.classList.remove("gate-card--generating");
     panel.hidden = true;
     panel.innerHTML = "";
     return;
   }
+  panel.classList.remove("gate-card--generating");
 
   panel.hidden = false;
 
@@ -1417,7 +1566,7 @@ function renderQuizPanel() {
     `<div class="quiz-options">${optionsHtml}</div>` +
     (!submitHidden
       ? `<button type="button" id="btn-submit-quiz" class="btn-quiz-submit" ${!store.selectedQuizOption || store.isSubmittingQuiz || isWorkspaceBusy() ? "disabled" : ""}>` +
-          `${store.isSubmittingQuiz ? "Verifying server-side…" : "Verify Answer (↵)"}` +
+          `${store.isSubmittingQuiz ? `${svgIcon("spinner", 13)}<span>Grading answer…</span>` : "Verify Answer (↵)"}` +
         `</button>`
       : "") +
     feedbackHtml;
@@ -1466,7 +1615,12 @@ function renderDeployPanel() {
 
   const missingLabels = LOCK_DESCRIPTIONS.filter((item) => !isLockSatisfied(item)).map((item) => item.missing);
   const doneCount = LOCK_DESCRIPTIONS.length - missingLabels.length;
-  const missingText = gateMissingText({ treesIdentical, blocked: Boolean(locks?.blocked), missing: missingLabels });
+  const missingText = gateMissingText({
+    treesIdentical,
+    blocked: Boolean(locks?.blocked),
+    missing: missingLabels,
+    busy: isWorkspaceBusy(),
+  });
 
   // A failed push revokes the sign-off server-side: the gate is back to "ready for approval" for the same diff.
   const pending = store.pendingRelease;
@@ -1506,15 +1660,17 @@ function renderDeployPanel() {
         `<div><code>${escapeHtml(prodSha)}</code></div>` +
       `</div>`;
   } else if (canDecide && !treesIdentical) {
+    const isApproving = store.isSubmittingDeploy && store.deployActionPending !== "reject";
+    const isRejecting = store.isSubmittingDeploy && store.deployActionPending === "reject";
     footerHtml =
       pendingHtml +
       `<div class="deploy-actions">` +
         `<button type="button" id="btn-approve-deploy" class="btn-deploy btn-deploy--ready" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
-          `${svgIcon(pending ? "retry" : "check", 13)}` +
-          `<span>${store.isSubmittingDeploy ? "Deploying…" : pending ? "Approve & Retry Push" : "Approve & Deploy"}</span>` +
+          `${svgIcon(isApproving ? "spinner" : pending ? "retry" : "check", 13)}` +
+          `<span>${isApproving ? "Deploying…" : pending ? "Approve & Retry Push" : "Approve & Deploy"}</span>` +
         `</button>` +
         `<button type="button" id="btn-reject-deploy" class="btn-reject" ${store.isSubmittingDeploy || isWorkspaceBusy() ? "disabled" : ""}>` +
-          `Reject` +
+          `${isRejecting ? "Rejecting…" : "Reject"}` +
         `</button>` +
       `</div>` +
       `<div class="kpi-card__sub deploy-actions__sub">commit + push to ${escapeHtml(store.git?.branch || "main")}</div>`;
@@ -1689,7 +1845,8 @@ function appendStepToFeed(step) {
     return;
   }
   const agent = step.agent || "system";
-  let group = feed.lastElementChild;
+  const liveCard = feed.querySelector(".stream-live-card");
+  let group = liveCard ? liveCard.previousElementSibling : feed.lastElementChild;
   if (!group || !group.classList.contains("step-group") || group.dataset.agent !== agent) {
     foldUntouchedStepGroups(feed);
     group = document.createElement("section");
@@ -1698,7 +1855,11 @@ function appendStepToFeed(step) {
     group.innerHTML =
       `<button type="button" class="step-group__summary" aria-expanded="true"></button>` +
       `<div class="step-group__body"></div>`;
-    feed.appendChild(group);
+    if (liveCard) {
+      feed.insertBefore(group, liveCard);
+    } else {
+      feed.appendChild(group);
+    }
     setStepGroupOpen(group, true);
   }
   group.querySelector(".step-group__body").appendChild(el);
@@ -1837,11 +1998,13 @@ function handleRunEvent(ev) {
     store.stopReason = null;
     store.pendingRelease = null;
     store.lastDeployReceipt = null;
+    store.lastLiveStep = null;
     renderTelemetryBar();
     return;
   }
 
   if (ev.type === "step" && ev.step) {
+    store.lastLiveStep = ev.step;
     appendStepToFeed(ev.step);
     renderTelemetryBar();
     return;
@@ -1887,6 +2050,7 @@ function handleRunEvent(ev) {
   }
 
   if (ev.type === "run_completed") {
+    store.isStreaming = false;
     store.interrupt = ev.interrupt || null;
     store.stopReason = ev.stop_reason || null;
     store.pendingRelease = ev.interrupt?.release || ev.pending_release || null;
@@ -1911,6 +2075,7 @@ function handleRunEvent(ev) {
   }
 
   if (ev.type === "run_error") {
+    store.isStreaming = false;
     const reason = ev.stop_reason || "api_error";
     store.stopReason = reason;
     store.interrupt = null;
@@ -1921,7 +2086,7 @@ function handleRunEvent(ev) {
       interrupt: null,
       isError: true,
     });
-    renderTelemetryBar();
+    renderAllStudio();
   }
 }
 
@@ -1934,8 +2099,9 @@ async function runAgentStream(promptText) {
   store.heroPeek = false;
   store.workbenchForcedOpen = true;
   store.isStreaming = true;
+  store.lastLiveStep = null;
   appendUserMessageToFeed(trimmed);
-  renderTelemetryBar();
+  renderAllStudio();
 
   const faultArmed = $("chk-fault-timeout").checked;
 
@@ -2018,6 +2184,7 @@ async function submitQuizAnswer() {
 
   store.isSubmittingQuiz = true;
   syncAmbientAura();
+  renderTelemetryBar();
   renderQuizPanel();
 
   const prevCounts = new Map(
@@ -2103,7 +2270,9 @@ async function submitDeployDecision(action) {
     return;
   }
   store.isSubmittingDeploy = true;
+  store.deployActionPending = action;
   syncAmbientAura();
+  renderTelemetryBar();
   renderDeployPanel();
 
   try {
@@ -2176,6 +2345,7 @@ async function submitDeployDecision(action) {
     showToast(`Deploy action failed: ${err.message}`);
   } finally {
     store.isSubmittingDeploy = false;
+    store.deployActionPending = null;
     syncAmbientAura();
     renderAllStudio();
   }
@@ -2190,6 +2360,8 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
     );
     return;
   }
+  store.isResetting = true;
+  renderTelemetryBar();
   try {
     const resp = await apiSend("/api/reset", "POST", {
       seed: "fintech",
@@ -2205,6 +2377,7 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
     store.stopReason = null;
     store.quiz = null;
     store.pendingRelease = null;
+    store.lastLiveStep = null;
     store.workbenchForcedOpen = newThread;
     store.heroPeek = false;
     store.selectedQuizOption = null;
@@ -2233,7 +2406,6 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
       applyStatePayload(data.state);
     }
     setCenterTab("diff");
-    renderAllStudio();
     showToast(
       newThread
         ? "New thread: workspace reset to baseline (skill memory kept)."
@@ -2241,6 +2413,9 @@ async function handleResetSeed(resetSkillMemory = false, { newThread = false } =
     );
   } catch (err) {
     showToast(`Reset failed: ${err.message}`);
+  } finally {
+    store.isResetting = false;
+    renderAllStudio();
   }
 }
 
